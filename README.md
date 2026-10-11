@@ -159,6 +159,10 @@ Then ask Claude: *"show me the QA, rec-after vs rec-before"*.
 
 Edit `hooks/register.tsx`, then `/reload-plugins`. Check with `claude plugin validate .` and `claude plugin test .`.
 
+## License
+
+[MIT](LICENSE)
+
 ---
 
 <sub>Photography from <a href="https://unsplash.com">Unsplash</a>, used under the Unsplash License.</sub>

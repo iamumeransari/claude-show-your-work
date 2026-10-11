@@ -4,16 +4,22 @@
 
 <h1 align="center">claude-show-your-work</h1>
 
-<p align="center">
-  <b>Stop opening localhost to check what Claude did.</b><br>
-  Claude shows you its finished work right in the chat: screenshots, videos of it clicking through your app,<br>
-  and synced before/after QA. No tab-switching, no "let me go check".
-</p>
+<p align="center"><b>Images and videos inline in Claude Code, right in your terminal.</b></p>
+
+**show-your-work** is a Claude Code plugin that lets Claude show you images and play videos inside the terminal: screenshots of what it built, Playwright recordings of it clicking through your app, and before/after QA runs played side by side in sync. It works in **Ghostty** and **kitty** on macOS. It's free and open source (MIT).
+
+**Stop opening localhost to check what Claude did.** No tab-switching, no "let me go check".
+
+```
+/plugin marketplace add iamumeransari/claude-show-your-work
+/plugin install show-your-work@iamumeransari
+```
 
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#what-you-see">What you see</a> ·
   <a href="#how-it-works">How it works</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="#try-the-demo">Try the demo</a>
 </p>
 
@@ -57,7 +63,7 @@ Claude says "Done! I fixed the pricing page." Then you:
 
 Every change, every time. That's the chaos this removes.
 
-## The fix
+## What it does
 
 Claude **shows its work** in the conversation, the moment it's done:
 
@@ -105,11 +111,16 @@ Every window stays in the chat, too. Scroll up and every picture and video Claud
 
 **Needs**
 
-- a terminal that can draw pictures: **Ghostty** or **kitty** (the kitty graphics protocol)
-- **ffmpeg** for video (`brew install ffmpeg`)
-- macOS (pictures in other formats are converted with `sips`)
+| | |
+|---|---|
+| Terminal | **Ghostty** or **kitty** (anything that draws with the kitty graphics protocol) |
+| OS | macOS (pictures in other formats are converted with `sips`) |
+| Video | **ffmpeg** (`brew install ffmpeg`) |
+| Claude Code | v2.1.287 or later (the version that added mods) |
 
 That's it. Claude picks the tools up and starts showing you its work.
+
+**Formats:** PNG, JPEG, HEIC, TIFF, GIF and anything else macOS can open for pictures; MP4, MOV, M4V, WebM, MKV, AVI and GIF for video.
 
 ## How it works
 
@@ -142,6 +153,40 @@ For QA, Claude passes a bit more:
 Videos are cut into frames with ffmpeg (up to 12 fps, 960 px wide, 900 frames), and the terminal swaps them in place, one picture at a time. Both runs of a comparison are merged into one clip ahead of time, so side by side costs no more than a single video.
 
 You can also open anything yourself: `/img path/to/file.png`.
+
+## FAQ
+
+### How do I show an image in Claude Code?
+
+Install show-your-work and Claude gets a `show_image` tool. When it makes a screenshot, a render, a chart or a mockup, the picture appears in the chat without being asked. To open a file yourself, type `/img path/to/file.png`.
+
+### Can Claude Code play videos in the terminal?
+
+Yes, with show-your-work in Ghostty or kitty. Claude calls `show_video` and the clip plays inline with Play/Pause, a progress bar and ±5 s skips. ffmpeg cuts it into frames and the terminal swaps them in place.
+
+### How is this different from pasting a screenshot into Claude?
+
+Pasting sends a picture to Claude. show-your-work goes the other way: Claude shows you what it made, and the picture or video stays in the scrollback with buttons to open the page, save the file or copy its path.
+
+### Which terminals does it work in?
+
+Ghostty and kitty, which draw pictures with the kitty graphics protocol. iTerm2, Terminal.app and the VS Code terminal aren't supported yet.
+
+### Does it work on Linux or Windows?
+
+Not yet. It relies on macOS's `sips` to read and resize pictures.
+
+### How does the before/after comparison stay in sync?
+
+Claude records the same Playwright script on the original and the updated version. The two runs are lined up by matching their frames, so if the original loads slower it waits, and each step lands at the same moment on both sides.
+
+### Does it send my screenshots or recordings anywhere?
+
+No. Everything runs on your machine: frames go to `/tmp/claude-show-your-work` and the plugin makes no network requests.
+
+### Is it free?
+
+Yes. It's open source under the MIT license.
 
 ## Try the demo
 

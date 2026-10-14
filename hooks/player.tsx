@@ -57,8 +57,12 @@ export const player = (site: string): Player => {
   return one
 }
 
-// Opens a file or URL with the desktop's default app.
-const openCommand = () => (state.isMac ? 'open' : 'xdg-open')
+// Opens a file, folder or URL with the desktop's default app. On a desktop
+// xdg-open doesn't know (niri, sway…) it runs the app in the foreground until
+// it quits, and $.process.run kills it at its timeout (30 s by default), so
+// on Linux it starts detached, in its own session, and returns at once.
+const DETACH_SH = 'if command -v setsid >/dev/null; then exec setsid -f "$@" </dev/null >/dev/null 2>&1; fi; "$@" </dev/null >/dev/null 2>&1 &'
+const openArgv = (target: string) => (state.isMac ? ['open', target] : ['sh', '-c', DETACH_SH, 'sh', 'xdg-open', target])
 
 // The narrowest the scrub and button rows get, in columns: room for the play
 // button, both times, a usable bar and the action buttons on one line.
@@ -850,7 +854,7 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
     for (let n = 2; await $.fs.stat(out).then(() => true, () => false); n++) out = `${state.home}/Downloads/${stem} ${n}${ext}`
     if (!state.isMac) await $.process.run(['mkdir', '-p', `${state.home}/Downloads`])
     const r = await $.process.run(['cp', source, out])
-    if (r.exitCode === 0) await $.process.run(state.isMac ? ['open', '-R', out] : ['xdg-open', `${state.home}/Downloads`]).catch(() => undefined)
+    if (r.exitCode === 0) await $.process.run(state.isMac ? ['open', '-R', out] : openArgv(`${state.home}/Downloads`)).catch(() => undefined)
     done(r, `Saved to Downloads/${out.split('/').pop()}`)
   }
 
@@ -859,7 +863,7 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
       {!source.startsWith(`${state.home}/Downloads/`) ? (
         <Button key="keep" plain dimColor label="Save to Downloads" onPress={() => { act('save'); void keep() }} />
       ) : (
-        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void $.process.run(state.isMac ? ['open', '-R', source] : ['xdg-open', source.slice(0, source.lastIndexOf('/')) || '/']).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder'))} />
+        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void $.process.run(state.isMac ? ['open', '-R', source] : openArgv(source.slice(0, source.lastIndexOf('/')) || '/')).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder'))} />
       )}
       {!isNarrow && (
         <Button
@@ -1085,7 +1089,7 @@ export async function Viewer(
       plain
       label={page ? '↗ Open page' : '↗ View'}
       onPress={() =>
-        act(page ? 'open_page' : 'open_file') || void $.process.run([openCommand(), page ?? source]).then(r =>
+        act(page ? 'open_page' : 'open_file') || void $.process.run(openArgv(page ?? source)).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : 'Could not open it'),
         )
       }

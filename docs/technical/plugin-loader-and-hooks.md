@@ -22,5 +22,6 @@ Things the Claude Code hooks loader and runtime enforce. Breaking one of the loa
 - **Pane hooks size from `e.props.bodyColumns` and `e.props.bodyRows` (or `e.props.scroll.bodyRows`).** `e.viewport` is the whole screen. See `paneSize`.
 - **`Button` can hold `Text` children only on Claude Code 2.1.295+.** Older versions refuse the render. `canColourButtons` is set from `$.session.version()` in `setUp`.
 - `$.process.run` takes `{ timeoutMs }`. A login shell (`sh -lc`) can hang on a slow profile: it gets 5 s, then a plain `sh -c`.
+- **`$.process.run` times out after 30 s by default** (at most 600 s), and then kills the process and everything under it. It also waits for the child's stdout and stderr to close, so a background child that keeps them open holds the run until the timeout. On a desktop `xdg-open` doesn't know (niri, sway…), `xdg-open` runs the app in the foreground until it quits, so a viewer opened that way closed after 30 s. `openArgv` (`player.tsx`) starts it with `setsid -f` and its stdio on `/dev/null`, so the run returns at once.
 - An `Image` source that equals the last one drawn is not sent again. That's why sources carry a `generation` (see `showing-images.md`).
 - A process that must outlive the session (the channel move) is started through `DETACH`: `perl -MPOSIX -e 'fork and exit; POSIX::setsid(); exec @ARGV'`.

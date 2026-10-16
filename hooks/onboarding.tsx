@@ -453,6 +453,8 @@ export async function Tour($: EngineInterface, e: Parameters<EngineInterface['ui
   if (state.isTourDone) return <Text dimColor>✓ Tour finished. /show-your-work tour shows it again.</Text>
   const room = { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }
   if (!media && s.media) loadDemo($)
+  // Nothing to look at yet: no bar, so Next can't be pressed before the demo shows.
+  if (!media && s.media) return <Text dimColor>Loading the demo…</Text>
   const view = media ? await Viewer($, e, atStep(media, state.tourSite), state.tourSite, false, room) : null
   const width = (view as { props?: { width?: number } } | null)?.props?.width ?? Math.min(room.columns - 2, 100)
   return (

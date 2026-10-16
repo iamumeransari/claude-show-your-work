@@ -621,6 +621,18 @@ const cutChunks = new Set<string>()
 const chunkKey = (f: Frames, i: number) => `${f.dir}#${Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)}`
 export const isFrameCut = (media: Shown, i: number) => !media.frames || cutChunks.has(chunkKey(media.frames, i))
 
+// A frame that should be on disk isn't (the temp folder was cleaned, or the
+// cache trimmed): forget its chunk was cut and cut it again from the source.
+// False when the source itself is gone too.
+export async function recutFrame($: EngineInterface, media: Shown, i: number): Promise<boolean> {
+  const f = media.frames
+  if (!f || !media.source || (await isGone($, media.source))) return false
+  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
+  cutChunks.delete(chunkKey(f, i))
+  await ensureChunk($, f, media.source, i)
+  return !(await isGone($, frameFile(f, Math.min(i, f.count - 1))))
+}
+
 // Over ssh every frame crosses as bytes: 256 colours, one palette per chunk,
 // no dithering, halve them. Frames on this machine go by path in full colour.
 const PALETTE = ',split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none'
@@ -2261,7 +2273,9 @@ export async function Viewer(
   }
   one.box = { columns: own.columns, rows: own.rows }
   await frameReady($, media, one.frame, site)
-  if (await isGone($, plainAt(media, one.frame))) {
+  // Only expired when the original is gone: a video's frames that were cleaned
+  // away are cut again from it.
+  if ((await isGone($, plainAt(media, one.frame))) && !(await recutFrame($, media, one.frame))) {
     one.timer?.cancel()
     one.timer = undefined
     return Expired(ui, $, shown, columns - 8)
@@ -3325,6 +3339,8 @@ export async function Tour($: EngineInterface, e: Parameters<EngineInterface['ui
   if (state.isTourDone) return <Text dimColor>✓ Tour finished. /show-your-work tour shows it again.</Text>
   const room = { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }
   if (!media && s.media) loadDemo($)
+  // Nothing to look at yet: no bar, so Next can't be pressed before the demo shows.
+  if (!media && s.media) return <Text dimColor>Loading the demo…</Text>
   const view = media ? await Viewer($, e, atStep(media, state.tourSite), state.tourSite, false, room) : null
   const width = (view as { props?: { width?: number } } | null)?.props?.width ?? Math.min(room.columns - 2, 100)
   return (

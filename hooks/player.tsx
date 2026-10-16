@@ -7,7 +7,7 @@ import type { Check, KeyChange, Shown, Summary } from '../types'
 import { state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, tabLabel, targetBox, wrapWords } from './layout'
 import { act, debug, track } from './telemetry'
-import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, toOriginal, toUpdated } from './media'
+import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, recutFrame, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 
@@ -1204,7 +1204,9 @@ export async function Viewer(
   }
   one.box = { columns: own.columns, rows: own.rows }
   await frameReady($, media, one.frame, site)
-  if (await isGone($, plainAt(media, one.frame))) {
+  // Only expired when the original is gone: a video's frames that were cleaned
+  // away are cut again from it.
+  if ((await isGone($, plainAt(media, one.frame))) && !(await recutFrame($, media, one.frame))) {
     one.timer?.cancel()
     one.timer = undefined
     return Expired(ui, $, shown, columns - 8)

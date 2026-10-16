@@ -337,6 +337,18 @@ const cutChunks = new Set<string>()
 const chunkKey = (f: Frames, i: number) => `${f.dir}#${Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)}`
 export const isFrameCut = (media: Shown, i: number) => !media.frames || cutChunks.has(chunkKey(media.frames, i))
 
+// A frame that should be on disk isn't (the temp folder was cleaned, or the
+// cache trimmed): forget its chunk was cut and cut it again from the source.
+// False when the source itself is gone too.
+export async function recutFrame($: EngineInterface, media: Shown, i: number): Promise<boolean> {
+  const f = media.frames
+  if (!f || !media.source || (await isGone($, media.source))) return false
+  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
+  cutChunks.delete(chunkKey(f, i))
+  await ensureChunk($, f, media.source, i)
+  return !(await isGone($, frameFile(f, Math.min(i, f.count - 1))))
+}
+
 // Over ssh every frame crosses as bytes: 256 colours, one palette per chunk,
 // no dithering, halve them. Frames on this machine go by path in full colour.
 const PALETTE = ',split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none'

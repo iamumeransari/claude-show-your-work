@@ -5,7 +5,7 @@ import type { EngineInterface, Timer } from 'claude-code'
 import type { Check, KeyChange, Shown, Summary } from '../types'
 
 import { state } from './state'
-import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, tabLabel, targetBox, wrapWords } from './layout'
+import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
 import { act, debug, track } from './telemetry'
 import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, recutFrame, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
@@ -114,7 +114,10 @@ function useSharpest(m: Shown) {
 }
 function sharpen($: EngineInterface, m: Shown, need: number) {
   const source = m.source
-  const limit = m.frames ? PX_MAX : Math.min(MAX_STILL, (m.sourceWidth ?? m.width) * 2)
+  // Stills are enlarged up to twice their width (three times in Large). Video
+  // frames stop at PX_MAX in both: bigger frames cost cutting time and memory
+  // on every frame, and a Large player stretches them a little instead.
+  const limit = m.frames ? PX_MAX : Math.min(MAX_STILL, (m.sourceWidth ?? m.width) * 2 * sizeStep())
   const want = Math.min(limit, need)
   const key = sharpKey(m)
   if (!source || want < m.width * 1.15 || (sharpening.get(key) ?? 0) >= want) return

@@ -5,7 +5,7 @@ import type { EngineInterface } from 'claude-code'
 import type { Check, Frames, Shown } from '../types'
 
 import { state } from './state'
-import { frameWidth, SIDEBAR } from './layout'
+import { frameWidth, PX_MAX, SIDEBAR } from './layout'
 import { debug } from './telemetry'
 
 // Deletes the oldest frame folders until the cache is under $1 KB, keeping the
@@ -254,7 +254,8 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   }
   const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'default=nw=1', real])
   const field = (name: string) => Number(new RegExp(`^${name}=([0-9.]+)`, 'm').exec(facts.stdout)?.[1] ?? Number.NaN)
-  const cut = cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell)
+  // Frames stay within PX_MAX in every Picture size (see sharpen).
+  const cut = Math.min(PX_MAX, cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell))
   const own = field('width') > 0 && field('height') > 0 ? { sourceWidth: field('width'), sourceHeight: field('height') } : {}
   // A clip is cut once per width: a bigger window cuts it again, bigger.
   const folder = key && `v-${keyOf(`${key}|${cut}${state.sendBytes ? '|bytes' : ''}`)}`

@@ -4,6 +4,7 @@ import { wrapWords, pagesOf, fit, cellOf, frameWidth, paneSize, layoutOf, target
 import { isInstalledCopy } from '../hooks/telemetry'
 import { isAtLeast } from '../hooks/setup'
 import { STOPS } from '../hooks/tour'
+import { settings } from '../hooks/state'
 import { anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, chunksBehind, chunksAhead, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
 import { parseShown, timesThatMean, versionsOf, noteOf, handleOf } from '../hooks/history'
 import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, profileLine } from '../hooks/player'
@@ -441,4 +442,19 @@ test('the line goes in the profile the shell reads, only inside that terminal', 
   expect(profileOf('/bin/tcsh', '/home/a', false)).toBe(null)
   expect(profileLine('warp', '/bin/zsh')).toBe('if [ "$TERM_PROGRAM" = "WarpTerminal" ]; then export CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1; fi # show-your-work: pictures in Warp')
   expect(profileLine('konsole', '/usr/bin/fish')).toBe('if test -n "$KONSOLE_VERSION"; set -gx CLAUDE_CODE_FORCE_TERMINAL_IMAGES 1; end # show-your-work: pictures in Konsole')
+})
+
+test('Picture size: Large is Standard times one fixed step', () => {
+  const room = { columns: 250, rows: 70, isPane: false, hasReport: false }
+  expect(layoutOf(room).maxCols).toBe(120)
+  expect(layoutOf(room).maxRows).toBe(38)
+  settings.standard_size = false
+  try {
+    expect(layoutOf(room).maxCols).toBe(180)
+    expect(layoutOf(room).maxRows).toBe(57)
+    // Same window, same picture, same box, every time.
+    expect(targetBox(1600, 1000, layoutOf(room), { width: 8, height: 16 })).toEqual(targetBox(1600, 1000, layoutOf(room), { width: 8, height: 16 }))
+  } finally {
+    settings.standard_size = true
+  }
 })

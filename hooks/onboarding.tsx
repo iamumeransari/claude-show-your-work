@@ -30,6 +30,17 @@ export const earlierNo = (consent: unknown, statsOff: unknown, updatesOff: unkno
   return { isStatsOff: statsOff === true || asked.stats === false, isUpdatesOff: updatesOff === true || asked.updates === false }
 }
 
+// Reads the saved settings once per plugin load. A reload starts with the
+// defaults in memory, and without this pictures would be laid out as Standard
+// until the next session start.
+let hasLoadedSettings = false
+export async function ensureSettings($: EngineInterface) {
+  if (hasLoadedSettings) return
+  hasLoadedSettings = true
+  // Unreadable (no store): the defaults stand.
+  await loadSettings($).catch(() => undefined)
+}
+
 export async function loadSettings($: EngineInterface) {
   const saved = ((await $.store.get('settings')) ?? {}) as Partial<Record<Field, unknown>>
   if (typeof saved.usage_stats !== 'boolean' && earlierNo(await $.store.get('consent'), await $.store.get('statsOff'), null).isStatsOff) settings.usage_stats = false
@@ -44,6 +55,11 @@ async function switchSetting($: EngineInterface, field: Field, value: boolean) {
   await $.store.set('settings', { ...settings })
   // The profile keeps the install's current choice of update channel.
   if (field === 'stable_updates') track('settings_changed', { $set: { update_channel: value ? 'stable' : 'latest' } })
+  if (field === 'standard_size') {
+    track('settings_changed', { $set: { picture_size: value ? 'standard' : 'large' } })
+    // Players already on screen redraw at the new size.
+    redraw($)
+  }
   // Turning usage data off sends one last signal saying so, then nothing more.
   if (field === 'usage_stats' && !value && state.isOn) {
     track('usage_data_turned_off', { $set: { usage_data: 'off' } })

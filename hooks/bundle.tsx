@@ -37,9 +37,13 @@ export function layoutOf(room: Room): Layout {
   // The window's border and padding; a pane has no row border of its own.
   const inner = room.columns - (room.isPane ? 6 : 10)
   const space = inner - (isWide ? SIDE + 3 : 0)
-  const maxCols = Math.max(1, Math.max(Math.min(space, 24), Math.min(space, room.isPane ? 220 : 120)))
-  // Inline, a picture takes at most 55% of the screen's height; a pane keeps 12 rows for its controls.
-  const maxRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(40, Math.floor(room.rows * 0.55)))
+  // Picture size (settings): Large is Standard times SIZE_STEP, every limit
+  // scaled by the same fixed factor, so a picture's size stays predictable.
+  const step = sizeStep()
+  const maxCols = Math.max(1, Math.max(Math.min(space, 24), Math.min(space, Math.round((room.isPane ? 220 : 120) * step))))
+  // Inline, a picture takes at most 55% of the screen's height (82% in Large);
+  // a pane keeps 12 rows for its controls.
+  const maxRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(Math.round(40 * step), Math.floor(room.rows * 0.55 * step)))
   return { isWide, inner, maxCols, maxRows }
 }
 export const targetBox = (width: number, height: number, layout: Layout, px: Cell | null) =>
@@ -48,8 +52,11 @@ export const drawBox = (width: number, height: number, layout: Layout, px: Cell 
   fit(width, height, layout.maxCols, layout.maxRows, px, true)
 // Enough for the box's width and, given the picture's shape, its height:
 // boxes are whole rows, so a wide picture sized by width alone falls short.
+// Large (Picture size) scales every size limit by this one factor.
+export const SIZE_STEP = 1.5
+export const sizeStep = () => (settings.standard_size ? 1 : SIZE_STEP)
 export const pixelsFor = (box: { columns: number; rows?: number }, px: Cell | null, aspect = 0) =>
-  px ? Math.max(PX_MIN, Math.min(PX_MAX, Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
+  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
 
 // Fits a picture in a box of cells, its own shape. With the cell's size in
 // pixels known and `isCapped`, never past the picture's own pixels; unknown,
@@ -538,7 +545,8 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   }
   const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'default=nw=1', real])
   const field = (name: string) => Number(new RegExp(`^${name}=([0-9.]+)`, 'm').exec(facts.stdout)?.[1] ?? Number.NaN)
-  const cut = cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell)
+  // Frames stay within PX_MAX in every Picture size (see sharpen).
+  const cut = Math.min(PX_MAX, cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell))
   const own = field('width') > 0 && field('height') > 0 ? { sourceWidth: field('width'), sourceHeight: field('height') } : {}
   // A clip is cut once per width: a bigger window cuts it again, bigger.
   const folder = key && `v-${keyOf(`${key}|${cut}${state.sendBytes ? '|bytes' : ''}`)}`
@@ -1183,7 +1191,10 @@ function useSharpest(m: Shown) {
 }
 function sharpen($: EngineInterface, m: Shown, need: number) {
   const source = m.source
-  const limit = m.frames ? PX_MAX : Math.min(MAX_STILL, (m.sourceWidth ?? m.width) * 2)
+  // Stills are enlarged up to twice their width (three times in Large). Video
+  // frames stop at PX_MAX in both: bigger frames cost cutting time and memory
+  // on every frame, and a Large player stretches them a little instead.
+  const limit = m.frames ? PX_MAX : Math.min(MAX_STILL, (m.sourceWidth ?? m.width) * 2 * sizeStep())
   const want = Math.min(limit, need)
   const key = sharpKey(m)
   if (!source || want < m.width * 1.15 || (sharpening.get(key) ?? 0) >= want) return
@@ -2520,10 +2531,11 @@ export const state = {
 export const SETTINGS = [
   { field: 'stable_updates', title: 'Updates', options: ['Stable releases', 'Latest'], text: 'Automatically install plugin updates from GitHub' },
   { field: 'usage_stats', title: 'Usage data', options: ['Share anonymously', "Don't share"], text: 'Helps fix bugs and improve the product experience. No sensitive data is ever shared' },
+  { field: 'standard_size', title: 'Picture size', options: ['Standard', 'Large'], text: 'Large shows pictures and videos one and a half times bigger' },
 ] as const
 export type Field = (typeof SETTINGS)[number]['field']
 // Each switch is true on its first option, the default.
-export const settings: Record<Field, boolean> = { stable_updates: true, usage_stats: true }
+export const settings: Record<Field, boolean> = { stable_updates: true, usage_stats: true, standard_size: true }
 
 // ── history.ts ────────────────────────────────────────────────────────────
 // Version history: every shown file kept in .show-your-work/, linked to the
@@ -2916,6 +2928,17 @@ export const earlierNo = (consent: unknown, statsOff: unknown, updatesOff: unkno
   return { isStatsOff: statsOff === true || asked.stats === false, isUpdatesOff: updatesOff === true || asked.updates === false }
 }
 
+// Reads the saved settings once per plugin load. A reload starts with the
+// defaults in memory, and without this pictures would be laid out as Standard
+// until the next session start.
+let hasLoadedSettings = false
+export async function ensureSettings($: EngineInterface) {
+  if (hasLoadedSettings) return
+  hasLoadedSettings = true
+  // Unreadable (no store): the defaults stand.
+  await loadSettings($).catch(() => undefined)
+}
+
 export async function loadSettings($: EngineInterface) {
   const saved = ((await $.store.get('settings')) ?? {}) as Partial<Record<Field, unknown>>
   if (typeof saved.usage_stats !== 'boolean' && earlierNo(await $.store.get('consent'), await $.store.get('statsOff'), null).isStatsOff) settings.usage_stats = false
@@ -2930,6 +2953,11 @@ async function switchSetting($: EngineInterface, field: Field, value: boolean) {
   await $.store.set('settings', { ...settings })
   // The profile keeps the install's current choice of update channel.
   if (field === 'stable_updates') track('settings_changed', { $set: { update_channel: value ? 'stable' : 'latest' } })
+  if (field === 'standard_size') {
+    track('settings_changed', { $set: { picture_size: value ? 'standard' : 'large' } })
+    // Players already on screen redraw at the new size.
+    redraw($)
+  }
   // Turning usage data off sends one last signal saying so, then nothing more.
   if (field === 'usage_stats' && !value && state.isOn) {
     track('usage_data_turned_off', { $set: { usage_data: 'off' } })
@@ -3827,6 +3855,7 @@ export const register: Register = on => {
       // After /reload-plugins nothing else has set up the folders yet: without
       // this the result looks for its picture in the wrong place and collapses.
       await setUp($)
+      await ensureSettings($)
       const shown = await shownOf($, props.output)
       if (!shown) return next(e)
       view = atStep(shown, e.requestId)
@@ -3898,6 +3927,7 @@ export const register: Register = on => {
     // /img: the player, in the chat under the command.
     if (row.command === 'img' && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
+      await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
       if (!shown) {
         // A row from before a restart: the picture is no longer at hand.

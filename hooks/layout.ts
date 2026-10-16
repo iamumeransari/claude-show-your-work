@@ -2,7 +2,7 @@
 // picture needs, and the helpers that fit text to a width.
 import type { EngineInterface } from 'claude-code'
 
-import { state } from './state'
+import { settings, state } from './state'
 
 // The window's fill: a step lighter than a dark terminal, so it reads as one panel.
 const PANEL = '#2c2e35'
@@ -31,9 +31,13 @@ export function layoutOf(room: Room): Layout {
   // The window's border and padding; a pane has no row border of its own.
   const inner = room.columns - (room.isPane ? 6 : 10)
   const space = inner - (isWide ? SIDE + 3 : 0)
-  const maxCols = Math.max(1, Math.max(Math.min(space, 24), Math.min(space, room.isPane ? 220 : 120)))
-  // Inline, a picture takes at most 55% of the screen's height; a pane keeps 12 rows for its controls.
-  const maxRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(40, Math.floor(room.rows * 0.55)))
+  // Picture size (settings): Large is Standard times SIZE_STEP, every limit
+  // scaled by the same fixed factor, so a picture's size stays predictable.
+  const step = sizeStep()
+  const maxCols = Math.max(1, Math.max(Math.min(space, 24), Math.min(space, Math.round((room.isPane ? 220 : 120) * step))))
+  // Inline, a picture takes at most 55% of the screen's height (82% in Large);
+  // a pane keeps 12 rows for its controls.
+  const maxRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(Math.round(40 * step), Math.floor(room.rows * 0.55 * step)))
   return { isWide, inner, maxCols, maxRows }
 }
 export const targetBox = (width: number, height: number, layout: Layout, px: Cell | null) =>
@@ -42,8 +46,11 @@ export const drawBox = (width: number, height: number, layout: Layout, px: Cell 
   fit(width, height, layout.maxCols, layout.maxRows, px, true)
 // Enough for the box's width and, given the picture's shape, its height:
 // boxes are whole rows, so a wide picture sized by width alone falls short.
+// Large (Picture size) scales every size limit by this one factor.
+export const SIZE_STEP = 1.5
+export const sizeStep = () => (settings.standard_size ? 1 : SIZE_STEP)
 export const pixelsFor = (box: { columns: number; rows?: number }, px: Cell | null, aspect = 0) =>
-  px ? Math.max(PX_MIN, Math.min(PX_MAX, Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
+  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
 
 // Fits a picture in a box of cells, its own shape. With the cell's size in
 // pixels known and `isCapped`, never past the picture's own pixels; unknown,

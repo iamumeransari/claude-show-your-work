@@ -16,7 +16,7 @@ import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, store
 import { hadVersionBefore06, PLUGIN } from './updater'
 import { atStep, cantDraw, draw, freshCalls, mayBeDropped, noteDrawn, NoticeBox, player, readPicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
 import type { Ui } from './player'
-import { goToStop, loadSettings, Opening, openSettings, openUpdate, openWelcome, Settings, startBackground, startTour, Tour, TOUR_TEXT, UPDATE, UpdatePane, WELCOME_TEXT } from './onboarding'
+import { ensureSettings, goToStop, loadSettings, Opening, openSettings, openUpdate, openWelcome, Settings, startBackground, startTour, Tour, TOUR_TEXT, UPDATE, UpdatePane, WELCOME_TEXT } from './onboarding'
 
 const PANE = 'show-your-work'
 // The tools, and their names from before the rename, so old windows still draw.
@@ -388,6 +388,7 @@ export const register: Register = on => {
       // After /reload-plugins nothing else has set up the folders yet: without
       // this the result looks for its picture in the wrong place and collapses.
       await setUp($)
+      await ensureSettings($)
       const shown = await shownOf($, props.output)
       if (!shown) return next(e)
       view = atStep(shown, e.requestId)
@@ -459,6 +460,7 @@ export const register: Register = on => {
     // /img: the player, in the chat under the command.
     if (row.command === 'img' && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
+      await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
       if (!shown) {
         // A row from before a restart: the picture is no longer at hand.

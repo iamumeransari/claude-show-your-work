@@ -4,7 +4,7 @@ import { BRANCHES, MOVE_SH, checkForUpdate } from '../hooks/updater'
 
 // A stand-in for the engine: GitHub says `latest`, the CLI reports `installed`
 // from a marketplace of `source`, and every command run is recorded.
-function engine(o: { latest?: string; installed?: string; source?: string; ref?: string | null; env?: Record<string, string>; checkedAt?: number; updateExit?: number; addExit?: number; installFailsOnce?: boolean; installFails?: number; missingBinaries?: string[] } = {}) {
+function engine(o: { latest?: string; installed?: string; source?: string; ref?: string | null; env?: Record<string, string>; checkedAt?: number; updateExit?: number; addExit?: number; installFailsOnce?: boolean; installFails?: number; missingBinaries?: string[]; noCli?: boolean } = {}) {
   const runs: string[][] = []
   const fetched: string[] = []
   let installed = o.installed ?? '0.5.0'
@@ -23,7 +23,7 @@ function engine(o: { latest?: string; installed?: string; source?: string; ref?:
     ui: { toast: (t: string) => void toasts.push(t), status: (t: string | undefined) => void statuses.push(t ?? '') },
     process: {
       run: async (argv: string[]) => {
-        if (o.missingBinaries?.includes(argv[0]!)) throw new Error('ENOENT')
+        if (o.noCli || o.missingBinaries?.includes(argv[0]!)) throw new Error('ENOENT')
         runs.push(argv)
         const args = argv.slice(1).join(' ')
         if (args === 'plugin marketplace list --json') return { exitCode: 0, stderr: '', stdout: JSON.stringify([{ name: 'iamumeransari', source: o.source ?? 'git', url: 'https://github.com/iamumeransari/claude-show-your-work.git', ref: o.ref === null ? undefined : o.ref ?? 'releases' }]) }
@@ -157,4 +157,10 @@ test('an old no to updates (0.5.12, 0.5.16) no longer stops them', async () => {
     await checkForUpdate(e.$, '0.6.0', BRANCHES.stable)
     expect(e.fetched.length).toBe(1)
   }
+})
+
+test('when Claude Code\'s command can\'t be found, it says so and tries again next session', async () => {
+  const e = engine({ noCli: true })
+  await checkForUpdate(e.$, '0.5.0')
+  expect(e.store.get('updateCheckedAt')).toBeUndefined()
 })

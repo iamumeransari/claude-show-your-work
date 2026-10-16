@@ -41,15 +41,16 @@ export function isNewer(latest: string, current: string): boolean {
   return false
 }
 
-// Where Claude Code's CLI usually is, when it isn't on the session's PATH.
-const CLAUDE_BINARIES = ['claude', '.local/bin/claude', '.claude/local/claude', '/opt/homebrew/bin/claude', '/usr/local/bin/claude']
+// Where Claude Code's CLI usually is, when the login shell didn't find it
+// (state.claudePath, found at session start) and it isn't on the session's PATH.
+const CLAUDE_BINARIES = ['claude', '.local/bin/claude', '.claude/local/claude', '.npm-global/bin/claude', '/opt/homebrew/bin/claude', '/usr/local/bin/claude', '/usr/bin/claude']
 let claudeBinary = ''
 
 // Runs Claude Code's CLI with the session's own environment (its PATH and
 // CLAUDE_CONFIG_DIR), so it changes this install and no other.
 async function claude($: EngineInterface, args: string[]) {
   const known = CLAUDE_BINARIES.map(b => (b.startsWith('.') ? `${state.home}/${b}` : b))
-  const candidates = [...new Set([claudeBinary, ...known].filter(Boolean))]
+  const candidates = [...new Set([claudeBinary, state.claudePath, ...known].filter(Boolean))]
   for (const bin of candidates) {
     const r = await $.process.run([bin, ...args], { timeoutMs: 120_000 }).catch(() => undefined)
     if (r) {
@@ -74,8 +75,12 @@ export async function checkForUpdate($: EngineInterface, current: string, branch
   if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')) return
   const now = await $.clock.now()
   if (now - Number((await $.store.get('updateCheckedAt')) ?? 0) < DAY_MS) return
-  await $.store.set('updateCheckedAt', now)
   const found = await findUpdate($, current, branch)
+  // Every check says how it ended, so a stuck install shows why. Only a check
+  // that got through counts for the day; one that couldn't run tries again
+  // at the next session.
+  track('update_check', { result: found.kind, channel: branch, ...('latest' in found ? { latest: found.latest } : {}) })
+  if (found.kind !== 'offline' && found.kind !== 'no_cli') await $.store.set('updateCheckedAt', now)
   const isReady = found.kind === 'pending' || ((found.kind === 'update' || found.kind === 'move') && (await installUpdate($, found, current)))
   if (isReady && 'latest' in found) $.ui.status(`show-your-work ${found.latest} is ready. Restart Claude Code to use it.`)
 }
@@ -88,6 +93,7 @@ export async function checkForUpdate($: EngineInterface, current: string, branch
 //   folder   loaded from a local folder (development), so it never updates
 //   pinned   installed from a fixed tag such as #v0.5.14, so it never updates
 //   offline  GitHub couldn't be reached
+//   no_cli   Claude Code's CLI couldn't be found or didn't answer
 export type Found =
   | { kind: 'update'; latest: string; scope: string }
   | { kind: 'move'; latest: string; branch: Branch; market: { url?: string; ref?: string } }
@@ -96,6 +102,7 @@ export type Found =
   | { kind: 'folder' }
   | { kind: 'pinned'; ref: string }
   | { kind: 'offline' }
+  | { kind: 'no_cli' }
 export async function findUpdate($: EngineInterface, current: string, branch: Branch): Promise<Found> {
   // No such branch yet, or no network: nothing to say about it.
   // Each channel's address written out in full, so the directory review can read it.
@@ -108,7 +115,9 @@ export async function findUpdate($: EngineInterface, current: string, branch: Br
   if (!latest) return { kind: 'offline' }
 
   // A marketplace read from a folder is someone working on the plugin: leave it.
-  const markets = jsonOf<{ name: string; source: string; url?: string; ref?: string }[]>((await claude($, ['plugin', 'marketplace', 'list', '--json']))?.stdout, [])
+  const listed = await claude($, ['plugin', 'marketplace', 'list', '--json'])
+  if (!listed || listed.exitCode !== 0) return { kind: 'no_cli' }
+  const markets = jsonOf<{ name: string; source: string; url?: string; ref?: string }[]>(listed.stdout, [])
   const market = markets.find(m => m.name === MARKETPLACE)
   if (!market || market.source === 'directory') return { kind: 'folder' }
   // Added with #v0.5.14 or another ref: the user chose that version.

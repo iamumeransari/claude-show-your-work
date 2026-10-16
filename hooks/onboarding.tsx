@@ -140,6 +140,10 @@ export function UpdatePane(ui: Ui, $: EngineInterface) {
   } else if (found?.kind === 'pinned') {
     head = `This install is pinned to ${found.ref}, so it doesn't update`
     actions = [close]
+  } else if (found?.kind === 'no_cli') {
+    head = "Couldn't find Claude Code's command"
+    line = 'Update by hand with: claude plugin update show-your-work@iamumeransari'
+    actions = [close]
   } else if (found?.kind === 'offline') {
     head = "Couldn't check for updates"
     line = 'Check your connection and run /show-your-work update again.'

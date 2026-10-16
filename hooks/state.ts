@@ -15,6 +15,8 @@ export const state = {
   home: '',
   ffmpeg: 'ffmpeg',
   ffprobe: 'ffprobe',
+  // Claude Code's CLI, as the login shell finds it ('' when it doesn't).
+  claudePath: '',
   // setUp's one run, shared by everything that waits on it.
   setup: null as Promise<void> | null,
   // Whether a Button can hold coloured Text (Claude Code 2.1.295 and later).

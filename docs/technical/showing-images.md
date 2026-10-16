@@ -20,6 +20,16 @@ The picture is an `Image` element. Video playback swaps its source with `$.ui.bl
 - **Ghostty keeps a picture at the size it was last sent.** When the box changes size but the source doesn't, the picture is cropped, not rescaled. File sources carry `generation: box.columns * 1000 + box.rows`, so a new box means a new source. Byte sources have no generation field; a crop can flash for a frame until the next redraw.
 - Nothing may wrap, overlay or fill behind the `Image`. Each of those stopped it drawing in Ghostty.
 
+## How Claude Code's `Image` draws (read from 2.1.301)
+
+So nobody has to dig through the binary again:
+
+- **It uses kitty Unicode placeholders.** The `Image` is a fixed box of exactly `columns` × `rows` cells (`overflow: hidden`), filled with placeholder characters; the picture itself is sent once and the terminal paints it into those cells. The terminal fits the picture into that box keeping its shape, and never past its own pixels.
+- **It sends the picture again only when the source's identity or the box (`${columns}x${rows}`) changes.** Same source and box: nothing is sent. That's why file sources carry a `generation`.
+- **File sources need the terminal to read local files.** At first use Claude Code writes a 4-byte `tty-graphics-protocol-*.rgba` file to the temp folder and asks the terminal to load it (`a=q,t=f`). If the terminal says no, every `{ file }` source draws its alt text (the message says "this terminal cannot read files on this machine"); byte sources still draw. Over ssh the answer is no, which is why `sendBytes` exists.
+- **Image ids:** 24-bit ids with truecolour, 8-bit with 256 colours, none (alt text) below that. With 8-bit ids, too many pictures on screen at once run out of ids and show their alt text.
+- If the terminal never answers its startup queries (XTVERSION `ESC [>0q`, device attributes `ESC [c`, the graphics query `a=q,t=d`), no picture is sent at all.
+
 ## Player layout
 
 Every view (one picture, Original/Updated, side by side) is built from the same zones, in this order:
@@ -38,12 +48,46 @@ No sizes in the UI: no resolution, and a video's length only on its scrub bar.
 
 All sizing goes through `hooks/layout.ts`:
 
-- `layoutOf(room)`: the space a player has. `room` is its columns and rows, pane or inline, and whether it has a report. Gives `maxCols`, `maxRows`, whether the report sits beside (`isWide`) and the inner width. Inline, a picture takes at most 120 columns and 55% of the rows (8 to 40); in a pane up to 220 columns and the pane's rows minus 12. The report sits beside when there is one and the chat is at least `WIDE_ENOUGH` (110) columns, in a `SIDE` (40) column.
+- `layoutOf(room)`: the space a player has. `room` is its columns and rows, pane or inline, and whether it has a report. Gives `maxCols`, `maxRows`, whether the report sits beside (`isWide`) and the inner width. In Standard, inline, a picture takes at most 120 columns and 55% of the rows (8 to 40); Large scales these (see Picture size); in a pane up to 220 columns and the pane's rows minus 12. The report sits beside when there is one and the chat is at least `WIDE_ENOUGH` (110) columns, in a `SIDE` (40) column.
 - `targetBox(w, h, layout, cell)`: the box a picture of that shape fills.
 - `pixelsFor(box, cell, aspect)`: the screen pixels that box needs, for its width and its height, between `PX_MIN` (320) and `PX_MAX` (2400).
 - `drawBox(w, h, layout, cell)`: the box actually drawn: the target, cut down to the picture's own pixels, so a picture that's short of pixels is drawn whole at its size instead of small in a big box.
 - `frameWidth`: the width a picture or clip is made at when prepared, the pixels an inline player without a report needs in this terminal.
 - `sharpen`: when a player needs at least 15% more pixels than its picture has (a bigger window, a pane), a sharper copy is made in the background from the original file and swapped into the same object, so a playing video carries on. Stills stop at twice their own width and `MAX_STILL` (3200); videos at `PX_MAX`.
+
+## Picture size: Standard and Large
+
+The setting (`standard_size`, Standard by default) scales every size limit by one fixed factor, `sizeStep()`: 1 for Standard, `SIZE_STEP` (1.5) for Large. Nothing else knows Large exists.
+
+| | Standard | Large |
+|---|---|---|
+| Max width, inline (`maxCols`) | 120 columns | 180 |
+| Max width, pane | 220 | 330 |
+| Max height, inline (`maxRows`) | 40 rows, 55% of the screen | 60 rows, 82% |
+| Box pixels (`pixelsFor` cap) | 2400 | 3600 |
+| Stills enlarged up to | 2× their width | 3× |
+| Video frames | 2400 px | 2400 px, the same |
+
+- **Videos keep Standard's 2400 px frames.** Bigger frames cost cutting time and memory on every frame (about 2.25× the pixels at 3600) and risked bringing back stutter. A Large player shows them in its bigger box anyway.
+- **Standard is unchanged by the setting's code.** Checked by running the new `layout.ts` against the one before it (from git) on 2,016 combinations of window, pane, report, cell size and picture shape: no difference in any box or pixel width. Repeat that check whenever sizing changes (see `testing-and-debugging.md`).
+- Changing the setting calls `redraw`, so pictures on screen re-lay out at once.
+
+### Why not a full-window size (tried and dropped in 0.7.0)
+
+A "Full window" option that stretched the frame and picture to the whole window was built and dropped. Keep these in mind before trying anything like it again:
+
+- **The terminal never enlarges a picture,** so filling a window means making a copy at the window's pixel width. Every window size needs its own copy; rounding to fixed widths (640 to 3200) still left up to eight files per picture and visible swaps.
+- **Shrinking a window cut the picture off.** The big copy made for the wide window stayed in use, and the terminal crops rather than shrinks an oversized picture in a smaller box. Fixing that meant a copy per size on the way down too.
+- **Off macOS the cell size is often unknown,** so "fill the window" had to guess a cell size (20 × 40 px was used), which was either blurry or wasteful.
+- **Cost:** a 3200 × 2000 picture is ~25 MB decoded, so far fewer fit in the terminal's 320 MB store and scrolling back re-sends more.
+
+A fixed multiplier keeps a picture's size a function of only the picture, the window, the cell and the setting: the same inputs always give the same box, and resizing behaves exactly as Standard. The Full window work is on the local branch `picture-size` (never pushed).
+
+### Open: Large in the tour
+
+In Large, tour stops were seen drawn smaller than their frame, in the frame's top-left corner, with frame widths changing between stops. The layout gives the right box (checked headless at the same window size), so the picture file drawn has fewer pixels than its box, and the terminal doesn't enlarge it. Not yet resolved; update this note with the cause.
+
+## The sizing invariant
 
 The invariant, tested in `tests/fit.test.ts`: a picture made at `frameWidth` fills its box at any window size and shape. `fit` rounds rows with a hair of tolerance; without it, 38 rows computed as 37.999 lost a row and several columns.
 

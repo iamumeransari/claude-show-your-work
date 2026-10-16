@@ -17,12 +17,12 @@ Before changing an area, read its notes in `docs/technical/`:
 
 - `architecture.md`: the modules, and a tool call traced from Claude to the terminal
 - `plugin-loader-and-hooks.md`: what the hooks loader rejects, and engine behaviour that isn't obvious
-- `showing-images.md`: how pictures reach the screen, sizing, the terminal's limits (measured in Ghostty), ssh and background sessions
+- `showing-images.md`: how pictures reach the screen, how Claude Code's `Image` draws, sizing, Picture size (Standard/Large, and why not full window), the terminal's limits, ssh and background sessions
 - `playing-video.md`: how videos become frames, chunks, the 256-colour palette
 - `cache-and-version-history.md`: temp folder, version history, size caps, cleanup
-- `updates-and-onboarding.md`: update channels, settings, welcome and tour
-- `testing-and-debugging.md`: the test harness and its quirks, and how to check things on screen
+- `updates-and-onboarding.md`: update channels and checks, settings, welcome and tour, releasing
+- `testing-and-debugging.md`: the checks, the test harness and its quirks, proving a change leaves behaviour alone, a headless terminal, and checking on screen
 
-A change is done when `node tools/bundle.mjs` has been run, `npx -p typescript tsc -p .`, the Biome lint (see `testing-and-debugging.md`), `claude plugin validate .` and `claude plugin test .` pass, and anything visual has been looked at on screen in a normal (not background) Ghostty session. The tests can't see whether a picture draws.
+A change is done when `node tools/bundle.mjs` has been run, `node --test tools/bundle.test.mjs`, `npx -p typescript tsc -p .`, the Biome lint (see `testing-and-debugging.md`), `claude plugin validate .` and `claude plugin test .` pass on the newest Claude Code and on 2.1.286, and anything visual has been looked at on screen in a normal (not background) Ghostty session. The tests can't see whether a picture draws.
 
 When you learn something new about the engine, a terminal or the test harness, add it to the right file in `docs/technical/`.

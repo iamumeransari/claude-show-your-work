@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/iamumeransari/claude-show-your-work/stargazers"><img src="https://img.shields.io/github/stars/iamumeransari/claude-show-your-work?style=flat&logo=github&label=Stars&color=E3B341" alt="GitHub stars"></a>
   <a href="#install"><img src="https://img.shields.io/badge/Claude_Code-plugin-D97757?logo=claude&logoColor=white" alt="Claude Code plugin"></a>
-  <a href="#install"><img src="https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-555555" alt="macOS, Linux and Windows"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/macOS_%7C_Linux-555555" alt="macOS and Linux"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/iamumeransari/claude-show-your-work?color=22C55E" alt="MIT license"></a>
 </p>
 
@@ -22,7 +22,7 @@ Run these two commands in Claude Code:
 /plugin install show-your-work@iamumeransari
 ```
 
-It works on macOS, Linux and Windows. You need a terminal that supports the kitty graphics protocol, like Ghostty or Warp, and Claude Code 2.1.286 or later. Videos also need ffmpeg: install it with your package manager (`brew install ffmpeg` on macOS), or ask Claude to install it.
+It supports Ghostty and kitty, on macOS and Linux, with Claude Code 2.1.286 or later. Videos also need ffmpeg: install it with your package manager (`brew install ffmpeg` on macOS), or ask Claude to install it.
 
 When the install finishes, a short onboarding shows you around. Run `/show-your-work` at any time to change your settings.
 
@@ -76,19 +76,19 @@ Making an ad, an animation or a launch video? Each cut plays right in the chat, 
 
 ## Terminals
 
-show-your-work works in any terminal that supports the kitty graphics protocol, on macOS, Linux and Windows.
+show-your-work supports Ghostty and kitty, on macOS and Linux. Pictures work there straight away.
 
-- **Ghostty and kitty:** pictures work straight away.
-- **Warp, WezTerm and Konsole:** Claude Code leaves pictures off in these until you turn them on. The first time a picture can't show, press **Turn on pictures**, then restart Claude Code. You can turn it off again in `/show-your-work`.
+- **Warp, WezTerm and Konsole:** these support the kitty graphics protocol, but not the Unicode placeholders Claude Code draws pictures with, so pictures can't show in them yet.
+- **tmux:** works inside Ghostty or kitty. Claude Code leaves pictures off in tmux unless it starts with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1`, so the first time, the plugin turns that on for new tmux panes and the notice copies a command that reopens the chat with it. The plugin also turns on `allow-passthrough` for its own pane and passes the pictures through. Nothing in your tmux config is changed.
 
-Turn on pictures adds one line to your shell profile (`~/.zshrc`, `~/.bash_profile` or `~/.bashrc`, or fish's `config.fish`) that sets `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` only inside that terminal. Turning it off removes the line.
+Versions 0.6.7 to 0.6.9 offered a Turn on pictures button in Warp, WezTerm and Konsole, which added a line to your shell profile. It made pictures draw as a grid of boxes, so the plugin now removes that line by itself.
 
 ## FAQ
 
 <details>
 <summary><b>Can Claude Code show images in the terminal?</b></summary>
 
-Yes, Claude Code can show images in the terminal with the show-your-work plugin. Once it's installed, Claude shows screenshots, designs, charts and other images right in the chat. It works in terminals that support the kitty graphics protocol, like Ghostty and Warp.
+Yes, Claude Code can show images in the terminal with the show-your-work plugin. Once it's installed, Claude shows screenshots, designs, charts and other images right in the chat. It works in Ghostty and kitty.
 
 </details>
 
@@ -151,7 +151,7 @@ No, show-your-work barely uses any extra tokens, because it's built from the gro
 <details>
 <summary><b>Which terminals does it work in?</b></summary>
 
-The show-your-work plugin works in terminals that support the kitty graphics protocol, like Ghostty and Warp, on macOS, Linux and Windows.
+The show-your-work plugin supports Ghostty and kitty, on macOS and Linux.
 
 </details>
 
@@ -195,7 +195,7 @@ You choose whether to share anonymous usage data. You can make that choice durin
 
 Here's everything the plugin does on your computer, so you know exactly what you're installing. Your pictures and videos never leave your machine.
 
-To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted, and inside tmux it asks `tmux` whether pictures can get through.
+To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted.
 
 A few short scripts run with `sh` and `perl`. They find `ffmpeg` and your home folder, read the terminal's cell size so pictures fit, tidy the plugin's temp folder, open a viewer on Linux, and switch between the Stable and Latest channels. It also uses `cp`, `mkdir`, `rm`, `cat` and `touch` for its own temp files, and `claude plugin` to install its own updates from this repository, at most once a day. You can turn updates off. The updater will be turned off after the plugin moves to the Claude Code plugin directory, which keeps it up to date instead.
 
@@ -204,7 +204,7 @@ It keeps these files:
 - Video frames and converted pictures go in a temp folder (`$TMPDIR/claude-show-your-work-<your user id>`), and anything older than a week is cleaned up.
 - A copy of each file Claude shows you goes in `.show-your-work/` in your project, so you can look back through versions.
 - Save to Downloads puts a copy in `~/Downloads`.
-- Turn on pictures adds one line to your shell profile (see [Terminals](#terminals)), and turning it off takes the line back out.
+- If your shell profile has the line an older version's Turn on pictures added (see [Terminals](#terminals)), it removes that one line.
 - With `SHOW_YOUR_WORK_DEBUG=1`, it writes a `debug.log` in the temp folder.
 
 Once a day it reads the plugin's latest version number from `raw.githubusercontent.com`.
@@ -213,12 +213,12 @@ If Usage data is set to share in `/show-your-work`, it sends anonymous usage cou
 
 Inside Claude Code, it uses these hooks:
 
-- `prompt.compose` adds one short line to Claude's instructions, telling it this terminal can show pictures (or why it can't). It only does this when the plugin's tools are available.
+- `prompt.submit` sends one short line with your message, telling Claude this terminal can show pictures (or why it can't). It sends it once a session, again after a compaction, and when that changes.
 - `prompt.submit` closes the settings when you send a message and remembers the names of images you paste, so `/img` can find them. Your message isn't changed.
 - `tool.call` handles the plugin's own `show_image` and `show_video` tools. It never touches other tools.
 - `command.run` runs `/img` and `/show-your-work`. Right after you install, it runs `/show-your-work tour` once to show you around.
 - `ui.render` draws the plugin's player, notices, settings and tour.
-- `session.start` and `session.end` set up the temp folder and terminal at the start, and send any waiting usage counts at the end.
+- `session.start` and `session.end` set up the temp folder and terminal at the start, and send any waiting usage counts at the end. Inside tmux they also start and stop the picture pass-through for the plugin's pane (see [Terminals](#terminals)).
 
 </details>
 

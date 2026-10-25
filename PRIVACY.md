@@ -27,6 +27,7 @@ They never include file names, paths, web addresses, titles, prompts, anything f
 - Video frames and converted pictures, in a temp folder. Anything older than a week is deleted.
 - A copy of each file Claude shows you, in `.show-your-work/` in your project, for version history. Delete the folder any time.
 - Your settings and the random install id, in Claude Code's storage for the plugin.
+- Only if you start Claude Code with `SHOW_YOUR_WORK_DEBUG=1`: a debug log (`debug.log` in the temp folder) of what the plugin did, including file paths and window sizes, for bug reports. It stays on your computer unless you attach it to an issue yourself.
 
 Apart from the random install id, which goes with the usage counts, nothing kept on your computer is sent anywhere.
 

@@ -6,7 +6,7 @@ import type { Check, Frames, Shown } from '../types'
 
 import { state } from './state'
 import { frameWidth, PX_MAX, SIDEBAR } from './layout'
-import { debug } from './telemetry'
+import { debug } from './diagnostics'
 
 // Deletes the oldest frame folders until the cache is under $1 KB, keeping the
 // newest two and the ones named in $2; only inside a folder this user owns.
@@ -15,10 +15,16 @@ export const TRIM_SH = [
   // Only the folders the plugin names (v-<key>, v<n>-<time>, p-<key>,
   // p2-<key>), one per line: a picture named by the user never matches.
   'all=$(ls -dtr -- v* p* 2>/dev/null | grep -E "^(v-[0-9a-f]+|v[0-9]+-[0-9]+|p2?-[0-9a-f]+)$"); n=$(printf "%s\\n" "$all" | grep -c .)',
+  // Only these folders count against the cap: the stills beside them used to
+  // count too, so with enough of those every trim emptied the frame cache.
+  'size() { printf "%s\\n" "$all" | while IFS= read -r f; do [ -d "$f" ] && du -sk -- "$f"; done | awk \'{s += $1} END {print s + 0}\'; }',
   'printf "%s\\n" "$all" | head -n $((n > 2 ? n - 2 : 0)) | while IFS= read -r d; do',
   '  [ -n "$d" ] && [ -d "$d" ] || continue',
-  '  [ "$(du -sk . | cut -f1)" -le "$1" ] && break',
+  '  [ "$(size)" -le "$1" ] && break',
   '  case " $2 " in *" $d "*) continue ;; esac',
+  // A folder changed in the last two minutes may be being cut into right
+  // now (a copy at another width of a playing video): never pulled away.
+  '  [ -n "$(find "./$d" -maxdepth 0 -mmin -2 2>/dev/null)" ] && continue',
   '  [ -L "$d" ] || rm -rf "./$d"',
   'done; true',
 ].join('\n')
@@ -283,12 +289,13 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   // A clip of known length is decoded as it plays, a chunk at a time (see
   // ensureChunk); one without (MediaRecorder webm) is cut whole, as before.
   const total = known ? Math.max(1, Math.min(MAX_STREAMED, Math.floor((probed - lead) * fps))) : 0
-  const made = await $.process.run([
+  const pngsIn = async () => (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).map(f => `${dir}/${f.name}`)
+  const made = await cutFrames($, isFew => [
     // The palette waits for the end of its input: only the first chunk is read.
     state.ffmpeg, '-v', 'error', ...(lead ? ['-ss', String(lead)] : []), ...(known ? ['-t', chunkSeconds(Math.min(CHUNK, total), fps)] : []), '-i', real,
-    '-vf', `fps=${fps},${scaleFor(cut)}`,
-    '-frames:v', String(known ? Math.min(CHUNK, total) : MAX_FRAMES), '-compression_level', '1', `${dir}/f%05d.png`,
-  ])
+    '-vf', `fps=${fps},${scaleFor(cut, isFew)}`,
+    '-frames:v', String(known ? Math.min(CHUNK, total) : MAX_FRAMES), '-compression_level', '1', '-y', `${dir}/f%05d.png`,
+  ], pngsIn)
   if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
   const pngs = (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).length
   if (!pngs) throw new Error(`no frames in ${real}`)
@@ -303,25 +310,46 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   return { kind: 'video', path: poster, source: real, ...size, ...own, title, generation: state.generation, frames }
 }
 
+// The same clip at another width, for a resized window. Its facts (rate,
+// length, lead-in) are already known, so only the chunk on screen is cut
+// (about 0.3 s) instead of preparing the clip again from its start, which
+// took seconds and cut the wrong part first. The folder is the one
+// prepareVideo would use for that width, so either finds the other's frames.
+export async function rescaleVideo($: EngineInterface, m: Shown, width: number, at: number): Promise<Shown | null> {
+  const f = m.frames
+  const source = m.source
+  if (!f || !source) return null
+  const key = await identityOf($, source)
+  const dir = `${state.TMP}/v-${keyOf(`${key}|${width}${state.sendBytes ? '|bytes' : ''}`)}`
+  const frames: Frames = { ...f, dir, cut: width }
+  const i = Math.max(0, Math.min(at, f.count - 1))
+  await $.process.run(['mkdir', '-p', dir])
+  await ensureChunk($, frames, source, i)
+  const shown = frameFile(frames, i)
+  if (await isGone($, shown)) return null
+  const size = await pngSize($, shown)
+  await writeMeta($, dir, { frames: { count: f.count, fps: f.fps, duration: f.duration, cut: width, ...(f.lead ? { lead: f.lead } : {}) }, ...size })
+  void trimFrames($)
+  return { ...m, path: shown, ...size, generation: ++state.generation, frames }
+}
+
 // Frames are decoded from the clip as it plays, 24 at a time: the chunk on
 // screen and the ones a 5 s skip either way reaches stay on disk, the rest
 // go. A frame asked for again further away (a long seek, a window scrolled
 // back to) is decoded again. The poster, frame 1, always stays.
 const CHUNK = 24
-// Chunks with time to spare (two or more ahead of the playhead) are cut at
-// a lower priority. On macOS that's the utility class: measured on an M1, a
-// 2 s chunk cut in 1.2 s with the machine free, the same as normal, and in
-// 7 s with every core busy, giving way. nice 10 didn't give way at all on
-// macOS, and the background class took 4.7 s even on a free machine. Linux
-// uses nice, which does give way there. The chunk needed next always runs at
-// normal priority, so playback keeps moving however busy the machine is.
-const GENTLY = 'if command -v taskpolicy >/dev/null 2>&1; then exec taskpolicy -c utility "$@"; fi; if command -v nice >/dev/null 2>&1; then exec nice -n 10 "$@"; fi; exec "$@"'
-const gently = (argv: string[]) => ['sh', '-c', GENTLY, 'sh', ...argv]
-// And on one thread: ffmpeg's default spreads one cut over several cores and
-// buffers for each. Measured on an M1 for 1 s of video at 2400 px: default
-// 1.3 s of CPU and 368 MB, one thread 0.85 s and 213 MB, still faster than
-// playback. The first chunk, cut before the video shows, keeps the default
-// so it appears quickly.
+// Every chunk is cut at normal priority. Chunks two or more ahead used to be
+// cut at macOS's utility class (nice 10 on Linux) to give way to other work,
+// but with every core busy macOS starves that class outright: a chunk never
+// finished, and when playback reached it, it waited on that cut and froze
+// for good (#14). Cutting only runs while a video plays, 5 s ahead at most.
+// Chunks are cut with ffmpeg's default threads, one cut at a time (see
+// cutAhead). One thread each looked enough on a plain test clip (1 s at
+// 2400 px in 0.85 s), but real footage is far heavier: a 72 Mbit/s 1080p
+// H.264 export with keyframes up to 3 s apart took 4.9 s per 2 s chunk on
+// one thread (7.7 s with every core busy), so playback waited on every chunk
+// and ran in slow motion (#14). Default threads: 1.4 s (2.4 s busy), at about
+// 310 MB peak instead of 133 MB. The side-by-side clip still uses one thread.
 const ONE_THREAD = ['-threads', '1', '-filter_threads', '1']
 const decoding = new Map<string, Promise<void>>()
 export function exists($: EngineInterface, file: string) {
@@ -350,14 +378,35 @@ export async function recutFrame($: EngineInterface, media: Shown, i: number): P
   return !(await isGone($, frameFile(f, Math.min(i, f.count - 1))))
 }
 
+// A terminal that refuses a picture file draws an empty box, and nothing comes
+// back to say so. Ghostty and kitty read any file up to 400 MB (checked in
+// their source), inside tmux too. Others may not: Orca reads one only from a
+// temp folder or the terminal's own worktree, and only up to 2 MiB (#16).
+// Elsewhere a still is drawn from a temp-folder copy under 2 MB (pngSource),
+// and a chunk with a frame over it is cut again in 256 colours (cutFrames).
+const READS_ANY_FILE = new Set(['ghostty', 'kitty'])
+export const readsAnyFile = () => READS_ANY_FILE.has(state.terminalName) || READS_ANY_FILE.has(state.outerTerminal)
+export const BYTES_MAX = 2_000_000
 // Over ssh every frame crosses as bytes: 256 colours, one palette per chunk,
 // no dithering, halve them. Frames on this machine go by path in full colour.
 const PALETTE = ',split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none'
 // How much of the clip a chunk reads, a frame's slack included.
 export const chunkSeconds = (frames: number, fps: number) => String(+((frames + 1) / fps).toFixed(3))
-const scaleFor = (cut?: number) => (cut ? `scale=${cut}:-2` : "scale='min(1600,iw)':-2") + (state.sendBytes ? PALETTE : '')
+const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : "scale='min(1600,iw)':-2") + (isFew ? PALETTE : '')
+// Runs a cut. Outside Ghostty and kitty, a frame over BYTES_MAX may not draw,
+// so the rare chunk with one (a very wide window, grainy footage) is cut again
+// in 256 colours. Every other chunk keeps full colour; the check is a stat per
+// frame and no process.
+async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], files: () => Promise<string[]>) {
+  const made = await $.process.run(cut(state.sendBytes))
+  if (made.exitCode !== 0 || state.sendBytes || readsAnyFile()) return made
+  const sizes = await Promise.all((await files()).map(f => Promise.resolve().then(() => $.fs.stat(f)).then(st => st.size, () => 0)))
+  if (!sizes.some(size => size > BYTES_MAX)) return made
+  debug('cut again in 256 colours: a frame is over 2 MB')
+  return $.process.run(cut(true))
+}
 
-function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, i: number, isUrgent = true): Promise<void> {
+function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, i: number): Promise<void> {
   const c = Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)
   const key = `${f.dir}#${c}`
   const running = decoding.get(key)
@@ -369,12 +418,13 @@ function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, 
     if (!source) return
     const cutAt = Date.now()
     await $.process.run(['mkdir', '-p', f.dir])
-    const cutChunk = [
-      state.ffmpeg, '-v', 'error', ...ONE_THREAD, '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-t', chunkSeconds(Math.min(CHUNK, f.count - first), f.fps), '-i', source,
-      '-vf', `fps=${f.fps},${scaleFor(f.cut)}`, '-frames:v', String(Math.min(CHUNK, f.count - first)),
-      '-threads', '1', '-start_number', String(first + 1), '-compression_level', '1', `${f.dir}/f%05d.png`,
+    const n = Math.min(CHUNK, f.count - first)
+    const cutChunk = (isFew: boolean) => [
+      state.ffmpeg, '-v', 'error', '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-t', chunkSeconds(n, f.fps), '-i', source,
+      '-vf', `fps=${f.fps},${scaleFor(f.cut, isFew)}`, '-frames:v', String(n),
+      '-start_number', String(first + 1), '-compression_level', '1', '-y', `${f.dir}/f%05d.png`,
     ]
-    await $.process.run(isUrgent ? cutChunk : gently(cutChunk))
+    await cutFrames($, cutChunk, async () => Array.from({ length: n }, (_, k) => frameFile(f, first + k)))
     debug(`cut chunk=${c} ms=${Date.now() - cutAt}`)
     await prune($, f.dir, c, f.fps)
   })().then(() => { cutChunks.add(key) }, () => undefined).finally(() => decoding.delete(key))
@@ -428,27 +478,24 @@ export async function frameReady($: EngineInterface, media: Shown, i: number, si
   void cutAhead($, f, media.source, i)
 }
 
-// Two cuts at once, nearest first: PNG encoding runs one frame at a time
-// in each ffmpeg, so a second process gets ~20-25% more done on an M1; a
-// third and fourth add little and crowd a busy machine.
-const CUT_WORKERS = 2
+// One cut at a time, nearest first: each already uses every core, and two
+// at once would double the memory for no gain.
+const CUT_WORKERS = 1
 const cuttingAhead = new Set<string>()
 async function cutAhead($: EngineInterface, f: Frames, source: string | undefined, i: number) {
   if (cuttingAhead.has(f.dir)) return
   cuttingAhead.add(f.dir)
   try {
-    // The chunk after this one is needed within 2 s; the rest have time.
-    const todo: { j: number; isUrgent: boolean }[] = []
+    const todo: number[] = []
     for (let d = 1; d <= chunksAhead(f.fps); d++) {
       const j = i + d * CHUNK
       if (j >= f.count) break
-      if (!cutChunks.has(chunkKey(f, j))) todo.push({ j, isUrgent: d === 1 })
+      if (!cutChunks.has(chunkKey(f, j))) todo.push(j)
     }
     let taken = 0
     const worker = async () => {
       while (taken < todo.length) {
-        const { j, isUrgent } = todo[taken++]!
-        await ensureChunk($, f, source, j, isUrgent)
+        await ensureChunk($, f, source, todo[taken++]!)
       }
     }
     await Promise.all(Array.from({ length: CUT_WORKERS }, worker))

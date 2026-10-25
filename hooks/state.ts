@@ -51,16 +51,14 @@ export const state = {
   sessionId: '',
   drawCause: 'background' as DrawCause,
   inTmux: false,
+  // The hint Claude was last given with a prompt (hintNow): sent again only
+  // when it changes, or after a compaction.
+  sentHint: '',
   // SHOW_YOUR_WORK_DEBUG=1 (see debug in telemetry.ts).
   isDebug: false,
   terminalName: '',
-  // CLAUDE_CODE_FORCE_TERMINAL_IMAGES was set when Claude Code started.
-  isForced: false,
-  // The person pressed Turn on pictures: the line is in their shell profile,
-  // and pictures show once Claude Code restarts.
-  isTurnedOn: false,
-  // Turned off again from the settings: the line is gone, from the next start.
-  isTurnedOff: false,
+  // Inside tmux, the terminal around it (`ghostty`, `kitty`, or '').
+  outerTerminal: '',
   // Usage stats: whether they're on, and the events waiting to go out.
   isOn: false,
   queue: [] as Event[],

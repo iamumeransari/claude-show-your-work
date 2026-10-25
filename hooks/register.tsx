@@ -8,13 +8,15 @@ import type { Check, KeyChange, Overlay, Shown, Summary } from '../types'
 import { state } from './state'
 import { clock, paneSize } from './layout'
 import type { PaneProps } from './layout'
-import { debug, flush, flushDebug, track } from './telemetry'
+import { debug, diagnosis, flushDebug } from './diagnostics'
+import { flush, track } from './telemetry'
 import { setUp } from './setup'
+import { forwardPictures, stopForwarding } from './tmux'
 import { CLEAN_SH, exists, expand, findPasted, identityOf, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
 import { hadVersionBefore06, PLUGIN } from './updater'
-import { atStep, cantDraw, draw, freshCalls, mayBeDropped, noteDrawn, NoticeBox, player, readPicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
+import { atStep, cantDraw, causeOf, draw, freshCalls, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
 import type { Ui } from './player'
 import { ensureSettings, goToStop, loadSettings, Opening, openSettings, openUpdate, openWelcome, Settings, startBackground, startTour, Tour, TOUR_TEXT, UPDATE, UpdatePane, WELCOME_TEXT } from './onboarding'
 
@@ -94,6 +96,7 @@ export const register: Register = on => {
     state.setup = null
     await setUp($)
     state.sessionId = await $.session.id().catch(() => '')
+    state.sentHint = ''
     state.hasVideoTools = false
     await loadSettings($)
     void (async () => {
@@ -101,21 +104,22 @@ export const register: Register = on => {
       state.pluginVersion = manifest.version ?? '0.0.0'
       const program = (await $.env.get('TERM_PROGRAM')) ?? ''
       const term = (await $.env.get('TERM')) ?? ''
-      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')) })
+      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '' })
       state.terminalName = terminal
-      state.isForced = !!(await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES'))
-      await readPicturesLine($)
+      // iTerm2 draws pictures from bytes only, never from a file it's named.
+      if (terminal === 'iterm2') state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
       state.isDebug = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_DEBUG')) ?? '')
       if (state.isDebug) $.clock.every(1000, () => void flushDebug($))
-      // tmux with passthrough off never lets a picture through: known before the first one.
-      if (state.inTmux) {
-        const pass = await $.process.run(['tmux', 'show', '-gv', 'allow-passthrough']).catch(() => null)
-        if (pass && pass.exitCode === 0 && /^off$/i.test(pass.stdout.trim())) {
-          state.canImage = false
-          state.probed = true
-          state.drawCause = 'tmux'
-        }
+      // Terminals that can't paint Claude Code's placeholders never show a
+      // picture, and tmux only with pictures forced on: known before the
+      // first one.
+      void removePicturesLine($)
+      const isForwarded = state.inTmux && (await forwardPictures($))
+      if ((state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
+        state.canImage = false
+        state.probed = true
+        state.drawCause = NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,
@@ -148,8 +152,8 @@ export const register: Register = on => {
     void $.process.run(['sh', '-c', CLEAN_SH, state.TMP]).then(() => trimFrames($))
     await $.command.register({
       name: 'show-your-work',
-      description: 'Settings for show-your-work; /show-your-work tour for the tour, /show-your-work update to check for updates',
-      argumentHint: '[settings|tour|update]',
+      description: 'Settings for show-your-work; /show-your-work tour for the tour, /show-your-work update to check for updates, /show-your-work diagnose for recent problems',
+      argumentHint: '[settings|tour|update|diagnose]',
     })
     await $.command.register({
       name: 'img',
@@ -175,30 +179,20 @@ export const register: Register = on => {
   })
 
   // While pictures draw, Claude is told up front that it can show its work,
-  // so it does so without being asked. Once a draw has failed, every later
-  // turn knows instead: what was "shown" was a notice, not the picture.
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    if (!e.tools.some(t => TOOLS.includes(t))) return composed
-    if (state.canImage) {
-      return {
-        sections: [...composed.sections, {
-          id: 'show-your-work:show-visual-work', scope: 'session',
-          text: "This terminal shows pictures and videos inline. After visual work, screenshot or record it and show it with show_image or show_video before you say you're done, instead of telling the user to open a file or localhost. For a UI fix, show before and after.",
-        }],
-      }
-    }
-    const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
-    return {
-      sections: [...composed.sections, {
-        id: 'show-your-work:cannot-draw', scope: 'session',
-        text: `show-your-work: pictures and videos can't draw in this session (${why}) Anything shown with show_image or show_video was not seen: the person saw a notice instead. Don't say they saw it.`,
-      }],
-    }
+  // so it does so without being asked. Once a draw has failed, the next turn
+  // knows instead: what was "shown" was a notice, not the picture.
+  // Sent as the prompt's context, once per session and again after a
+  // compaction or a change: prompt.compose is skipped on Team and Enterprise
+  // logins, where Claude Code's own guard runs ahead of every mod (#13).
+  on('session.compact', ($, e, next) => {
+    if (!e.agentId) state.sentHint = ''
+
+    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     await flush($).catch(() => undefined)
+    await stopForwarding($)
 
     return next(e)
   })
@@ -207,8 +201,11 @@ export const register: Register = on => {
     // Sending a message puts the settings away.
     if (e.origin?.kind !== 'plugin') void $.ui.panes().then(panes => { if (panes.some(p => p.id === WELCOME)) return $.ui.close({ id: WELCOME }) }).catch(() => undefined)
     pastedNames = (e.attachments ?? []).filter(a => a.type === 'image' && a.filename).map(a => a.filename!)
+    const hint = hintNow()
+    if (e.command || hint === state.sentHint) return next(e)
+    state.sentHint = hint
 
-    return next(e)
+    return next({ ...e, context: [...(e.context ?? []), hint] })
   })
 
   on('command.run', { command: 'img' }, async ($, invoked) => {
@@ -423,6 +420,9 @@ export const register: Register = on => {
       startTour($)
       return { text: TOUR_TEXT }
     }
+    // What went wrong lately, for a bug report: problems noticed (always kept)
+    // and where the full local log is. Nothing here is sent anywhere.
+    if (/^diagnose$/i.test(invoked.args.trim())) return { text: diagnosis(await $.clock.now()) }
     if (/^update$/i.test(invoked.args.trim())) {
       void openUpdate($).catch(() => undefined)
       return { text: 'Checking for show-your-work updates.' }
@@ -500,4 +500,11 @@ export const register: Register = on => {
     await setUp($)
     return Opening($, e, e.requestId, e.viewport)
   })
+}
+
+// What Claude is told about showing its work, for the state pictures are in now.
+function hintNow() {
+  if (state.canImage) return "This terminal shows pictures and videos inline. After visual work, screenshot or record it and show it with show_image or show_video before you say you're done, instead of telling the user to open a file or localhost. For a UI fix, show before and after."
+  const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
+  return `show-your-work: pictures and videos can't draw in this session (${why}) Anything shown with show_image or show_video was not seen: the person saw a notice instead. Don't say they saw it.`
 }

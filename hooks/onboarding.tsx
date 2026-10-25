@@ -13,7 +13,7 @@ import { BRANCHES, checkForUpdate, findUpdate, installUpdate, PLUGIN } from './u
 import type { Found } from './updater'
 import { STOPS } from './tour'
 import type { Stop } from './tour'
-import { arePicturesOn, atStep, freshCalls, play, players, redraw, stop, SWITCHABLE, turnOffPictures, turnOnPictures, Viewer } from './player'
+import { atStep, freshCalls, play, players, redraw, stop, Viewer } from './player'
 import type { Ui } from './player'
 
 // ── Settings and welcome ─────────────────────────────────────────────────
@@ -272,28 +272,6 @@ function SettingRows(ui: Ui, $: EngineInterface) {
           })}
         </Box>
       ))}
-      {/* Only in a terminal where Claude Code leaves pictures off by default. */}
-      {SWITCHABLE[state.terminalName] && (
-        <Box key="row-pictures" flexDirection="row">
-          <Box width={24} flexShrink={0}><Text dimColor>{`Pictures in ${SWITCHABLE[state.terminalName]!.label}`}</Text></Box>
-          {(['On', 'Off'] as const).map((label, k) => {
-            const isChosen = arePicturesOn() === (k === 0)
-            const text = `${isChosen ? '●' : '○'} ${label}`
-            const press = () => void (k === 0 ? turnOnPictures($) : turnOffPictures($))
-            return (
-              <Box key={`slot-pictures-${k}`} width={k === 0 ? first : undefined} flexShrink={0}>
-                {state.canColourButtons ? (
-                  <Button key={`pictures-${k}`} plain label={text} onPress={press}>
-                    <Text color={k === 0 ? 'success' : 'claude'} dimColor={!isChosen}>{text}</Text>
-                  </Button>
-                ) : (
-                  <Button key={`pictures-${k}`} plain {...(isChosen ? {} : { dimColor: true })} label={text} onPress={press} />
-                )}
-              </Box>
-            )
-          })}
-        </Box>
-      )}
       <Box marginTop={1}><Text dimColor>Usage data is anonymous and helps fix bugs and improve the product experience. No sensitive data is ever shared.</Text></Box>
     </Box>
   )

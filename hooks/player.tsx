@@ -4,12 +4,14 @@ import type { EngineInterface, Timer } from 'claude-code'
 
 import type { Check, KeyChange, Shown, Summary } from '../types'
 
-import { state } from './state'
+import { settings, state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
-import { act, debug, track } from './telemetry'
-import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, recutFrame, toOriginal, toUpdated } from './media'
+import { debug, event, isWiderThanBox, problem } from './diagnostics'
+import { act, track } from './telemetry'
+import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
+import { FORCE } from './tmux'
 
 // Playback per drawn site (a transcript row's tool_use_id, or the pane).
 type Player = {
@@ -36,6 +38,10 @@ type Player = {
   updatedFrame?: number
   // the picture's size in cells as last drawn, for repaints
   box?: { columns: number; rows: number }
+  // changes every time box does, never repeating (see resized)
+  boxGeneration?: number
+  // the latest resize, so only the last of a burst sends the frame again
+  resizeTicket?: number
 }
 export const players = new Map<string, Player>()
 // Calls made since this load: only these autoplay, not every window a reload redraws.
@@ -100,38 +106,98 @@ export function openFailure(r: { exitCode: number; stderr: string }, what: strin
 // button, both times, a usable bar and the action buttons on one line.
 const CONTROLS_MIN = 64
 
-// A player whose box needs more pixels than its picture has (a bigger
-// window, a pane, no report beside it) gets a sharper copy, made once in the
-// background from the original file and swapped into the same object, so a
-// playing video carries on. Stills stop at twice their own width (an icon
-// stays small) and MAX_STILL; videos at PX_MAX.
-const sharpKey = (m: Shown) => `${m.kind}|${m.source ?? m.path}`
-const sharpening = new Map<string, number>()
-const sharpest = new Map<string, Pick<Shown, 'path' | 'width' | 'height' | 'generation' | 'frames'>>()
-function useSharpest(m: Shown) {
-  const better = sharpest.get(sharpKey(m))
-  if (better && better.width > m.width) Object.assign(m, better)
+// A picture is drawn from a copy that fits its box. Ghostty crops a picture
+// bigger than its box instead of shrinking it (a Large video made for a wide
+// window was cut off after the window narrowed), and never enlarges one
+// smaller than its box. So copies are made at fixed widths (COPY_WIDTHS), in
+// the background from the original file, and each draw uses the largest copy
+// no wider than the box needs: drawn whole, at most one step smaller than the
+// box. Copies are kept and reused, so resizing back and forth makes nothing
+// new. Stills stop at twice their own width (three times in Large; an icon
+// stays small) and MAX_STILL. Video frames stop at PX_MAX in both sizes:
+// bigger frames cost cutting time and memory on every frame.
+export const COPY_WIDTHS = [480, 640, 800, 1000, 1280, 1600, 2000, 2400, 3200]
+// The width to make for a box that needs `need` pixels: the widest step that
+// fits, or the narrowest step when even that is too wide.
+export const copyWidthFor = (need: number) => COPY_WIDTHS.filter(w => w <= need).at(-1) ?? COPY_WIDTHS[0]!
+type Copy = Pick<Shown, 'path' | 'width' | 'height' | 'generation' | 'frames'>
+const copyKey = (m: Shown) => `${m.kind}|${m.source ?? m.path}`
+// Every copy of a source, by width, the one first prepared included.
+const copies = new Map<string, Map<number, Copy>>()
+// The widths being made now, by source.
+const making = new Map<string, Set<number>>()
+// A copy up to 3% wider than its box counts as fitting: the few pixels the
+// terminal cuts off aren't visible, and a smaller copy of a video is a re-cut.
+const FIT_SLACK = 1.03
+// The copy to draw: the widest one that fits, or the narrowest when none does.
+export function bestCopy(widths: number[], need: number): number | undefined {
+  const sorted = [...widths].sort((a, b) => a - b)
+  return sorted.filter(w => w <= need * FIT_SLACK).at(-1) ?? sorted[0]
 }
-function sharpen($: EngineInterface, m: Shown, need: number) {
-  const source = m.source
-  // Stills are enlarged up to twice their width (three times in Large). Video
-  // frames stop at PX_MAX in both: bigger frames cost cutting time and memory
-  // on every frame, and a Large player stretches them a little instead.
+// The copy each player last chose for a source, by `site|source`. The play
+// timer holds its own object for the video (not always the one the player
+// draws), so every frame it sends is matched to this first (syncCopy):
+// otherwise it kept sending the old copy's frames into the new box.
+const chosen = new Map<string, Copy>()
+function syncCopy(site: string, m: Shown | undefined) {
+  const copy = m && chosen.get(`${site}|${copyKey(m)}`)
+  if (m && copy && copy.path !== m.path) Object.assign(m, copy)
+}
+function fitCopy($: EngineInterface, site: string, m: Shown, need: number) {
+  const key = copyKey(m)
+  let made = copies.get(key)
+  if (!made) copies.set(key, (made = new Map()))
+  if (!made.has(m.width)) made.set(m.width, { path: m.path, width: m.width, height: m.height, generation: m.generation, frames: m.frames })
+  // Standard keeps its behaviour from before Picture size: the widest copy is
+  // drawn, and a copy is only ever made bigger, at the width the box needs.
+  // Its box hardly changes between window sizes, so it never pays for copies
+  // after a resize. Large draws and makes fitted copies (above).
+  const isFitted = !settings.standard_size
+  const widths = [...made.keys()]
+  const best = made.get(isFitted ? bestCopy(widths, need)! : Math.max(...widths))!
+  if (best.path !== m.path) Object.assign(m, best)
+  chosen.set(`${site}|${key}`, best)
   const limit = m.frames ? PX_MAX : Math.min(MAX_STILL, (m.sourceWidth ?? m.width) * 2 * sizeStep())
   const want = Math.min(limit, need)
-  const key = sharpKey(m)
-  if (!source || want < m.width * 1.15 || (sharpening.get(key) ?? 0) >= want) return
-  sharpening.set(key, want)
-  void (async () => {
-    const made = m.frames
-      ? await prepareVideo($, source, m.title, await identityOf($, source), want)
-      : await widenStill($, source, want)
-    if (!made) return
-    sharpest.set(key, { path: made.path, width: made.width, height: made.height, generation: made.generation, frames: made.frames })
-    useSharpest(m)
-    redraw($)
-  })().catch(() => undefined)
+  const width = isFitted ? Math.min(copyWidthFor(want), limit) : want
+  const source = m.source
+  // Already drawn from the copy for this box, or close enough: a bigger copy
+  // must gain 15%, and (Large only) a smaller one is only needed when this
+  // one doesn't fit.
+  const isFine = isFitted ? m.width <= need * FIT_SLACK && m.width * 1.15 > width : m.width * 1.15 > width
+  if (!source) return
+  if (!isFine) makeCopy($, site, m, source, made, width, need)
+  // In Large a video also gets one small fallback copy as soon as it's shown.
+  // A new window size needs its own copy, which takes a few seconds to cut;
+  // meanwhile the fallback is drawn (smaller, but whole) instead of the big
+  // copy, which the terminal would crop.
+  if (isFitted && m.frames && Math.max(...widths) > FALLBACK_WIDTH * 1.5) makeCopy($, site, m, source, made, FALLBACK_WIDTH, need)
 }
+const FALLBACK_WIDTH = 800
+function makeCopy($: EngineInterface, site: string, m: Shown, source: string, made: Map<number, Copy>, width: number, need: number) {
+  const key = copyKey(m)
+  const busy = making.get(key) ?? new Set<number>()
+  if (made.has(width) || busy.has(width)) return
+  busy.add(width)
+  making.set(key, busy)
+  const askedAt = Date.now()
+  event('copy', { state: 'asked', site, kind: m.kind, from: m.width, width, need })
+  // Started after the draw that asked has finished: Claude Code cancels the
+  // processes a draw started once a newer draw replaces it, and a playing
+  // video redraws often enough that a re-cut started inside one never
+  // finished. One cancelled anyway is forgotten, so a later draw asks again.
+  void (async () => {
+    await $.clock.sleep(SHARPEN_DELAY_MS)
+    const copy = m.frames ? await rescaleVideo($, m, width, players.get(site)?.frame ?? 0) : await widenStill($, source, width)
+    if (!copy) return void event('copy', { state: 'failed', site, width, ms: Date.now() - askedAt })
+    event('copy', { state: 'made', site, width: copy.width, ms: Date.now() - askedAt })
+    made.set(copy.width, { path: copy.path, width: copy.width, height: copy.height, generation: copy.generation, frames: copy.frames })
+    redraw($)
+  })()
+    .catch(error => event('copy', { state: /superseded|aborted/.test(String(error)) ? 'cancelled' : 'failed', site, width, error: String(error).slice(0, 160) }))
+    .finally(() => busy.delete(width))
+}
+const SHARPEN_DELAY_MS = 300
 async function widenStill($: EngineInterface, source: string, width: number): Promise<Shown | null> {
   const out = `${state.TMP}/w-${keyOf(source)}-${width}.png`
   const made = state.isMac
@@ -175,7 +241,6 @@ type Source = { png: string } | { file: string; format: 'png'; generation?: numb
 // Claude Code takes at most 2 MiB of picture as bytes: a bigger one is sent as
 // a smaller copy, made once with whatever the machine has (sips, ffmpeg or
 // ImageMagick) and kept in the temp folder.
-const BYTES_MAX = 2_000_000
 export const SHRINK_SH = [
   'f="$0"; out="$1"; ff="$2"; max="$3"',
   'size() { wc -c < "$1" | tr -d " "; }',
@@ -194,57 +259,70 @@ export const SHRINK_SH = [
   'done',
   'exit 1',
 ].join('\n')
+// Shrunk copies and recent reads are known by a picture's path, size and time,
+// not its path alone: a file saved again at the same path, or a temp name like
+// `shot-3.png` back with another picture in it, is read again.
 const fitted = new Map<string, string>()
+async function versionOf($: EngineInterface, file: string): Promise<string> {
+  const st = await Promise.resolve().then(() => $.fs.stat(file)).catch(() => null)
+  return st ? `${file}|${st.size}|${st.mtimeMs}` : file
+}
 // The last few pictures read, so a button press that redraws the player
 // doesn't read and send its picture from disk again.
 const recentBytes = new Map<string, string>()
 async function bytesOf($: EngineInterface, file: string): Promise<string | null> {
-  const known = recentBytes.get(file)
+  const version = await versionOf($, file)
+  const known = recentBytes.get(version)
   if (known) return known
-  const png = await readBytes($, file)
+  const png = await readBytes($, file, version)
   if (png) {
-    recentBytes.set(file, png)
+    recentBytes.set(version, png)
     if (recentBytes.size > 6) recentBytes.delete(recentBytes.keys().next().value!)
   }
   return png
 }
-async function readBytes($: EngineInterface, file: string): Promise<string | null> {
+async function readBytes($: EngineInterface, file: string, version: string): Promise<string | null> {
   // Most files (every video frame) are under the limit: read them as they are,
   // with no process started per frame.
-  if (!fitted.has(file)) {
+  if (!fitted.has(version)) {
     const direct = await Promise.resolve().then(() => $.fs.read(file, { as: 'bytes' })).catch(() => null)
     if (direct?.base64 && direct.base64.length * 0.75 <= BYTES_MAX) return direct.base64
   }
-  let small = fitted.get(file)
+  let small = fitted.get(version)
   if (!small) {
-    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(file)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(version)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     small = r?.exitCode === 0 ? r.stdout.trim() : ''
     if (!small) return null
-    fitted.set(file, small)
+    fitted.set(version, small)
   }
   const loaded = await Promise.resolve().then(() => $.fs.read(small!, { as: 'bytes' })).catch(() => null)
   return loaded?.base64 ?? null
 }
-// Orca reads a picture file only from a temp folder or the terminal's own
-// worktree, and only up to 2 MiB; its floating terminal has no worktree. A
-// file it refuses draws as an empty box, and nothing comes back to say so. So
-// in Orca a picture outside the temp folder is drawn from a copy there, and
+// A terminal that refuses a picture file draws an empty box, and nothing comes
+// back to say so. Ghostty and kitty read any file up to 400 MB (checked in
+// their source). Others may not: Orca reads one only from a temp folder or the
+// terminal's own worktree, and only up to 2 MiB (#16). So in every other
+// terminal a picture outside the temp folder is drawn from a copy there, and
 // one too big from a smaller copy.
-export const orcaReads = (file: string, bytes: number, tmp: string) => file.startsWith(`${tmp}/`) && bytes <= BYTES_MAX
+export const anyTerminalReads = (file: string, bytes: number, tmp: string) => file.startsWith(`${tmp}/`) && bytes <= BYTES_MAX
 // One copy per picture, and two draws at once share it. A picture is known by
 // its path, size and time, not its path alone: a file saved again, or a temp
 // name like `shot-3.png` back with another picture in it, gets a new copy. A
-// file Orca reads as it is (every video frame) gets none.
-const orcaCopies = new Map<string, Promise<string>>()
-async function orcaFile($: EngineInterface, file: string): Promise<string> {
+// file every terminal reads as it is (every video frame) gets none. A failed
+// copy isn't kept, so the next draw tries again.
+const readableCopies = new Map<string, Promise<string>>()
+async function readableFile($: EngineInterface, file: string): Promise<string> {
   const st = await Promise.resolve().then(() => $.fs.stat(file)).catch(() => null)
-  if (!st || orcaReads(file, st.size, state.TMP)) return file
+  if (!st || anyTerminalReads(file, st.size, state.TMP)) return file
   const id = keyOf(`${file}|${st.size}|${st.mtimeMs}`)
-  let made = orcaCopies.get(id)
-  if (!made) orcaCopies.set(id, (made = orcaCopy($, file, st.size, id)))
+  let made = readableCopies.get(id)
+  if (!made) {
+    readableCopies.set(id, (made = readableCopy($, file, st.size, id)))
+    void made.then(copy => copy === file && readableCopies.delete(id))
+  }
   return made
 }
-async function orcaCopy($: EngineInterface, file: string, size: number, id: string): Promise<string> {
+async function readableCopy($: EngineInterface, file: string, size: number, id: string): Promise<string> {
   if (size > BYTES_MAX) {
     const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     return (r?.exitCode === 0 && r.stdout.trim()) || file
@@ -259,7 +337,7 @@ export async function pngSource($: EngineInterface, file: string): Promise<Sourc
     const png = await bytesOf($, file)
     if (png) return { png }
   }
-  if (state.terminalName === 'orca') return { file: await orcaFile($, file), format: 'png' as const }
+  if (!readsAnyFile()) return { file: await readableFile($, file), format: 'png' as const }
   return { file, format: 'png' as const }
 }
 
@@ -280,9 +358,10 @@ function probe($: EngineInterface, site: string, key: string, pic: Pic) {
     // poster, or the clip jumps back to its start for a moment.
     const shownNow = swaps.get(`${site}|${key}`)?.last
     const r = await $.ui.blit({ requestId: site, key, source: shownNow ? await pngSource($, shownNow) : pic.src })
+    event('probe', { deny: r.deny ?? null, bytes: 'png' in pic.src })
     if (r.deny && /alt/i.test(r.deny)) {
       state.canImage = false
-      state.drawCause = causeOf(state.inTmux, state.terminalName, state.isForced)
+      state.drawCause = causeOf(state.inTmux, state.terminalName)
       track('cannot_draw', { cause: state.drawCause })
       $.ui.toast("Pictures can't show here: see the notice in the chat.")
       redraw($)
@@ -297,6 +376,55 @@ function probe($: EngineInterface, site: string, key: string, pic: Pic) {
 // draw's is stale and skipped.
 const swaps = new Map<string, { isBusy: boolean; ticket: number; next?: { file: string; frame: number }; last?: string }>()
 let tickets = 0
+// Records the box a player draws in. When it changed (the window was resized),
+// the frame on screen is sent again once the new layout is drawn: a frame swap
+// already in flight was placed at the old size, and a playing video otherwise
+// stayed small in its new box until the next swap that happened to land after.
+// Each new box gets a new boxGeneration, which file sources carry: Claude Code
+// sends a source again only when it differs from one it already sent, so a
+// generation made from the box itself repeated when the window went back to a
+// size it had before, and the picture stayed at the last size.
+let boxGenerations = 0
+// A layout event only when a player's layout changed, so playback's redraws
+// don't fill the log.
+const lastLayouts = new Map<string, string>()
+function noteLayout(site: string, fields: Record<string, unknown>) {
+  const cell = state.cell ? `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` : null
+  const line = JSON.stringify({ ...fields, cell })
+  if (lastLayouts.get(site) === line) return
+  lastLayouts.set(site, line)
+  event('layout', { site, ...fields, cell })
+}
+let hasReportedNoCell = false
+function resized($: EngineInterface, site: string, media: Shown, shown: Shown, box: { columns: number; rows: number }) {
+  const one = player(site)
+  const was = one.box
+  if (was?.columns === box.columns && was.rows === box.rows && one.boxGeneration) return
+  one.box = { columns: box.columns, rows: box.rows }
+  one.boxGeneration = ++boxGenerations
+  event('resize', { site, from: was ? `${was.columns}x${was.rows}` : null, to: `${box.columns}x${box.rows}`, generation: one.boxGeneration })
+  if (!was) return
+  // Dragging a window edge changes the box many times, and a frame swap in
+  // flight can land at the old size after Claude Code has drawn the new one.
+  // Once the box has held for SETTLE_MS the frame on screen is sent again, and
+  // once more after AGAIN_MS in case that send itself raced a late layout.
+  const ticket = (one.resizeTicket = boxGenerations)
+  const isLatest = () => players.get(site)?.resizeTicket === ticket
+  const resend = (isAgain: boolean) => {
+    if (!isLatest()) return
+    event('resend', { site, generation: ticket, isAgain })
+    draw($, site, media, shown)
+  }
+  void $.clock
+    .sleep(SETTLE_MS)
+    .then(() => resend(false))
+    .then(() => $.clock.sleep(AGAIN_MS))
+    .then(() => resend(true))
+    .catch(error => problem('resend_cancelled', { site, generation: ticket, error: String(error).slice(0, 160) }))
+}
+const SETTLE_MS = 250
+const AGAIN_MS = 750
+const boxGenerationOf = (site: string) => players.get(site)?.boxGeneration ?? 0
 async function blit($: EngineInterface, site: string, key: string, media: Shown, file: string, frame: number, ticket = ++tickets) {
   if (!state.canImage) return
   const id = `${site}|${key}`
@@ -314,10 +442,15 @@ async function blit($: EngineInterface, site: string, key: string, media: Shown,
   try {
     while (job) {
       const at = Date.now()
-      await $.ui.blit({ requestId: site, key, source: await pngSource($, job.file) })
+      // A frame carries the box it's drawn in, like the Image's own source
+      // (see Picture), so a frame sent after a resize is placed at the new size.
+      const src = await pngSource($, job.file)
+      await $.ui.blit({ requestId: site, key, source: 'file' in src ? { ...src, generation: boxGenerationOf(site) } : src })
       noteDrawn(site, media.width, media.height)
+      const box = players.get(site)?.box
+      event('frame', { site, frame: job.frame, width: media.width, box: box && `${box.columns}x${box.rows}`, ms: Date.now() - at })
+      if (box && state.cell && !settings.standard_size && isWiderThanBox(media.width, box.columns, state.cell.width)) problem('frame_wider_than_box', { site, width: media.width, box: `${box.columns}x${box.rows}`, cell: state.cell.width })
       lane.last = job.file
-      debug(`blit frame=${job.frame} ms=${Date.now() - at}`)
       job = lane.next
       lane.next = undefined
     }
@@ -346,6 +479,7 @@ export function mayBeDropped(site: string) {
 
 export function draw($: EngineInterface, site: string, media: Shown, shown?: Shown) {
   const one = player(site)
+  for (const side of [media, shown, shown?.compare]) syncCopy(site, side)
   if (one.isSplit && shown?.pair) {
     const at = Math.min(one.frame, shown.pair.count - 1), pair = shown.pair
     const ticket = ++tickets
@@ -413,24 +547,46 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     return `${Math.floor(t)}|${liveChange(timed, shown && isOriginal ? toUpdated(shown, t) : t, frames.fps)}`
   }
   let last = marks()
-  // The clock never runs ahead of the frames: a tick whose next frame is
-  // still being cut waits for it, so pressing play never skips ahead.
-  let isWaiting = false
+  // Playback keeps real time, like any video player: when the frames ahead
+  // aren't cut yet (a slow or busy machine), it holds the frame on screen and
+  // then jumps to where the clock is, skipping frames, instead of waiting on
+  // every frame and playing in slow motion (#14). `owed` is how many frames
+  // the clock is ahead of the picture, by real time. Before the first frame moves it never
+  // runs ahead, so pressing play never skips the start.
+  let owed = 0
+  let isAsking = false
   let tickAt = Date.now()
+  let shownFrame = one.frame
+  const startFrame = one.frame
   debug(`play fps=${frames.fps} count=${frames.count} from=${one.frame}`)
   one.timer = $.clock.every(Math.round(1000 / frames.fps), () => {
-    debug(`tick gap=${Date.now() - tickAt} frame=${one.frame}${isWaiting ? ' waiting' : ''}`)
-    tickAt = Date.now()
+    const at = Date.now()
+    debug(`tick gap=${at - tickAt} frame=${one.frame} owed=${owed.toFixed(2)}`)
+    // The frames the real time since the last tick is worth, one at least. A
+    // tick asks for the next only once it has run, so ticks come a little late
+    // (85 ms and up for 83) and counting them alone played at about 0.9x.
+    owed += Math.max(1, ((at - tickAt) * frames.fps) / 1000)
+    tickAt = at
+    // A seek or a flip moved the playhead: the clock starts again from there.
+    if (one.frame !== shownFrame) owed = 0
+    if (one.frame === startFrame) owed = Math.min(owed, 1)
     if (one.frame >= frames.count - 1) return stop($, site)
-    if (isWaiting) return
-    const coming = one.frame + 1
+    if (owed < 1) return
+    const target = Math.min(frames.count - 1, one.frame + Math.floor(owed))
+    let coming = target
     if (!shown?.pair || !one.isSplit) {
-      isWaiting = true
-      void frameReady($, media, coming, site).finally(() => { isWaiting = false })
-      if (!isFrameCut(media, coming)) return void debug(`wait frame=${coming}`)
-      isWaiting = false
+      if (!isAsking && !isFrameCut(media, target)) {
+        isAsking = true
+        void frameReady($, media, target, site).finally(() => { isAsking = false })
+      } else if (!isAsking) void frameReady($, media, target, site)
+      // The furthest frame on the way that's already cut.
+      while (coming > one.frame && !isFrameCut(media, coming)) coming--
+      if (coming <= one.frame) return void debug(`wait frame=${target}`)
+      if (coming < one.frame + Math.floor(owed) - 1) debug(`skip to=${coming} clock=${target}`)
     }
+    owed = Math.max(0, owed - (coming - one.frame))
     one.frame = coming
+    shownFrame = coming
     draw($, site, media, shown)
     const now = marks()
     if (now !== last) {
@@ -509,7 +665,7 @@ function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: 
   // behind it. Each of those kept the picture from drawing in the terminal.
   // The same file in a box of another size (a resized window) is sent again:
   // the terminal keeps a picture at the size it was last sent at.
-  const source = 'file' in pic.src ? { ...pic.src, generation: box.columns * 1000 + box.rows } : pic.src
+  const source = 'file' in pic.src ? { ...pic.src, generation: boxGenerationOf(site) } : pic.src
   const image = (
     <Image
       key={viewKey(site)}
@@ -960,27 +1116,23 @@ export function urlAt(shown: Shown, seconds: number): string | undefined {
 export const resumeCommand = (id: string) =>
   id ? `claude stop ${id}; CLAUDE_CODE_DISABLE_AGENT_VIEW=1 claude --resume ${id}` : 'CLAUDE_CODE_DISABLE_AGENT_VIEW=1 claude --resume'
 
-// Why pictures can't draw here, once a draw has failed: tmux blocking them,
-// a terminal without picture support, a background session, or a terminal
-// where Claude Code leaves pictures off until they're turned on.
-export type DrawCause = 'tmux' | 'herdr' | 'terminal' | 'background' | 'off'
+// Why pictures can't draw here: tmux, a terminal that can't draw Claude
+// Code's pictures, or a background session.
+export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'terminal' | 'background'
 
-// Claude Code turns pictures on by itself only in Ghostty and kitty. Warp,
-// WezTerm and Konsole draw them too, but only when
-// CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 is set before Claude Code starts: Claude
-// Code reads it at launch, so a plugin can't set it for the running session.
-// Turn on pictures adds one line to the person's shell profile that sets it
-// only inside that terminal, so other terminals are unaffected.
-export const SWITCHABLE: Record<string, { label: string; sh: string; fish: string }> = {
-  warp: { label: 'Warp', sh: '[ "$TERM_PROGRAM" = "WarpTerminal" ]', fish: 'test "$TERM_PROGRAM" = WarpTerminal' },
-  wezterm: { label: 'WezTerm', sh: '[ "$TERM_PROGRAM" = "WezTerm" ]', fish: 'test "$TERM_PROGRAM" = WezTerm' },
-  konsole: { label: 'Konsole', sh: '[ -n "$KONSOLE_VERSION" ]', fish: 'test -n "$KONSOLE_VERSION"' },
-}
-// Marks the line, so it is found again to skip a second copy or to remove it.
+// Claude Code draws every picture with kitty Unicode placeholders (a=T,U=1),
+// which only Ghostty and kitty paint. Warp, WezTerm and Konsole speak the
+// kitty graphics protocol but not placeholders: forced on with
+// CLAUDE_CODE_FORCE_TERMINAL_IMAGES, Warp draws a grid of boxes instead of
+// the picture (#10). So pictures stay off there, known before the first one.
+export const DRAWS_PICTURES = ['ghostty', 'kitty']
+export const NO_PLACEHOLDERS: Record<string, string> = { warp: 'Warp', wezterm: 'WezTerm', konsole: 'Konsole' }
+// 0.6.7 to 0.6.9 offered Turn on pictures in those terminals, which added this
+// marked line to the shell profile. It only made the boxes appear, so it's
+// removed again at session start.
 export const PROFILE_MARK = '# show-your-work: pictures in '
 
-// The profile file the person's login shell reads, from $SHELL. Null for a
-// shell this doesn't know: the notice then shows the line to add by hand.
+// The profile file the person's login shell reads, from $SHELL.
 export function profileOf(shell: string, home: string, isMac: boolean): string | null {
   const name = shell.split('/').pop() ?? ''
   if (name === 'zsh') return `${home}/.zshrc`
@@ -989,78 +1141,34 @@ export function profileOf(shell: string, home: string, isMac: boolean): string |
   return null
 }
 
-// The line itself, in the shell's own syntax.
-export function profileLine(terminal: string, shell: string): string {
-  const t = SWITCHABLE[terminal]!
-  const mark = `${PROFILE_MARK}${t.label}`
-  return /fish$/.test(shell)
-    ? `if ${t.fish}; set -gx CLAUDE_CODE_FORCE_TERMINAL_IMAGES 1; end ${mark}`
-    : `if ${t.sh}; then export CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1; fi ${mark}`
+// The profile without the old Turn on pictures line, or null when it has none.
+export function withoutPicturesLine(profile: string): string | null {
+  if (!profile.includes(PROFILE_MARK)) return null
+  return profile.split('\n').filter(l => !l.includes(PROFILE_MARK)).join('\n')
 }
 
-// Turn on pictures: appends the line once, then the notice says to restart.
-// When the shell or its profile can't be written, the notice shows the line
-// to add by hand instead.
-export async function turnOnPictures($: EngineInterface) {
-  act('turn_on_pictures')
-  const shell = (await $.env.get('SHELL')) ?? ''
-  const profile = profileOf(shell, state.home, state.isMac)
-  const line = profileLine(state.terminalName, shell)
-  if (!profile) return $.ui.toast(`Add this line to your shell profile, then restart Claude Code: ${line}`)
-  const before = await $.fs.read(profile).catch(() => '')
-  if (!before.includes(`${PROFILE_MARK}${SWITCHABLE[state.terminalName]!.label}`)) {
-    const written = await $.fs.write(profile, `${before}${before && !before.endsWith('\n') ? '\n' : ''}${line}\n`).then(() => true, () => false)
-    if (!written) return $.ui.toast(`Couldn't write ${profile}. Add this line to it, then restart Claude Code: ${line}`)
-  }
-  state.isTurnedOn = true
-  state.isTurnedOff = false
-  redraw($)
-}
-
-// Turn pictures off again (the settings row): removes the marked line.
-export async function turnOffPictures($: EngineInterface) {
-  act('turn_off_pictures')
+export async function removePicturesLine($: EngineInterface) {
   const profile = profileOf((await $.env.get('SHELL')) ?? '', state.home, state.isMac)
-  const label = SWITCHABLE[state.terminalName]?.label
-  if (profile && label) {
-    const before = await $.fs.read(profile).catch(() => '')
-    const after = before.split('\n').filter(l => !l.includes(`${PROFILE_MARK}${label}`)).join('\n')
-    if (after !== before) await $.fs.write(profile, after).catch(() => undefined)
-  }
-  state.isTurnedOn = false
-  state.isTurnedOff = true
-  redraw($)
+  if (!profile) return
+  const after = withoutPicturesLine(await $.fs.read(profile).catch(() => ''))
+  if (after !== null) await $.fs.write(profile, after).catch(() => undefined)
 }
 
-// At session start: whether the person turned pictures on in an earlier
-// session, read from the line in their shell profile. A tab opened before the
-// line was added doesn't have the setting, but pictures are still on.
-export async function readPicturesLine($: EngineInterface) {
-  const label = SWITCHABLE[state.terminalName]?.label
-  const profile = profileOf((await $.env.get('SHELL')) ?? '', state.home, state.isMac)
-  if (!label || !profile) return
-  const text = await $.fs.read(profile).catch(() => '')
-  state.isTurnedOn = text.includes(`${PROFILE_MARK}${label}`)
-}
-
-// Whether pictures are on for this terminal, as the settings row shows it.
-export const arePicturesOn = () => !state.isTurnedOff && (state.isForced || state.isTurnedOn)
-// Terminals that speak the kitty graphics protocol: a failed draw in one of
-// them is a background session, not the terminal.
-export const KITTY_TERMINALS = ['ghostty', 'kitty', 'wezterm', 'warp', 'konsole']
 // Herdr, like tmux, sits between Claude Code and the terminal: pictures get
 // through only with its kitty graphics pass-through on, to a terminal that
 // draws them.
-export const causeOf = (tmux: boolean, terminal: string, isForced = false): DrawCause =>
+export const causeOf = (tmux: boolean, terminal: string): DrawCause =>
   tmux ? 'tmux'
     : terminal === 'herdr' ? 'herdr'
-    : SWITCHABLE[terminal] ? (isForced ? 'terminal' : 'off')
-    : KITTY_TERMINALS.includes(terminal) ? 'background'
+    : terminal === 'iterm2' ? 'iterm'
+    : DRAWS_PICTURES.includes(terminal) ? 'background'
     : 'terminal'
 
 // Which terminal this is, from what each one sets in the environment.
-export function terminalOf(env: { program: string; term: string; kitty: boolean; konsole: boolean }): string {
+export function terminalOf(env: { program: string; term: string; kitty: boolean; konsole: boolean; lcTerminal?: string }): string {
   const { program, term } = env
+  // LC_TERMINAL also crosses ssh.
+  if (/iterm/i.test(program) || /^iTerm2$/i.test(env.lcTerminal ?? '')) return 'iterm2'
   if (/ghostty/i.test(program + term)) return 'ghostty'
   if (/kitty/i.test(term) || env.kitty) return 'kitty'
   if (/wezterm/i.test(program)) return 'wezterm'
@@ -1075,40 +1183,37 @@ const TERMINALS = 'https://github.com/iamumeransari/claude-show-your-work#termin
 
 export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video', id: string) {
   const what = kind === 'video' ? 'videos' : 'pictures'
-  const label = SWITCHABLE[state.terminalName]?.label ?? 'this terminal'
-  // Turned on, but this session started without the setting. A new tab reads
-  // the shell profile and has it; this tab's shell started before the line
-  // was added, so the command sets it for this one restart too.
-  if (cause === 'off' && state.isTurnedOn) return {
-    title: 'Pictures are on',
-    text: 'Type /exit, then paste the command here to see them now. It reopens this chat where you left off. New terminal tabs show pictures on their own.',
-    command: `env CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Copy restart command', action: 'copy_resume_command', isCalm: true,
-    claude: `pictures are turned on for ${label}, but this session started before that, so the person saw a notice instead of ${name}. They can type /exit and run the copied command, or open a new terminal tab.`,
-  }
-  if (cause === 'off') return {
-    title: `Pictures are off in ${label}`,
-    text: 'Turn them on to see pictures and videos here.',
-    command: '', label: 'Turn on pictures', action: 'turn_on_pictures', isCalm: true,
-    claude: `pictures are off in ${label} until the person presses Turn on pictures in the notice and restarts Claude Code, so they saw a notice instead of ${name}.`,
-  }
+  // Claude Code keeps pictures off inside tmux unless FORCE is set at launch;
+  // with it, the plugin passes them through (see tmux.ts).
   if (cause === 'tmux') return {
-    title: `tmux is blocking ${what}`,
-    text: `"${name}" is ready, but tmux stops ${what} from reaching the terminal. Add this line to ~/.tmux.conf, reload tmux, and ask Claude to show it again. Or open this chat outside tmux.`,
-    command: 'set -g allow-passthrough on', label: 'Copy setting', action: 'copy_tmux_setting',
-    claude: `tmux is blocking pictures, so the person saw a notice instead of ${name}. They can add "set -g allow-passthrough on" to ~/.tmux.conf or open the chat outside tmux.`,
+    title: `Restart Claude Code to show ${what} in tmux`,
+    text: `"${name}" is ready, but Claude Code keeps ${what} off inside tmux until it restarts. Press Copy command, type /exit, and paste it here to reopen this chat with ${what} on. New tmux panes have them on already.`,
+    command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Copy command', action: 'copy_resume_command',
+    claude: `Claude Code keeps pictures off inside tmux, so the person saw a notice instead of ${name}. They can restart Claude Code with ${FORCE}=1 to see it.`,
   }
   if (cause === 'herdr') return {
     title: `Herdr isn't passing ${what} through`,
-    text: `"${name}" is ready, but Herdr isn't passing ${what} on to your terminal. Add this to your Herdr config, restart Herdr, and ask Claude to show it again. The terminal around Herdr also has to support the kitty graphics protocol, such as Ghostty, kitty, WezTerm, Warp or Konsole.`,
+    text: `"${name}" is ready, but Herdr isn't passing ${what} on to your terminal. Add this to your Herdr config, restart Herdr, and ask Claude to show it again. The terminal around Herdr also has to be Ghostty or kitty.`,
     command: '[terminal]\nkitty_graphics = true', label: 'Copy setting', action: 'copy_herdr_setting',
-    claude: `Herdr isn't passing pictures through, so the person saw a notice instead of ${name}. They can set kitty_graphics = true under [terminal] in their Herdr config and restart Herdr, in a terminal that supports the kitty graphics protocol.`,
+    claude: `Herdr isn't passing pictures through, so the person saw a notice instead of ${name}. They can set kitty_graphics = true under [terminal] in their Herdr config and restart Herdr, inside Ghostty or kitty.`,
   }
+  // iTerm2 3.5+ draws Claude Code's pictures in its fullscreen view only
+  // (the classic renderer would send each one again for every new line).
+  if (cause === 'iterm') return {
+    title: `iTerm2 shows ${what} in fullscreen view`,
+    text: `"${name}" is ready. Type /tui fullscreen to switch Claude Code to its fullscreen view (it restarts and resumes this chat), then ask Claude to show it again. Needs iTerm2 3.5 or later.`,
+    command: '/tui fullscreen', label: 'Copy command', action: 'copy_tui_fullscreen',
+    claude: `iTerm2 only draws pictures in Claude Code's fullscreen view, so the person saw a notice instead of ${name}. They can type /tui fullscreen and ask again.`,
+  }
+  const known = NO_PLACEHOLDERS[state.terminalName]
   if (cause === 'terminal') return {
-    title: "Your terminal isn't supported by show-your-work",
-    text: `"${name}" is ready, but this terminal can't draw ${what}. show-your-work works in any terminal that supports the kitty graphics protocol, such as Ghostty, kitty, WezTerm, Warp or Konsole. See the full list:`,
+    title: known ? `${known} can't show Claude Code's ${what} yet` : "Your terminal isn't supported by show-your-work",
+    text: known
+      ? `"${name}" is ready, but ${known} can't draw ${what} the way Claude Code sends them yet. They show in Ghostty and kitty. See the list:`
+      : `"${name}" is ready, but this terminal can't draw ${what}. show-your-work works in Ghostty and kitty. See the list:`,
     link: { href: TERMINALS, after: 'Then press Copy command and paste it in one of them to open this chat there.' },
     command: `claude --resume${id ? ` ${id}` : ''}`, label: 'Copy command', action: 'copy_resume_command',
-    claude: `this terminal can't draw pictures, so the person saw a notice instead of ${name}. They need a terminal that supports the kitty graphics protocol, such as Ghostty, kitty, WezTerm, Warp or Konsole (list at ${TERMINALS}).`,
+    claude: `${known ?? 'this terminal'} can't draw Claude Code's pictures, so the person saw a notice instead of ${name}. Pictures show in Ghostty or kitty (list at ${TERMINALS}).`,
   }
   return {
     title: `Can't show ${what} in a background session`,
@@ -1120,7 +1225,6 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
 
 function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: number) {
   const n = cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId)
-  if (n.action === 'turn_on_pictures') return NoticeBox(ui, $, width, { ...n, copy: '', onPress: () => void turnOnPictures($) })
   return NoticeBox(ui, $, width, { ...n, copy: n.command })
 }
 
@@ -1188,15 +1292,22 @@ export async function Viewer(
   const layout = layoutOf({ columns, rows: viewport?.rows ?? 40, isPane, hasReport })
   const isWide = layout.isWide
   const other = shown.compare ? (media === shown ? shown.compare : shown) : null
-  for (const side of [media, other]) if (side) useSharpest(side)
-  // A side short of pixels for its box gets a sharper copy, made in the background.
-  if (state.cell) for (const side of [media, other]) if (side) sharpen($, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  // Each side is drawn from the copy that fits its box (see fitCopy).
+  // iTerm2 scales a picture into its box itself, so it never needs a copy
+  // fitted to the box (which also shrank the box after the first draw).
+  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side) fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
   const own = drawBox(media.width, media.height, layout, state.cell)
   const theirs = other ? drawBox(other.width, other.height, layout, state.cell) : own
   const box = { columns: Math.max(own.columns, theirs.columns), rows: Math.max(own.rows, theirs.rows) }
+  noteLayout(site, { columns, rows: viewport?.rows, room: `${layout.maxCols}x${layout.maxRows}`, isWide, picture: `${media.width}x${media.height}`, box: `${own.columns}x${own.rows}`, frame: `${box.columns}x${box.rows}` })
+  if (state.cell && !settings.standard_size && isWiderThanBox(media.width, own.columns, state.cell.width)) problem('picture_wider_than_box', { site, width: media.width, box: `${own.columns}x${own.rows}`, cell: state.cell.width })
+  if (!state.cell && state.canImage && !state.inTmux && !hasReportedNoCell) {
+    hasReportedNoCell = true
+    problem('no_cell_size', { terminal: state.terminalName })
+  }
   // A new window or font size: the cell is measured again, and only a cell
   // that really changed redraws.
   const size = `${columns}x${viewport?.rows ?? 0}`
@@ -1235,16 +1346,34 @@ export async function Viewer(
     one.timer = undefined
     return Warning(ui, $, site, shown, columns - 8)
   }
-  one.box = { columns: own.columns, rows: own.rows }
+  resized($, site, media, shown, own)
   await frameReady($, media, one.frame, site)
-  // Only expired when the original is gone: a video's frames that were cleaned
-  // away are cut again from it.
-  if ((await isGone($, plainAt(media, one.frame))) && !(await recutFrame($, media, one.frame))) {
-    one.timer?.cancel()
-    one.timer = undefined
-    return Expired(ui, $, shown, columns - 8)
+  // Only expired when the original is gone. A frame not on disk yet (a copy
+  // just made for a resized window, or one the cache trimmed) is cut again
+  // from the original, outside this draw: Claude Code cancels the processes a
+  // draw started once the next draw replaces it, and a resize redraws many
+  // times, so a cut started here was killed and the video read as expired.
+  // Meanwhile the frame last on screen, or the copy's poster, is drawn. A copy
+  // made for a resized window has no poster: only the chunk at the playhead
+  // is cut for it.
+  let file = plainAt(media, one.frame)
+  if (await isGone($, file)) {
+    if (!media.source || media.source === file || (await isGone($, media.source))) {
+      one.timer?.cancel()
+      one.timer = undefined
+      problem('expired', { site, frame: one.frame })
+      return Expired(ui, $, shown, columns - 8)
+    }
+    const frame = one.frame
+    event('recut', { site, frame })
+    void $.clock.sleep(SHARPEN_DELAY_MS).then(() => recutFrame($, media, frame)).then(isCut => { if (isCut) redraw($, site) }, () => undefined)
+    const stands = [swaps.get(`${site}|${viewKey(site)}`)?.last, media.frames && frameFile(media.frames, 0)].filter((f): f is string => !!f)
+    let stand = ''
+    for (const f of stands) if (!(await isGone($, f))) { stand = f; break }
+    if (!stand) return <Box width={box.columns} height={box.rows} justifyContent="center" alignItems="center"><Text dimColor>Loading…</Text></Box>
+    file = stand
   }
-  const pic = await picFor($, plainAt(media, one.frame), own)
+  const pic = await picFor($, file, own)
   probe($, site, viewKey(site), pic)
   if (one.isSplit && shown.pair && frames) return SplitView(ui, $, site, shown, columns, viewport?.rows ?? 40, isPane, prLink)
 
@@ -1334,7 +1463,7 @@ async function SplitView(
   const seconds = one.frame / shown.frames!.fps
   const change = changeAt(shown, seconds)
   const { fixed, broken } = checkDiff(shown.checks, before.checks)
-  one.box = { columns: box.columns, rows: box.rows }
+  resized($, site, shown, shown, box)
   await pairReady($, shown, Math.min(one.frame, pair.count - 1), site)
   const pic = await picFor($, frameFile(pair, Math.min(one.frame, pair.count - 1)), box)
   probe($, site, 'view-pair', pic)
@@ -1359,7 +1488,7 @@ async function SplitView(
           {head(shown, 'Updated', box.columns - half)}
         </Box>
         {Image ? (
-          <Image key="view-pair" source={'file' in pic.src ? { ...pic.src, generation: box.columns * 1000 + box.rows } : pic.src} columns={box.columns} rows={box.rows} alt="[original and updated, side by side]" />
+          <Image key="view-pair" source={'file' in pic.src ? { ...pic.src, generation: boxGenerationOf(site) } : pic.src} columns={box.columns} rows={box.rows} alt="[original and updated, side by side]" />
         ) : (
           <Text dimColor>This surface cannot draw images.</Text>
         )}

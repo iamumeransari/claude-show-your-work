@@ -6,6 +6,7 @@ import { noticeOf, NO_FFMPEG, noFfmpeg } from '../hooks/media'
 import { hadVersionBefore06, isNewer } from '../hooks/updater'
 import { cantDraw, causeOf, terminalOf } from '../hooks/player'
 import { earlierNo } from '../hooks/onboarding'
+import { outerOf } from '../hooks/tmux'
 
 test('a newer version is spotted, an older or equal one is not', () => {
   expect(isNewer('0.5.0', '0.4.0')).toBe(true)
@@ -53,17 +54,20 @@ test('a picture that cannot draw says why, and tells Claude it was not seen', ()
   // Herdr, like tmux, gets its own setting to copy.
   expect(causeOf(false, 'herdr')).toBe('herdr')
   expect(cantDraw('herdr', 'a.png', 'picture', 'id1').command).toBe('[terminal]\nkitty_graphics = true')
-  // kitty draws once Claude Code allows it; Warp, WezTerm and Konsole need pictures turned on first.
+  // Only Ghostty and kitty paint Claude Code's placeholders; Warp, WezTerm and Konsole can't.
   expect(causeOf(false, 'kitty')).toBe('background')
-  for (const t of ['wezterm', 'warp', 'konsole']) expect(causeOf(false, t)).toBe('off')
-  expect(cantDraw('terminal', 'a.png', 'picture', 'id1').text.includes('kitty graphics protocol')).toBe(true)
+  for (const t of ['wezterm', 'warp', 'konsole']) expect(causeOf(false, t)).toBe('terminal')
+  expect(cantDraw('terminal', 'a.png', 'picture', 'id1').text.includes('Ghostty and kitty')).toBe(true)
   expect(cantDraw('background', 'a.png', 'picture', 'id1').text.includes('Ghostty')).toBe(false)
-  expect(cantDraw('tmux', 'a.png', 'picture', 'id1').command).toBe('set -g allow-passthrough on')
+  // In tmux pictures need Claude Code restarted with them forced on; the
+  // plugin passes them through after that.
+  expect(cantDraw('tmux', 'a.png', 'picture', 'id1').command).toBe('CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 claude --resume id1')
+  expect(cantDraw('tmux', 'a.png', 'picture', 'id1').text.includes('New tmux panes')).toBe(true)
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').title).toBe("Your terminal isn't supported by show-your-work")
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').link?.href).toBe('https://github.com/iamumeransari/claude-show-your-work#terminals')
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').claude.includes('#terminals')).toBe(true)
   expect(cantDraw('background', 'a.png', 'video', 'id1').command.includes('--resume id1')).toBe(true)
-  for (const cause of ['tmux', 'herdr', 'terminal', 'background', 'off'] as const) expect(cantDraw(cause, 'a.png', 'picture', '').claude.includes('saw a notice')).toBe(true)
+  for (const cause of ['tmux', 'herdr', 'terminal', 'background'] as const) expect(cantDraw(cause, 'a.png', 'picture', '').claude.includes('saw a notice')).toBe(true)
 })
 
 test('Linux gets its own ffmpeg notice, with a package manager instead of Homebrew', () => {
@@ -106,7 +110,7 @@ test('an install used before 0.6.0 is told from one that started on 0.6', () => 
 })
 
 test('the terminal is recognised from what it sets in the environment', () => {
-  const env = (o: Partial<{ program: string; term: string; kitty: boolean; konsole: boolean }>) => ({ program: '', term: '', kitty: false, konsole: false, ...o })
+  const env = (o: Partial<{ program: string; term: string; kitty: boolean; konsole: boolean; lcTerminal: string }>) => ({ program: '', term: '', kitty: false, konsole: false, ...o })
   expect(terminalOf(env({ program: 'ghostty', term: 'xterm-ghostty' }))).toBe('ghostty')
   expect(terminalOf(env({ term: 'xterm-kitty' }))).toBe('kitty')
   expect(terminalOf(env({ kitty: true, term: 'xterm-256color' }))).toBe('kitty')
@@ -115,15 +119,25 @@ test('the terminal is recognised from what it sets in the environment', () => {
   expect(terminalOf(env({ konsole: true }))).toBe('konsole')
   expect(terminalOf(env({ program: 'Apple_Terminal' }))).toBe('apple_terminal')
   expect(terminalOf(env({}))).toBe('other')
+  expect(terminalOf(env({ program: 'iTerm.app' }))).toBe('iterm2')
+  // Over ssh only LC_TERMINAL is left.
+  expect(terminalOf(env({ lcTerminal: 'iTerm2' }))).toBe('iterm2')
+  expect(causeOf(false, 'iterm2')).toBe('iterm')
 })
 
-test('once pictures are turned on, the restart command turns them on in the same tab too', () => {
+test('Warp says it is Warp that cannot draw, and points to Ghostty and kitty', () => {
   state.terminalName = 'warp'
-  state.isTurnedOn = true
-  const n = cantDraw('off', 'a.png', 'picture', 'abc123')
-  expect(n.title).toBe('Pictures are on')
-  expect(n.command).toBe('env CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 claude --resume abc123')
-  state.isTurnedOn = false
-  expect(cantDraw('off', 'a.png', 'picture', 'abc123').label).toBe('Turn on pictures')
+  const n = cantDraw('terminal', 'a.png', 'picture', 'abc123')
+  expect(n.title).toBe("Warp can't show Claude Code's pictures yet")
+  expect(n.command).toBe('claude --resume abc123')
+  expect(n.claude.includes('Ghostty or kitty')).toBe(true)
   state.terminalName = ''
+})
+
+test('the terminal around tmux is read from the version it told tmux', () => {
+  expect(outerOf('ghostty 1.2.3')).toBe('')
+  expect(outerOf('kitty(0.35.2)')).toBe('')
+  expect(outerOf('WezTerm 20240203-110809-5046fc22')).toBe('wezterm')
+  expect(outerOf('Konsole 24.08')).toBe('konsole')
+  expect(outerOf('')).toBe('')
 })

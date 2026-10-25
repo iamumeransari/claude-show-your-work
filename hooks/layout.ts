@@ -2,6 +2,7 @@
 // picture needs, and the helpers that fit text to a width.
 import type { EngineInterface } from 'claude-code'
 
+import { event } from './diagnostics'
 import { settings, state } from './state'
 
 // The window's fill: a step lighter than a dark terminal, so it reads as one panel.
@@ -37,7 +38,10 @@ export function layoutOf(room: Room): Layout {
   const maxCols = Math.max(1, Math.max(Math.min(space, 24), Math.min(space, Math.round((room.isPane ? 220 : 120) * step))))
   // Inline, a picture takes at most 55% of the screen's height (82% in Large);
   // a pane keeps 12 rows for its controls.
-  const maxRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(Math.round(40 * step), Math.floor(room.rows * 0.55 * step)))
+  const fullRows = room.isPane ? Math.max(6, room.rows - 12) : Math.max(8, Math.min(Math.round(40 * step), Math.floor(room.rows * 0.55 * step)))
+  // iTerm2 draws a picture only while all of it is on screen: the player
+  // (title, picture, controls) fits in the window there.
+  const maxRows = state.terminalName === 'iterm2' && !room.isPane ? Math.max(6, Math.min(fullRows, room.rows - 16)) : fullRows
   return { isWide, inner, maxCols, maxRows }
 }
 export const targetBox = (width: number, height: number, layout: Layout, px: Cell | null) =>
@@ -91,11 +95,19 @@ export function sizeFor(width: number, height: number, room: number, rows: numbe
 // reports none (tmux, a relay), and measured again when the window changes.
 export type Cell = { width: number; height: number }
 export const CELL_SH = `perl -e 'open(T, "</dev/tty") or exit 1; my $w = " " x 8; ioctl(T, ($^O eq "darwin" ? 0x40087468 : 0x5413), $w) or exit 1; print join(" ", unpack("S4", $w))'`
-// The tty's size is in points; pictures draw in screen pixels, `scale` to a
-// point (2 on Retina).
+// The tty's size is in screen pixels in Ghostty, kitty and WezTerm (measured:
+// a 157-column Ghostty window on a 1280-point Retina screen reports 2520 px).
+// Multiplying it by the screen's scale, as 0.6.0 did, made every cell twice
+// its size, so pictures were made twice as wide as needed and, in Large, drawn
+// in boxes half as wide as they should be. A cell under POINT_CELL wide on a
+// Retina screen can only be points (no readable font is that narrow in
+// pixels), so only then is it scaled.
+const POINT_CELL = 10
 export function cellOf(stdout: string, scale = 1): Cell | null {
   const [rows, columns, x, y] = stdout.trim().split(/\s+/).map(Number)
-  return rows && columns && x && y ? { width: (x / columns) * scale, height: (y / rows) * scale } : null
+  if (!(rows && columns && x && y)) return null
+  const unit = scale > 1 && x / columns < POINT_CELL ? scale : 1
+  return { width: (x / columns) * unit, height: (y / rows) * unit }
 }
 const SCALE_SH = `osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSScreen.mainScreen.backingScaleFactor'`
 export async function measureCells($: EngineInterface) {
@@ -103,10 +115,16 @@ export async function measureCells($: EngineInterface) {
     $.process.run(['sh', '-c', CELL_SH]).catch(() => null),
     state.isMac ? $.process.run(['sh', '-c', SCALE_SH]).catch(() => null) : null,
   ])
+  // A measure Claude Code cancelled (a newer draw replaced the one that asked,
+  // as happens many times while a window edge is dragged) says nothing about
+  // the terminal: the last size stands. Dropping it fell back to guessed 2:1
+  // cells, a picture of the wrong shape until the next resize.
+  if (!r) return void event('measure', { state: 'cancelled', kept: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
   const scale = Number(s?.stdout.trim()) || 1
-  state.cell = r?.exitCode === 0 ? cellOf(r.stdout, scale) : null
-  const [rows, columns] = (r?.exitCode === 0 ? r.stdout : '').trim().split(/\s+/).map(Number)
+  state.cell = r.exitCode === 0 ? cellOf(r.stdout, scale) : null
+  const [rows, columns] = (r.exitCode === 0 ? r.stdout : '').trim().split(/\s+/).map(Number)
   state.termSize = rows && columns ? { columns, rows } : null
+  event('measure', { state: 'measured', tty: r.stdout.trim(), scale, cell: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
 }
 // Players of different widths each ask: one measure a second at most, the
 // last ask still measured.

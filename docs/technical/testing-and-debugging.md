@@ -42,14 +42,31 @@ Biome (`biome.json`), lint only: the formatter is off so diffs stay small. The r
 
 To show a refactor or a new setting changes nothing in the default path, run the old code beside the new: copy the old module out of git (`git show <commit>:hooks/layout.ts > hooks/zzold.ts`), write a throwaway test that imports both and compares their outputs over a grid of inputs, run `claude plugin test .`, then delete both files. Picture size was checked this way (2,016 combinations, no difference).
 
+## Diagnostics
+
+`hooks/diagnostics.ts` keeps a structured log: one JSON object per line in `debug.log` in the temp folder, while `SHOW_YOUR_WORK_DEBUG=1` is set. It is local only and must never reach `track()` (PostHog): it holds paths and sizes. Events (`e`):
+
+- `layout`: a player's window, space, picture, box and cell, only when one of them changed.
+- `copy`: a copy `asked`, `made` (with `ms`), `failed` or `cancelled` (Claude Code cancelled the draw that started it).
+- `frame`: each frame swapped in, its width and the box it went into.
+- `resize`, `resend`: a box change and its never-repeating generation; the frame sent again after it.
+- `measure`: a cell measurement, or one cancelled (the last size kept).
+- `log`: the playback timings (`tick`, `wait`, `cut chunk`, `drop`).
+- `problem`: something that shouldn't happen. Problems are also kept in memory without the debug log, a few hundred at most, for `/show-your-work diagnose`. Current checks: `frame_wider_than_box` and `picture_wider_than_box` (Large: the terminal would crop it), `resend_cancelled`, `no_cell_size`.
+
+Add an event or a problem check wherever a bug was found by guessing, so the next one is found by reading. Never start a process or read a file to log something: the log is written from memory once a second. (A `sips` call per draw, added once for debugging, made the terminal laggy.)
+
 ## A real terminal, headless
+
+`tools/pty-harness.py` does all of the below: `python3 tools/pty-harness.py video|image|tour|scroll`. It prints every placement Claude Code sent next to each resize, counts the plugin's events, and exits 1 if any `problem` was logged. Clicking and scrolling need `pyte` (see the script's header).
 
 To see what Claude Code does in a terminal without opening a window, run it under a pseudo-terminal from Python (`pty.fork`):
 
 - **Fake the terminal** with `TERM_PROGRAM=ghostty TERM=xterm-ghostty` and `SHOW_YOUR_WORK_DEBUG=1`, and load the local copy with the `--plugin-dir … --settings` line below.
 - **Set the window size** with `ioctl(fd, TIOCSWINSZ, struct.pack('HHHH', rows, cols, width_pt, height_pt))` and send `SIGWINCH`. The pixel sizes are in points; the plugin multiplies by the screen's scale (2 on Retina). To match a user's screenshot, work out their columns and cell size from it first; a guess at the geometry gives different boxes.
 - **Read `debug.log`** in the temp folder for what the plugin computed. Temporary `debug()` lines prefixed with something greppable are the quickest way to see a value; remove them before committing.
-- **It can't show whether a picture draws.** Claude Code only sends pictures after the terminal answers its queries (XTVERSION, device attributes, the kitty graphics query); answering them from the script wasn't enough to get pictures sent. Use it for layout and sizes, and a real Ghostty tab for drawing.
+- **To make Claude Code send pictures, answer its queries in order:** each kitty graphics query (`ESC _G i=<id>,…,a=q…`) with `ESC _G i=<id>;OK ESC \\` *before* answering the device-attributes query (`ESC [c`) that follows it as a sentinel; also answer XTVERSION (`ESC [>0q` → `ESC P>|ghostty 1.2.3 ESC \\`) and `ESC [?u` (`ESC [?0u`). Answered after the sentinel, the probe counts as no reply (`claude --debug-file` logs `kittyGraphics=no (probe: no reply to the graphics query)`). With that, every placement Claude Code sends (`a=T,U=1,…,c=<columns>,r=<rows>`) can be logged with a timestamp next to each resize. It still can't show what Ghostty paints from those commands.
+- **A resize test should drag, not jump:** many small size changes 40 ms apart, while a video plays (a clip longer than the test, so it doesn't end midway). Single jumps hid the cancelled-measure bug below.
 - **A test session shares the local copy's saved plugin settings** with the user's own sessions. Don't change a setting there to test; it changes theirs.
 - To reach a later tour stop without clicking, reorder `STOPS` in `tour.ts` for the run and put it back afterwards.
 

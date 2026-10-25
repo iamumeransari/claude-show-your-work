@@ -5,9 +5,9 @@ import { isInstalledCopy } from '../hooks/telemetry'
 import { isAtLeast } from '../hooks/setup'
 import { STOPS } from '../hooks/tour'
 import { settings, state } from '../hooks/state'
-import { anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, chunksBehind, chunksAhead, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
+import { readsAnyFile, anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, chunksBehind, chunksAhead, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
 import { parseShown, timesThatMean, versionsOf, noteOf, handleOf } from '../hooks/history'
-import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, profileLine, orcaReads, terminalOf, pngSource } from '../hooks/player'
+import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, withoutPicturesLine, copyWidthFor, bestCopy, anyTerminalReads, terminalOf, pngSource } from '../hooks/player'
 
 test('a wide image fills the width at half-height rows', () => {
   expect(fit(1920, 1080, 100, 40)).toEqual({ columns: 100, rows: 29 })
@@ -306,13 +306,16 @@ test('with the cell size known, a big picture is never wider than its box', () =
 
 test('the cell size comes from the tty size, and is unknown without pixels', () => {
   expect(cellOf('40 150 2400 1280\n')).toEqual({ width: 16, height: 32 })
-  expect(cellOf('40 150 2400 1280\n', 2)).toEqual({ width: 32, height: 64 })
+  // Ghostty reports pixels: a Retina scale doesn't double them.
+  expect(cellOf('40 150 2400 1280\n', 2)).toEqual({ width: 16, height: 32 })
+  // A size that can only be points (a cell 7 wide) is scaled to pixels.
+  expect(cellOf('40 150 1050 640\n', 2)).toEqual({ width: 14, height: 32 })
   expect(cellOf('40 150 0 0')).toBe(null)
   expect(cellOf('')).toBe(null)
 })
 
 test('video frames are cut as wide as the window shows them, up to 2400 px', () => {
-  // A full Retina window: 157 by 39 cells of 32.1 by 68.5 screen pixels.
+  // A wide window with large cells: 157 by 39 cells of 32.1 by 68.5 screen pixels.
   const term = { columns: 157, rows: 39 }, px = { width: 32.1, height: 68.5 }
   expect(frameWidth(1600, 800, term, px)).toBe(2400)
   const tall = frameWidth(1600, 1000, term, px)
@@ -423,25 +426,21 @@ test('a file that will not open says why, in words', () => {
   expect(openFailure({ exitCode: 1, stderr: 'The file /a.png does not exist.' }, 'pictures', at)).toBe(`Couldn't open it: nothing is at ${at} any more.`)
 })
 
-test('Warp, WezTerm and Konsole get a way to turn pictures on; others keep their notice', () => {
-  expect(causeOf(false, 'warp')).toBe('off')
-  expect(causeOf(false, 'wezterm')).toBe('off')
-  expect(causeOf(false, 'konsole')).toBe('off')
-  // Already turned on and still not drawing: the terminal itself can't.
-  expect(causeOf(false, 'warp', true)).toBe('terminal')
+test('Warp, WezTerm and Konsole are told up front; only Ghostty and kitty draw', () => {
+  for (const t of ['warp', 'wezterm', 'konsole', 'apple_terminal']) expect(causeOf(false, t)).toBe('terminal')
   expect(causeOf(false, 'ghostty')).toBe('background')
-  expect(causeOf(false, 'apple_terminal')).toBe('terminal')
   expect(causeOf(true, 'warp')).toBe('tmux')
 })
 
-test('the line goes in the profile the shell reads, only inside that terminal', () => {
+test('the old Turn on pictures line is found in the profile the shell reads, and only it is removed', () => {
   expect(profileOf('/bin/zsh', '/Users/a', true)).toBe('/Users/a/.zshrc')
   expect(profileOf('/bin/bash', '/Users/a', true)).toBe('/Users/a/.bash_profile')
   expect(profileOf('/bin/bash', '/home/a', false)).toBe('/home/a/.bashrc')
   expect(profileOf('/usr/bin/fish', '/home/a', false)).toBe('/home/a/.config/fish/config.fish')
   expect(profileOf('/bin/tcsh', '/home/a', false)).toBe(null)
-  expect(profileLine('warp', '/bin/zsh')).toBe('if [ "$TERM_PROGRAM" = "WarpTerminal" ]; then export CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1; fi # show-your-work: pictures in Warp')
-  expect(profileLine('konsole', '/usr/bin/fish')).toBe('if test -n "$KONSOLE_VERSION"; set -gx CLAUDE_CODE_FORCE_TERMINAL_IMAGES 1; end # show-your-work: pictures in Konsole')
+  const line = 'if [ "$TERM_PROGRAM" = "WarpTerminal" ]; then export CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1; fi # show-your-work: pictures in Warp'
+  expect(withoutPicturesLine(`export A=1\n${line}\nexport B=2\n`)).toBe('export A=1\nexport B=2\n')
+  expect(withoutPicturesLine('export A=1\n')).toBe(null)
 })
 
 test('Picture size: Large is Standard times one fixed step', () => {
@@ -459,17 +458,35 @@ test('Picture size: Large is Standard times one fixed step', () => {
   }
 })
 
-test('Orca draws a file only from the temp folder and only up to 2 MB', () => {
-  expect(terminalOf({ program: 'Orca', term: 'xterm-256color', kitty: false, konsole: false })).toBe('orca')
-  const tmp = '/var/folders/x/T/claude-show-your-work-501'
-  expect(orcaReads(`${tmp}/a-3-w1800.png`, 1_500_000, tmp)).toBe(true)
-  expect(orcaReads(`${tmp}/store/0a8d43.png`, 2_000_000, tmp)).toBe(true)
-  expect(orcaReads(`${tmp}/a-3.png`, 4_700_000, tmp)).toBe(false)
-  expect(orcaReads('/Users/a/project/.show-your-work/0a8d43.png', 300_000, tmp)).toBe(false)
-  expect(orcaReads(`${tmp}-other/a.png`, 300_000, tmp)).toBe(false)
+test('copies come at fixed widths, never wider than the box needs', () => {
+  expect(copyWidthFor(1670)).toBe(1600)
+  expect(copyWidthFor(1058)).toBe(1000)
+  expect(copyWidthFor(300)).toBe(480)
+  expect(copyWidthFor(9999)).toBe(3200)
 })
 
-test('in Orca, a picture saved again at the same path gets a new copy', async () => {
+test('a picture is drawn from the widest copy that fits its box', () => {
+  // A Large video made for a wide window (1670), then the window narrows to
+  // a box of 1058 px: the 1060 first prepared fits (within 3%), so it's drawn
+  // whole instead of the 1670 being cropped.
+  expect(bestCopy([1060, 1670], 1058)).toBe(1060)
+  expect(bestCopy([1100, 1670, 1000], 1058)).toBe(1000)
+  expect(bestCopy([1060, 1670], 1700)).toBe(1670)
+  // Nothing fits yet: the narrowest, so the crop is as small as it can be.
+  expect(bestCopy([1670, 1060], 900)).toBe(1060)
+})
+
+test('outside Ghostty and kitty, a picture is drawn from the temp folder and at most 2 MB', () => {
+  expect(terminalOf({ program: 'Orca', term: 'xterm-256color', kitty: false, konsole: false })).toBe('orca')
+  const tmp = '/var/folders/x/T/claude-show-your-work-501'
+  expect(anyTerminalReads(`${tmp}/a-3-w1800.png`, 1_500_000, tmp)).toBe(true)
+  expect(anyTerminalReads(`${tmp}/store/0a8d43.png`, 2_000_000, tmp)).toBe(true)
+  expect(anyTerminalReads(`${tmp}/a-3.png`, 4_700_000, tmp)).toBe(false)
+  expect(anyTerminalReads('/Users/a/project/.show-your-work/0a8d43.png', 300_000, tmp)).toBe(false)
+  expect(anyTerminalReads(`${tmp}-other/a.png`, 300_000, tmp)).toBe(false)
+})
+
+test('outside Ghostty and kitty, a picture saved again at the same path gets a new copy', async () => {
   const saved = { terminalName: state.terminalName, sendBytes: state.sendBytes, TMP: state.TMP }
   Object.assign(state, { terminalName: 'orca', sendBytes: false, TMP: '/t' })
   try {
@@ -491,8 +508,53 @@ test('in Orca, a picture saved again at the same path gets a new copy', async ()
     const second: any = await pngSource($, '/p/shot.png')
     expect(second.file.startsWith('/t/b-')).toBe(true)
     expect(runs.length).toBe(2)
-    expect((await pngSource($, '/p/shot.png') as any).file).toBe(second.file)
+    expect(((await pngSource($, '/p/shot.png')) as any).file).toBe(second.file)
     expect(runs.length).toBe(2)
+  } finally {
+    Object.assign(state, saved)
+  }
+})
+
+test('a failed copy is tried again on the next draw', async () => {
+  const saved = { terminalName: state.terminalName, sendBytes: state.sendBytes, TMP: state.TMP }
+  Object.assign(state, { terminalName: 'orca', sendBytes: false, TMP: '/t' })
+  try {
+    let fail = true
+    const $: any = {
+      fs: { stat: async (path: string) => (path.startsWith('/t/') ? { size: 1000, mtimeMs: 1 } : { size: 1000, mtimeMs: 7 }) },
+      process: { run: async () => ({ exitCode: fail ? 1 : 0, stdout: '' }) },
+    }
+    expect(((await pngSource($, '/p/again.png')) as any).file).toBe('/p/again.png')
+    await Promise.resolve()
+    fail = false
+    expect(((await pngSource($, '/p/again.png')) as any).file.startsWith('/t/o-')).toBe(true)
+  } finally {
+    Object.assign(state, saved)
+  }
+})
+
+test('Ghostty and kitty draw a picture from where it is', async () => {
+  const saved = { terminalName: state.terminalName, sendBytes: state.sendBytes, TMP: state.TMP }
+  try {
+    for (const name of ['ghostty', 'kitty']) {
+      Object.assign(state, { terminalName: name, sendBytes: false, TMP: '/t' })
+      const $: any = { fs: { stat: async () => ({ size: 9_000_000, mtimeMs: 1 }) }, process: { run: async () => { throw new Error('no process') } } }
+      expect(((await pngSource($, '/p/big.png')) as any).file).toBe('/p/big.png')
+    }
+  } finally {
+    Object.assign(state, saved)
+  }
+})
+
+test('tmux inside Ghostty or kitty reads files as they do', () => {
+  const saved = { terminalName: state.terminalName, outerTerminal: state.outerTerminal }
+  try {
+    Object.assign(state, { terminalName: 'tmux', outerTerminal: 'ghostty' })
+    expect(readsAnyFile()).toBe(true)
+    Object.assign(state, { terminalName: 'tmux', outerTerminal: '' })
+    expect(readsAnyFile()).toBe(false)
+    Object.assign(state, { terminalName: 'orca', outerTerminal: '' })
+    expect(readsAnyFile()).toBe(false)
   } finally {
     Object.assign(state, saved)
   }

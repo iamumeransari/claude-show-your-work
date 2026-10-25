@@ -1,5 +1,5 @@
-// Anonymous usage stats, the button presses they count, and the local
-// playback timing log.
+// Anonymous usage stats and the button presses they count. The local debug
+// log is diagnostics.ts, kept apart so nothing in it is ever sent.
 import type { EngineInterface } from 'claude-code'
 
 import { settings, state } from './state'
@@ -8,13 +8,6 @@ import { settings, state } from './state'
 export const act = (action: string): false => {
   track('action', { action })
   return false
-}
-// SHOW_YOUR_WORK_DEBUG=1: playback timings, a line per event, in TMP/debug.log.
-const debugLines: string[] = []
-export const debug = (line: string) => { if (state.isDebug) debugLines.push(`${Date.now()} ${line}`) }
-export async function flushDebug($: EngineInterface) {
-  if (!debugLines.length) return
-  await $.fs.write(`${state.TMP}/debug.log`, `${debugLines.slice(-20000).join('\n')}\n`).catch(() => undefined)
 }
 
 // Anonymous usage stats, sent to PostHog: what kind of thing happened and how

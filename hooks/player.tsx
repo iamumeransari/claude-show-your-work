@@ -225,11 +225,41 @@ async function readBytes($: EngineInterface, file: string): Promise<string | nul
   const loaded = await Promise.resolve().then(() => $.fs.read(small!, { as: 'bytes' })).catch(() => null)
   return loaded?.base64 ?? null
 }
+// Orca reads a picture file only from a temp folder or the terminal's own
+// worktree, and only up to 2 MiB; its floating terminal has no worktree. A
+// file it refuses draws as an empty box, and nothing comes back to say so. So
+// in Orca a picture outside the temp folder is drawn from a copy there, and
+// one too big from a smaller copy.
+export const orcaReads = (file: string, bytes: number, tmp: string) => file.startsWith(`${tmp}/`) && bytes <= BYTES_MAX
+// One copy per picture, and two draws at once share it. A picture is known by
+// its path, size and time, not its path alone: a file saved again, or a temp
+// name like `shot-3.png` back with another picture in it, gets a new copy. A
+// file Orca reads as it is (every video frame) gets none.
+const orcaCopies = new Map<string, Promise<string>>()
+async function orcaFile($: EngineInterface, file: string): Promise<string> {
+  const st = await Promise.resolve().then(() => $.fs.stat(file)).catch(() => null)
+  if (!st || orcaReads(file, st.size, state.TMP)) return file
+  const id = keyOf(`${file}|${st.size}|${st.mtimeMs}`)
+  let made = orcaCopies.get(id)
+  if (!made) orcaCopies.set(id, (made = orcaCopy($, file, st.size, id)))
+  return made
+}
+async function orcaCopy($: EngineInterface, file: string, size: number, id: string): Promise<string> {
+  if (size > BYTES_MAX) {
+    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    return (r?.exitCode === 0 && r.stdout.trim()) || file
+  }
+  const copy = `${state.TMP}/o-${id}.png`
+  // `cp -c` keeps the original's time; the temp folder's cleanup goes by it.
+  const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', '{ cp -c "$0" "$1" 2>/dev/null || cp --reflink=auto "$0" "$1" 2>/dev/null || cp "$0" "$1"; } && touch "$1"', file, copy])).catch(() => null)
+  return r?.exitCode === 0 ? copy : file
+}
 export async function pngSource($: EngineInterface, file: string): Promise<Source> {
   if (state.sendBytes) {
     const png = await bytesOf($, file)
     if (png) return { png }
   }
+  if (state.terminalName === 'orca') return { file: await orcaFile($, file), format: 'png' as const }
   return { file, format: 'png' as const }
 }
 

@@ -4,10 +4,10 @@ import { wrapWords, pagesOf, fit, cellOf, frameWidth, paneSize, layoutOf, target
 import { isInstalledCopy } from '../hooks/telemetry'
 import { isAtLeast } from '../hooks/setup'
 import { STOPS } from '../hooks/tour'
-import { settings } from '../hooks/state'
+import { settings, state } from '../hooks/state'
 import { anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, chunksBehind, chunksAhead, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
 import { parseShown, timesThatMean, versionsOf, noteOf, handleOf } from '../hooks/history'
-import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, profileLine } from '../hooks/player'
+import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, profileLine, orcaReads, terminalOf, pngSource } from '../hooks/player'
 
 test('a wide image fills the width at half-height rows', () => {
   expect(fit(1920, 1080, 100, 40)).toEqual({ columns: 100, rows: 29 })
@@ -456,5 +456,44 @@ test('Picture size: Large is Standard times one fixed step', () => {
     expect(targetBox(1600, 1000, layoutOf(room), { width: 8, height: 16 })).toEqual(targetBox(1600, 1000, layoutOf(room), { width: 8, height: 16 }))
   } finally {
     settings.standard_size = true
+  }
+})
+
+test('Orca draws a file only from the temp folder and only up to 2 MB', () => {
+  expect(terminalOf({ program: 'Orca', term: 'xterm-256color', kitty: false, konsole: false })).toBe('orca')
+  const tmp = '/var/folders/x/T/claude-show-your-work-501'
+  expect(orcaReads(`${tmp}/a-3-w1800.png`, 1_500_000, tmp)).toBe(true)
+  expect(orcaReads(`${tmp}/store/0a8d43.png`, 2_000_000, tmp)).toBe(true)
+  expect(orcaReads(`${tmp}/a-3.png`, 4_700_000, tmp)).toBe(false)
+  expect(orcaReads('/Users/a/project/.show-your-work/0a8d43.png', 300_000, tmp)).toBe(false)
+  expect(orcaReads(`${tmp}-other/a.png`, 300_000, tmp)).toBe(false)
+})
+
+test('in Orca, a picture saved again at the same path gets a new copy', async () => {
+  const saved = { terminalName: state.terminalName, sendBytes: state.sendBytes, TMP: state.TMP }
+  Object.assign(state, { terminalName: 'orca', sendBytes: false, TMP: '/t' })
+  try {
+    let st = { size: 300_000, mtimeMs: 1 }
+    const runs: string[][] = []
+    const $: any = {
+      fs: { stat: async () => st },
+      // A shrink prints the copy it made: its 5th argument.
+      process: {
+        run: async (argv: string[]) => {
+          runs.push(argv)
+          return { exitCode: 0, stdout: argv[4] ?? '' }
+        },
+      },
+    }
+    const first: any = await pngSource($, '/p/shot.png')
+    expect(first.file.startsWith('/t/o-')).toBe(true)
+    st = { size: 9_000_000, mtimeMs: 2 }
+    const second: any = await pngSource($, '/p/shot.png')
+    expect(second.file.startsWith('/t/b-')).toBe(true)
+    expect(runs.length).toBe(2)
+    expect((await pngSource($, '/p/shot.png') as any).file).toBe(second.file)
+    expect(runs.length).toBe(2)
+  } finally {
+    Object.assign(state, saved)
   }
 })

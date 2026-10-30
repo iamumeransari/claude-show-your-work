@@ -59,6 +59,9 @@ test('a picture that cannot draw says why, and tells Claude it was not seen', ()
   for (const t of ['wezterm', 'warp', 'konsole']) expect(causeOf(false, t)).toBe('terminal')
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').text.includes('Ghostty and kitty')).toBe(true)
   expect(cantDraw('background', 'a.png', 'picture', 'id1').text.includes('Ghostty')).toBe(false)
+  // The desktop app draws the card but not the picture: Open shows the file.
+  expect(cantDraw('desktop', 'a.png', 'picture', 'id1').label).toBe('Open')
+  expect(cantDraw('desktop', 'a.png', 'picture', 'id1').claude.includes('saw a notice instead of a.png')).toBe(true)
   // In tmux pictures need Claude Code restarted with them forced on; the
   // plugin passes them through after that.
   expect(cantDraw('tmux', 'a.png', 'picture', 'id1').command).toBe('CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 claude --resume id1')

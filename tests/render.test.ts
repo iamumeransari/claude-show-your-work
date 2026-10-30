@@ -84,7 +84,7 @@ test('the history lists every version by what changed, newest first', async $ =>
   expect(tree.indexOf('Centred play')).toBeLessThan(tree.indexOf('Cloud photo'))
 })
 
-test('the bar can be scrubbed while the clip plays', async $ => {
+test('scrubbing while the clip plays moves the playhead and pauses', async $ => {
   const output = `Shown.\nshow-your-work:${JSON.stringify(shown)}`
   const target = {
     plugin: 'show-your-work', surface: 'terminal', component: 'ToolResult', requestId: 'scrub',
@@ -99,11 +99,20 @@ test('the bar can be scrubbed while the clip plays', async $ => {
   expect(tree.includes('Pause')).toBe(true)
   expect(tree.includes('"seek-0"')).toBe(true)
   // Pressing near the end while playing moves the playhead there.
-  const last = [...tree.matchAll(/"seek-(\d+)"/g)].map(x => Number(x[1])).at(-1)
-  await m.press({ key: `seek-${last}` })
+  const keys = [...tree.matchAll(/"seek-(\d+)"/g)].map(x => Number(x[1]))
+  await m.press({ key: `seek-${keys.at(-1)}` })
   await m.redraw()
   const after = JSON.stringify(await m.drawn())
   expect(after.includes('0:01')).toBe(true)
+  // A jump to the middle pauses there: Resume, not a Pause over a still frame.
+  if (!after.includes('Pause')) await m.press({ key: 'play' })
+  await m.redraw()
+  expect(JSON.stringify(await m.drawn()).includes('Pause')).toBe(true)
+  await m.press({ key: `seek-${keys[Math.floor(keys.length / 2)]}` })
+  await m.redraw()
+  const middle = JSON.stringify(await m.drawn())
+  expect(middle.includes('Pause')).toBe(false)
+  expect(middle.includes('Resume')).toBe(true)
 })
 
 test('a preview whose files are gone says it expired, with a prompt to copy', async $ => {

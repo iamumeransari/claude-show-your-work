@@ -116,10 +116,12 @@ export const register: Register = on => {
       // first one.
       void removePicturesLine($)
       const isForwarded = state.inTmux && (await forwardPictures($))
-      if ((state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
+      // The desktop app's Code tab draws no pictures (#18).
+      const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
+      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
         state.canImage = false
         state.probed = true
-        state.drawCause = NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
+        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,

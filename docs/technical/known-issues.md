@@ -4,6 +4,7 @@ What's broken or unproven, and what was fixed and why, so nobody has to find the
 
 ## Open
 
+- **Clicks can be lost in Claude Code's fullscreen view (Claude Code, not the plugin).** Measured in the pty harness: a press whose mouse moves one cell before release becomes a drag-select ("copied 2 chars to clipboard") and never presses (0/10); a second click within ~0.45 s is taken as a double-click and dropped (0/5 at 0.15 s and 0.3 s, 2/5 at 0.45 s, 5/5 at 0.7 s). `ButtonProps` has no setting for either. Button `hotkey`s don't help: they reach band and pane sites only, never a transcript row; with one on Play, both a click on the player and ctrl+x tab left `p` typing into the prompt.
 - **Ghostty's painting isn't verified headless.** The pty harness (`testing-and-debugging.md`) sees every placement Claude Code sends, not what Ghostty draws. Resizing, Large and playback need a look on screen before a release.
 - **The side-by-side view doesn't use fitted copies.** `SplitView` sizes the paired clip with `sizeFor` and never calls `fitCopy`, so after a window narrows it can be cropped the way single videos were.
 - **The resends after a resize can be cancelled.** `resized` schedules them from inside a render, and Claude Code may cancel a superseded render's sleeps (`ui.render: superseded`). A playing video corrects itself on its next frame; a paused one may stay at the old placement until it's drawn again.
@@ -17,7 +18,14 @@ What's broken or unproven, and what was fixed and why, so nobody has to find the
 - **Other terminals and systems are unproven.** Whether Warp, WezTerm, kitty and Konsole report their tty size in pixels (as Ghostty does) is assumed, not measured; the plugin only scales a cell under 10 px wide. Linux and Windows haven't been run with Large or resizing.
 - **Reported: the terminal feels sticky with pictures on screen, and scrolling up sometimes jumps back.** Seen in the user's Ghostty while temporary debug logging (a `sips` call and a log write on every redraw) was in the local copy; removed. Measured headless afterwards with five pictures and a playing video: each scroll step answered in 1–26 ms, no jump back while scrolled up or during playback. If it's still seen on screen, the cause is Ghostty decoding pictures sent again on scroll back (`mayBeDropped`), or a box growing when a sharper copy arrives (the content height changes under the scroll position).
 
-## Fixed in 0.7.0 (not yet released)
+## Fixed after 0.7.0 (not yet released)
+
+| Bug | Since | Cause | Fix |
+|---|---|---|---|
+| On Linux, the history trim deleted every dot-file in the project (`.gitignore`, `.env`) (#19) | 0.6.x | `stat -f %m` is GNU's file-system report, so empty-path lines reached `rm -f -- "$base".*` as `rm -f -- .*` in the project | GNU `stat -c %Y` first, only whole record paths pass, delete from inside the history folder; `tools/trim.test.mjs` |
+| Claude desktop app: "Shown" but no picture (#18) | 0.6.x | The Code tab draws the card, not the picture, and no check caught it | `CLAUDE_CODE_ENTRYPOINT=claude-desktop` turns pictures off at session start: no inline hint, "Not shown" to Claude, a notice with Open. The plugin is for the CLI; the desktop app isn't supported |
+
+## Fixed in 0.7.0
 
 | Bug | Since | Cause | Fix |
 |---|---|---|---|

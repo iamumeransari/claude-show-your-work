@@ -17,6 +17,7 @@
 
 ## Safety rules (from issue #4 and the review after it)
 
+- Never let a bad line become a glob. `HISTORY_TRIM_SH` once read file times with `stat -f %m || stat -c %Y`; on Linux GNU `stat -f` prints a file-system report (and fails), so its lines reached the loop as records with an empty path, and `rm -f -- "$base".*` became `rm -f -- .*` in the project, deleting `.gitignore`, `.env` and every other dot-file (#19). Now GNU's `-c %Y` goes first, only a whole `/…/<6-hex>.json` path passes, and the delete runs from inside that folder. `tools/trim.test.mjs` runs the script with a GNU-style `stat`.
 - Never word-split a path: `while IFS= read -r`, quoted variables, `cd -P` into the folder and work with bare names.
 - Never follow a link: check `[ ! -L ]` and `[ -O ]` (owned by this user) before writing or deleting.
 - Delete only names the plugin makes (strict patterns), so a user's own file can never match.

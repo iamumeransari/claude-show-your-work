@@ -1172,11 +1172,17 @@ export const HISTORY_TRIM_SH = [
   'total=0; for d in "$@"; do ok "$d" && total=$((total + $(du -sk "$d" | cut -f1))); done',
   '[ "$total" -le "$cap" ] && exit 0',
   'R="[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"',
-  'for d in "$@"; do ok "$d" || continue; for f in "$d"/$R.json; do [ -f "$f" ] && printf "%s\\t%s\\n" "$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")" "$f"; done; done |',
+  // GNU stat first: GNU's -f means --file-system, and its report lines
+  // would reach the loop as records with no path (#19).
+  'for d in "$@"; do ok "$d" || continue; for f in "$d"/$R.json; do [ -f "$f" ] && printf "%s\\t%s\\n" "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")" "$f"; done; done |',
   '  sort -n | while IFS="$(printf "\\t")" read -r t f; do',
   '    [ "$total" -le "$cap" ] && break',
   '    [ "$f" = "$keep" ] && continue',
-  '    base=${f%.json}; size=$(du -sk "$base".* 2>/dev/null | awk \'{s += $1} END {print s + 0}\'); rm -f -- "$base".*; total=$((total - size))',
+  // Only a whole record path, deleted from inside its own folder: a bad
+  // line is skipped, never expanded in the project.
+  '    case "$f" in /*/$R.json) ;; *) continue ;; esac',
+  '    cd -P "${f%/*}" 2>/dev/null && ok . || continue',
+  '    base=./${f##*/}; base=${base%.json}; size=$(du -sk "$base".* 2>/dev/null | awk \'{s += $1} END {print s + 0}\'); rm -f -- "$base".*; total=$((total - size))',
   '  done; true',
 ].join('\n')
 export async function storeOf($: EngineInterface): Promise<string> {
@@ -2022,10 +2028,15 @@ function toggle($: EngineInterface, site: string, media: Shown, shown?: Shown) {
   return player(site).timer ? stop($, site) : play($, site, media, shown)
 }
 
+// A jump pauses: the frames at the new place may not be cut yet, and a clip
+// left playing there stood still under Pause.
 function seek($: EngineInterface, site: string, media: Shown, seconds: number, shown?: Shown) {
   const frames = media.frames
   if (!frames) return
-  player(site).frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
+  const one = player(site)
+  one.timer?.cancel()
+  one.timer = undefined
+  one.frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
   draw($, site, media, shown)
   redraw($, site)
 }
@@ -2538,7 +2549,7 @@ export const resumeCommand = (id: string) =>
 
 // Why pictures can't draw here: tmux, a terminal that can't draw Claude
 // Code's pictures, or a background session.
-export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'terminal' | 'background'
+export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'terminal' | 'background' | 'desktop'
 
 // Claude Code draws every picture with kitty Unicode placeholders (a=T,U=1),
 // which only Ghostty and kitty paint. Warp, WezTerm and Konsole speak the
@@ -2625,6 +2636,14 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
     command: '/tui fullscreen', label: 'Copy command', action: 'copy_tui_fullscreen',
     claude: `iTerm2 only draws pictures in Claude Code's fullscreen view, so the person saw a notice instead of ${name}. They can type /tui fullscreen and ask again.`,
   }
+  // The desktop app's Code tab draws the plugin's card but not its pictures
+  // (#18): the file opens in the system viewer instead.
+  if (cause === 'desktop') return {
+    title: `The desktop app can't show ${what} here`,
+    text: `"${name}" is ready, but the Claude desktop app doesn't draw ${what} inside the chat. Press Open to see it, or run this chat in Ghostty or kitty to see ${what} inline.`,
+    command: '', label: 'Open', action: 'open_file',
+    claude: `the Claude desktop app can't draw pictures in the chat, so the person saw a notice instead of ${name}. They can press Open on it to view the file.`,
+  }
   const known = NO_PLACEHOLDERS[state.terminalName]
   if (cause === 'terminal') return {
     title: known ? `${known} can't show Claude Code's ${what} yet` : "Your terminal isn't supported by show-your-work",
@@ -2645,7 +2664,11 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
 
 function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: number) {
   const n = cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId)
-  return NoticeBox(ui, $, width, { ...n, copy: n.command })
+  const file = shown.origin ?? shown.source ?? shown.path
+  const onPress = state.drawCause === 'desktop'
+    ? () => act(n.action) || void $.process.run(openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
+    : undefined
+  return NoticeBox(ui, $, width, { ...n, copy: n.command, onPress })
 }
 
 // The file behind a preview is gone (temp cleared, cache trimmed, or the
@@ -3920,10 +3943,12 @@ export const register: Register = on => {
       // first one.
       void removePicturesLine($)
       const isForwarded = state.inTmux && (await forwardPictures($))
-      if ((state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
+      // The desktop app's Code tab draws no pictures (#18).
+      const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
+      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
         state.canImage = false
         state.probed = true
-        state.drawCause = NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
+        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,

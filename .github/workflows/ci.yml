@@ -26,7 +26,7 @@ jobs:
         run: node tools/bundle.mjs --check
 
       - name: Test the bundle step
-        run: node --test tools/bundle.test.mjs
+        run: node --test tools/bundle.test.mjs tools/trim.test.mjs
 
       # 2.1.286 is the oldest Claude Code the plugin supports (README, Install).
       - name: Validate and test on the oldest supported Claude Code

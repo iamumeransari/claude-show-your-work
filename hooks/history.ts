@@ -66,11 +66,17 @@ export const HISTORY_TRIM_SH = [
   'total=0; for d in "$@"; do ok "$d" && total=$((total + $(du -sk "$d" | cut -f1))); done',
   '[ "$total" -le "$cap" ] && exit 0',
   'R="[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"',
-  'for d in "$@"; do ok "$d" || continue; for f in "$d"/$R.json; do [ -f "$f" ] && printf "%s\\t%s\\n" "$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")" "$f"; done; done |',
+  // GNU stat first: GNU's -f means --file-system, and its report lines
+  // would reach the loop as records with no path (#19).
+  'for d in "$@"; do ok "$d" || continue; for f in "$d"/$R.json; do [ -f "$f" ] && printf "%s\\t%s\\n" "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")" "$f"; done; done |',
   '  sort -n | while IFS="$(printf "\\t")" read -r t f; do',
   '    [ "$total" -le "$cap" ] && break',
   '    [ "$f" = "$keep" ] && continue',
-  '    base=${f%.json}; size=$(du -sk "$base".* 2>/dev/null | awk \'{s += $1} END {print s + 0}\'); rm -f -- "$base".*; total=$((total - size))',
+  // Only a whole record path, deleted from inside its own folder: a bad
+  // line is skipped, never expanded in the project.
+  '    case "$f" in /*/$R.json) ;; *) continue ;; esac',
+  '    cd -P "${f%/*}" 2>/dev/null && ok . || continue',
+  '    base=./${f##*/}; base=${base%.json}; size=$(du -sk "$base".* 2>/dev/null | awk \'{s += $1} END {print s + 0}\'); rm -f -- "$base".*; total=$((total - size))',
   '  done; true',
 ].join('\n')
 export async function storeOf($: EngineInterface): Promise<string> {

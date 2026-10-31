@@ -15,6 +15,7 @@ import { forwardPictures, stopForwarding } from './tmux'
 import { CLEAN_SH, exists, expand, findPasted, identityOf, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
+import { stopAllAudio } from './audio'
 import { hadVersionBefore06, PLUGIN } from './updater'
 import { atStep, cantDraw, causeOf, draw, freshCalls, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
 import type { Ui } from './player'
@@ -193,6 +194,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    stopAllAudio()
     await flush($).catch(() => undefined)
     await stopForwarding($)
 

@@ -10,6 +10,7 @@ import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
 import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
+import { startAudio, stopAudio } from './audio'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
 
@@ -518,6 +519,7 @@ export function stop($: EngineInterface, site: string) {
   const one = player(site)
   one.timer?.cancel()
   one.timer = undefined
+  stopAudio(site)
   redraw($, site)
 }
 
@@ -530,6 +532,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (other !== site && p.timer) {
       p.timer.cancel()
       p.timer = undefined
+      stopAudio(other, 'other_player')
       versions.set(other, (versions.get(other) ?? 0) + 1)
     }
   }
@@ -555,6 +558,10 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
   // runs ahead, so pressing play never skips the start.
   let owed = 0
   let isAsking = false
+  // Sound waits for the picture to move: starting it at play would let it run
+  // while the frames ahead are still being cut (a resume into an uncached
+  // chunk), and the clip would be heard before it is seen.
+  let audioStarted = false
   let tickAt = Date.now()
   let shownFrame = one.frame
   const startFrame = one.frame
@@ -587,6 +594,10 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     owed = Math.max(0, owed - (coming - one.frame))
     one.frame = coming
     shownFrame = coming
+    if (!audioStarted) {
+      audioStarted = true
+      startAudio($, site, frames.audio, startFrame / frames.fps)
+    }
     draw($, site, media, shown)
     const now = marks()
     if (now !== last) {
@@ -610,6 +621,7 @@ function seek($: EngineInterface, site: string, media: Shown, seconds: number, s
   const one = player(site)
   one.timer?.cancel()
   one.timer = undefined
+  stopAudio(site, 'seek')
   one.frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
   draw($, site, media, shown)
   redraw($, site)
@@ -622,6 +634,7 @@ function flip($: EngineInterface, site: string, shown: Shown, toCompare: boolean
   const wasPlaying = !!one.timer
   one.timer?.cancel()
   one.timer = undefined
+  stopAudio(site, 'flip')
   one.isCompare = toCompare
   const to = sideOf(shown, site)
   // Same moment on the other side, lined up on the steps both runs share.
@@ -648,6 +661,7 @@ function split($: EngineInterface, site: string, shown: Shown, isOn: boolean) {
   const wasPlaying = !!one.timer
   one.timer?.cancel()
   one.timer = undefined
+  stopAudio(site, 'split')
   if (one.isCompare && shown.compare.frames && shown.frames)
     one.frame = Math.max(0, Math.min(shown.frames.count - 1, Math.round(toUpdated(shown, one.frame / shown.compare.frames.fps) * shown.frames.fps)))
   one.isCompare = false
@@ -1361,6 +1375,7 @@ export async function Viewer(
   if (!state.canImage) {
     one.timer?.cancel()
     one.timer = undefined
+    stopAudio(site, 'not_visible')
     return Warning(ui, $, site, shown, columns - 8)
   }
   resized($, site, media, shown, own)
@@ -1378,6 +1393,7 @@ export async function Viewer(
     if (!media.source || media.source === file || (await isGone($, media.source))) {
       one.timer?.cancel()
       one.timer = undefined
+      stopAudio(site, 'expired')
       problem('expired', { site, frame: one.frame })
       return Expired(ui, $, shown, columns - 8)
     }

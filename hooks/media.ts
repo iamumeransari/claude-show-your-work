@@ -5,8 +5,9 @@ import type { EngineInterface } from 'claude-code'
 import type { Check, Frames, Shown } from '../types'
 
 import { state } from './state'
+import { audioExtractArgv, hasAudioTrack } from './audio'
 import { frameWidth, PX_MAX, SIDEBAR } from './layout'
-import { debug } from './diagnostics'
+import { debug, event } from './diagnostics'
 
 // Deletes the oldest frame folders until the cache is under $1 KB, keeping the
 // newest two and the ones named in $2; only inside a folder this user owns.
@@ -253,6 +254,24 @@ function writeMeta($: EngineInterface, dir: string, meta: unknown) {
   return $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
 }
 
+// A clip's sound, cut beside its frames so the player can run it alongside
+// them: mono 22 kHz, from where the frames start and as long as they run.
+// No stream, no tools or a failed cut leaves the clip as silent as before.
+export async function extractAudio($: EngineInterface, real: string, dir: string, lead: number, duration: number): Promise<string | undefined> {
+  if (!state.hasVideoTools) return undefined
+  const audioProbe = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', real]).catch(() => null)
+  if (!audioProbe || audioProbe.exitCode !== 0) {
+    event('audio', { action: 'unavailable', stage: 'probe' })
+    return undefined
+  }
+  if (!hasAudioTrack(audioProbe.stdout)) return undefined
+  const wav = `${dir}/audio.wav`
+  const made = await $.process.run(audioExtractArgv(state.ffmpeg, real, wav, lead, duration)).catch(() => null)
+  if (made && made.exitCode === 0) return wav
+  event('audio', { action: 'unavailable', stage: 'extract' })
+  return undefined
+}
+
 export async function prepareVideo($: EngineInterface, real: string, title: string, key?: string, cutAt?: number): Promise<Shown> {
   if (!state.hasVideoTools) {
     state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
@@ -271,6 +290,12 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     const meta = (await readMeta($, dir)) as { frames: Omit<Frames, 'dir'>; width: number; height: number } | null
     if (meta) {
       const frames = { ...meta.frames, dir }
+      // A folder cached before sound existed has no audio field; a wav the
+      // trim or cleanup took is gone. Either way the source says: a clip that
+      // has sound gets it cut again, one that never did stays silent.
+      const cached = meta.frames.audio
+      frames.audio = cached && !(await isGone($, cached)) ? cached : await extractAudio($, real, dir, frames.lead ?? 0, frames.duration)
+      if (!cached && frames.audio) await writeMeta($, dir, { ...meta, frames: { ...meta.frames, audio: frames.audio } })
       await $.process.run(['touch', dir]).catch(() => undefined)
       await ensureChunk($, frames, real, 0)
       await prefill($, frames, real)
@@ -300,11 +325,12 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   const pngs = (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).length
   if (!pngs) throw new Error(`no frames in ${real}`)
   const count = known ? Math.max(pngs, total) : pngs
-  const frames = { dir, count, fps, duration: count / fps, cut, ...(lead ? { lead } : {}) }
+  const frames: Frames = { dir, count, fps, duration: count / fps, cut, ...(lead ? { lead } : {}) }
+  frames.audio = await extractAudio($, real, dir, lead, frames.duration)
   const poster = frameFile(frames, 0)
 
   const size = await pngSize($, poster)
-  if (folder) await writeMeta($, dir, { frames: { count, fps, duration: frames.duration, cut, ...(lead ? { lead } : {}) }, ...size })
+  if (folder) await writeMeta($, dir, { frames: { count, fps, duration: frames.duration, cut, ...(lead ? { lead } : {}), ...(frames.audio ? { audio: frames.audio } : {}) }, ...size })
   void trimFrames($)
   if (known) await prefill($, frames, real)
   return { kind: 'video', path: poster, source: real, ...size, ...own, title, generation: state.generation, frames }
@@ -325,10 +351,13 @@ export async function rescaleVideo($: EngineInterface, m: Shown, width: number, 
   const i = Math.max(0, Math.min(at, f.count - 1))
   await $.process.run(['mkdir', '-p', dir])
   await ensureChunk($, frames, source, i)
+  frames.audio = f.audio
+    ? (await isGone($, f.audio) ? await extractAudio($, source, dir, f.lead ?? 0, f.duration) : f.audio)
+    : undefined
   const shown = frameFile(frames, i)
   if (await isGone($, shown)) return null
   const size = await pngSize($, shown)
-  await writeMeta($, dir, { frames: { count: f.count, fps: f.fps, duration: f.duration, cut: width, ...(f.lead ? { lead: f.lead } : {}) }, ...size })
+  await writeMeta($, dir, { frames: { count: f.count, fps: f.fps, duration: f.duration, cut: width, ...(f.lead ? { lead: f.lead } : {}), ...(frames.audio ? { audio: frames.audio } : {}) }, ...size })
   void trimFrames($)
   return { ...m, path: shown, ...size, generation: ++state.generation, frames }
 }

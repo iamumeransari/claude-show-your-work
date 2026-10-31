@@ -1,4 +1,4 @@
-export type Frames = { dir: string; count: number; fps: number; duration: number; lead?: number; cut?: number }
+export type Frames = { dir: string; count: number; fps: number; duration: number; lead?: number; cut?: number; audio?: string }
 
 // One QA check: its name, whether it passed, and when it happens in a clip.
 export type Check = { name: string; ok: boolean; at?: number; url?: string }

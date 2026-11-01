@@ -4,6 +4,8 @@ import type { EngineInterface } from 'claude-code'
 
 import { state } from './state'
 import { measureCells } from './layout'
+import { bgDecide } from './player'
+import { event, problem } from './diagnostics'
 
 export const PICK_TMP = [
   'base="${TMPDIR:-/tmp}"; base="${base%/}"; d="$base/claude-show-your-work-$(id -u)"',
@@ -22,6 +24,24 @@ export function setUp($: EngineInterface): Promise<void> {
   // Each step on its own: one that fails leaves the defaults, never a throw.
   const tryRun = (argv: string[], options?: { timeoutMs: number }) => Promise.resolve().then(() => $.process.run(argv, options)).catch(() => null)
   return (state.setup ??= (async () => {
+    // Lazy setup also runs after a reload, which may not run session.start.
+    // Recover playback policy before any player can schedule autoplay; a host
+    // without an env uses the normal foreground policy.
+    const kind = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_SESSION_KIND')).catch(() => undefined)
+    const forced = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')).catch(() => undefined)
+    const { isBg, force } = bgDecide(kind, forced)
+    state.isBg = isBg
+    if (force) {
+      const result = await Promise.resolve().then(() => $.env.set('CLAUDE_CODE_FORCE_TERMINAL_IMAGES', '1')).catch(() => ({ deny: 'could not be set' }))
+      const denied = result.deny ?? null
+      event('bg_force', { denied })
+      if (denied) {
+        problem('bg_force_denied', { reason: denied })
+        state.canImage = false
+        state.probed = true
+        state.drawCause = 'background'
+      }
+    }
     // After a reload the session start doesn't run again: ask the session
     // where it runs, so history is read from the right folder.
     if (!state.cwd) state.cwd = (await Promise.resolve().then(() => $.session.cwd()).catch(() => '')) || ((await tryRun(['pwd']))?.stdout ?? '').trim()

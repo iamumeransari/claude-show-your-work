@@ -362,7 +362,7 @@ function probe($: EngineInterface, site: string, key: string, pic: Pic) {
     event('probe', { deny: r.deny ?? null, bytes: 'png' in pic.src })
     if (r.deny && /alt/i.test(r.deny)) {
       state.canImage = false
-      state.drawCause = causeOf(state.inTmux, state.terminalName)
+      state.drawCause = causeOf(state.inTmux, state.terminalName, state.isBg)
       track('cannot_draw', { cause: state.drawCause })
       $.ui.toast("Pictures can't show here: see the notice in the chat.")
       redraw($)
@@ -1176,8 +1176,11 @@ export async function removePicturesLine($: EngineInterface) {
 // Herdr, like tmux, sits between Claude Code and the terminal: pictures get
 // through only with its kitty graphics pass-through on, to a terminal that
 // draws them.
-export const causeOf = (tmux: boolean, terminal: string): DrawCause =>
+export const bgDecide = (kind: string | undefined, forced: string | undefined) => ({ isBg: kind === 'bg', force: kind === 'bg' && forced === undefined })
+export const autoStarts = () => !state.isBg
+export const causeOf = (tmux: boolean, terminal: string, isBg = false): DrawCause =>
   tmux ? 'tmux'
+    : isBg ? 'background'
     : terminal === 'herdr' ? 'herdr'
     : terminal === 'iterm2' ? 'iterm'
     : DRAWS_PICTURES.includes(terminal) ? 'background'
@@ -1365,8 +1368,10 @@ export async function Viewer(
   const run = (argv: string[], note: string) => () => {
     void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
-  // A video the agent shows starts playing by itself, once.
-  if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
+  // A video the agent shows starts playing by itself, once — never in a
+  // background session, where nobody may ever view it: there it waits for the
+  // person's own Play, in whatever view they open.
+  if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site) && autoStarts()) {
     one.hasAutoplayed = true
     void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
   }

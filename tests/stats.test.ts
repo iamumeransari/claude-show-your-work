@@ -4,7 +4,7 @@ import { state } from '../hooks/state'
 import { isStatsBlocked, nicknameOf } from '../hooks/telemetry'
 import { noticeOf, NO_FFMPEG, noFfmpeg } from '../hooks/media'
 import { hadVersionBefore06, isNewer } from '../hooks/updater'
-import { cantDraw, causeOf, terminalOf } from '../hooks/player'
+import { autoStarts, bgDecide, cantDraw, causeOf, terminalOf } from '../hooks/player'
 import { earlierNo } from '../hooks/onboarding'
 import { outerOf } from '../hooks/tmux'
 
@@ -71,6 +71,30 @@ test('a picture that cannot draw says why, and tells Claude it was not seen', ()
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').claude.includes('#terminals')).toBe(true)
   expect(cantDraw('background', 'a.png', 'video', 'id1').command.includes('--resume id1')).toBe(true)
   for (const cause of ['tmux', 'herdr', 'terminal', 'background'] as const) expect(cantDraw(cause, 'a.png', 'picture', '').claude.includes('saw a notice')).toBe(true)
+})
+
+test('a background session is told apart from a normal one, and turns pictures on itself', () => {
+  // The worker runs with CLAUDE_CODE_SESSION_KIND=bg and no terminal env; the
+  // plugin flips Claude Code's pictures back on, unless the person set the
+  // variable themselves (an explicit off stays off).
+  expect(bgDecide('bg', undefined)).toStrictEqual({ isBg: true, force: true })
+  expect(bgDecide('bg', '1')).toStrictEqual({ isBg: true, force: false })
+  expect(bgDecide('bg', '0')).toStrictEqual({ isBg: true, force: false })
+  expect(bgDecide('interactive', undefined)).toStrictEqual({ isBg: false, force: false })
+  expect(bgDecide(undefined, undefined)).toStrictEqual({ isBg: false, force: false })
+  // A picture that fails to draw in a background session says so whatever the
+  // scrubbed env looks like: never "your terminal isn't supported".
+  expect(causeOf(false, 'other', true)).toBe('background')
+  expect(causeOf(false, 'kitty', true)).toBe('background')
+  expect(causeOf(false, 'apple_terminal', true)).toBe('background')
+  expect(causeOf(true, 'other', true)).toBe('tmux')
+  expect(causeOf(false, 'apple_terminal', false)).toBe('terminal')
+  // Videos in a background session wait for the person: nothing plays to an
+  // empty room. A normal session starts them itself, as before.
+  state.isBg = true
+  expect(autoStarts()).toBe(false)
+  state.isBg = false
+  expect(autoStarts()).toBe(true)
 })
 
 test('Linux gets its own ffmpeg notice, with a package manager instead of Homebrew', () => {

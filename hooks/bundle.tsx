@@ -1874,7 +1874,7 @@ function probe($: EngineInterface, site: string, key: string, pic: Pic) {
     event('probe', { deny: r.deny ?? null, bytes: 'png' in pic.src })
     if (r.deny && /alt/i.test(r.deny)) {
       state.canImage = false
-      state.drawCause = causeOf(state.inTmux, state.terminalName)
+      state.drawCause = causeOf(state.inTmux, state.terminalName, state.isBg)
       track('cannot_draw', { cause: state.drawCause })
       $.ui.toast("Pictures can't show here: see the notice in the chat.")
       redraw($)
@@ -2688,8 +2688,11 @@ export async function removePicturesLine($: EngineInterface) {
 // Herdr, like tmux, sits between Claude Code and the terminal: pictures get
 // through only with its kitty graphics pass-through on, to a terminal that
 // draws them.
-export const causeOf = (tmux: boolean, terminal: string): DrawCause =>
+export const bgDecide = (kind: string | undefined, forced: string | undefined) => ({ isBg: kind === 'bg', force: kind === 'bg' && forced === undefined })
+export const autoStarts = () => !state.isBg
+export const causeOf = (tmux: boolean, terminal: string, isBg = false): DrawCause =>
   tmux ? 'tmux'
+    : isBg ? 'background'
     : terminal === 'herdr' ? 'herdr'
     : terminal === 'iterm2' ? 'iterm'
     : DRAWS_PICTURES.includes(terminal) ? 'background'
@@ -2877,8 +2880,10 @@ export async function Viewer(
   const run = (argv: string[], note: string) => () => {
     void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
-  // A video the agent shows starts playing by itself, once.
-  if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
+  // A video the agent shows starts playing by itself, once — never in a
+  // background session, where nobody may ever view it: there it waits for the
+  // person's own Play, in whatever view they open.
+  if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site) && autoStarts()) {
     one.hasAutoplayed = true
     void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
   }
@@ -3129,6 +3134,8 @@ export const state = {
   sessionId: '',
   drawCause: 'background' as DrawCause,
   inTmux: false,
+  // Background workers prepare media without knowing whether anyone views it.
+  isBg: false,
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',
@@ -3802,14 +3809,15 @@ function loadDemo($: EngineInterface) {
   void prepareTour($).catch(() => undefined)
 }
 
-// Each stop starts its player fresh; a video starts playing by itself.
+// Each stop starts its player fresh; a video starts playing by itself — never
+// in a background session, where nothing plays without the person's Play.
 export function goToStop($: EngineInterface, to: number) {
   stop($, state.tourSite)
   players.delete(state.tourSite)
   state.tourStop = Math.max(0, Math.min(STOPS.length - 1, to))
   state.isStopDone = false
   const media = mediaOf(STOPS[state.tourStop]!)
-  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play') void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
+  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play' && autoStarts()) void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
   void update($, welcome, n => n + 1)
 }
 
@@ -3919,6 +3927,24 @@ export function setUp($: EngineInterface): Promise<void> {
   // Each step on its own: one that fails leaves the defaults, never a throw.
   const tryRun = (argv: string[], options?: { timeoutMs: number }) => Promise.resolve().then(() => $.process.run(argv, options)).catch(() => null)
   return (state.setup ??= (async () => {
+    // Lazy setup also runs after a reload, which may not run session.start.
+    // Recover playback policy before any player can schedule autoplay; a host
+    // without an env uses the normal foreground policy.
+    const kind = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_SESSION_KIND')).catch(() => undefined)
+    const forced = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')).catch(() => undefined)
+    const { isBg, force } = bgDecide(kind, forced)
+    state.isBg = isBg
+    if (force) {
+      const result = await Promise.resolve().then(() => $.env.set('CLAUDE_CODE_FORCE_TERMINAL_IMAGES', '1')).catch(() => ({ deny: 'could not be set' }))
+      const denied = result.deny ?? null
+      event('bg_force', { denied })
+      if (denied) {
+        problem('bg_force_denied', { reason: denied })
+        state.canImage = false
+        state.probed = true
+        state.drawCause = 'background'
+      }
+    }
     // After a reload the session start doesn't run again: ask the session
     // where it runs, so history is read from the right folder.
     if (!state.cwd) state.cwd = (await Promise.resolve().then(() => $.session.cwd()).catch(() => '')) || ((await tryRun(['pwd']))?.stdout ?? '').trim()
@@ -4258,7 +4284,9 @@ export const register: Register = on => {
       const handle = kept.id ? ` #${kept.id}${kept.chain.length ? `, version ${kept.chain.length + 1} after #${kept.chain.at(-1)!.id}` : ''}.` : ''
       const hint = (kept.missing ? ` #${kept.missing} wasn't found, so this has no history.` : '') + handle
       const opening = state.canImage
-        ? `Shown: ${shown.title} (${what}).`
+        ? state.isBg
+          ? `Prepared: ${shown.title} (${what}). It appears when this session is viewed in a drawing terminal${shown.frames ? '; press Play to start it' : ''}. Don't say the person has seen it.`
+          : `Shown: ${shown.title} (${what}).`
         : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)

@@ -327,7 +327,9 @@ export const register: Register = on => {
       const handle = kept.id ? ` #${kept.id}${kept.chain.length ? `, version ${kept.chain.length + 1} after #${kept.chain.at(-1)!.id}` : ''}.` : ''
       const hint = (kept.missing ? ` #${kept.missing} wasn't found, so this has no history.` : '') + handle
       const opening = state.canImage
-        ? `Shown: ${shown.title} (${what}).`
+        ? state.isBg
+          ? `Prepared: ${shown.title} (${what}). It appears when this session is viewed in a drawing terminal${shown.frames ? '; press Play to start it' : ''}. Don't say the person has seen it.`
+          : `Shown: ${shown.title} (${what}).`
         : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)

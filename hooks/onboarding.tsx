@@ -13,7 +13,7 @@ import { BRANCHES, checkForUpdate, findUpdate, installUpdate, PLUGIN } from './u
 import type { Found } from './updater'
 import { STOPS } from './tour'
 import type { Stop } from './tour'
-import { atStep, freshCalls, play, players, redraw, stop, Viewer } from './player'
+import { atStep, autoStarts, freshCalls, play, players, redraw, stop, Viewer } from './player'
 import type { Ui } from './player'
 
 // ── Settings and welcome ─────────────────────────────────────────────────
@@ -416,14 +416,15 @@ function loadDemo($: EngineInterface) {
   void prepareTour($).catch(() => undefined)
 }
 
-// Each stop starts its player fresh; a video starts playing by itself.
+// Each stop starts its player fresh; a video starts playing by itself — never
+// in a background session, where nothing plays without the person's Play.
 export function goToStop($: EngineInterface, to: number) {
   stop($, state.tourSite)
   players.delete(state.tourSite)
   state.tourStop = Math.max(0, Math.min(STOPS.length - 1, to))
   state.isStopDone = false
   const media = mediaOf(STOPS[state.tourStop]!)
-  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play') void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
+  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play' && autoStarts()) void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
   void update($, welcome, n => n + 1)
 }
 

@@ -52,6 +52,8 @@ export const state = {
   sessionId: '',
   drawCause: 'background' as DrawCause,
   inTmux: false,
+  // Background workers prepare media without knowing whether anyone views it.
+  isBg: false,
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',

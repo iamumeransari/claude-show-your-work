@@ -3,6 +3,28 @@ import { state } from '../hooks/state'
 
 import { audioArgv, audioExtractArgv, hasAudioTrack } from '../hooks/audio'
 import { extractAudio } from '../hooks/media'
+import { setUp } from '../hooks/setup'
+
+// Reloads do not necessarily run session.start. The first lazy setup must
+// recover background policy before a media call or a restored player.
+test('lazy setup restores background policy and enables graphics after a reload', async () => {
+  const original = { setup: state.setup, isBg: state.isBg, canImage: state.canImage, probed: state.probed, drawCause: state.drawCause }
+  for (const denied of [false, true]) {
+    state.setup = null
+    state.isBg = false
+    state.canImage = true
+    const $ = {
+      env: { get: async (name: string) => name === 'CLAUDE_CODE_SESSION_KIND' ? 'bg' : undefined, set: async () => denied ? { deny: 'host rule' } : {} },
+      session: { cwd: async () => '/tmp', version: async () => ({ base: '2.1.309' }) },
+      process: { run: async () => ({ exitCode: 1, stdout: '', stderr: '' }) },
+    } as unknown as Parameters<typeof setUp>[0]
+    await setUp($)
+    expect(state.isBg).toBe(true)
+    expect(state.canImage).toBe(!denied)
+    if (denied) expect(state.drawCause).toBe('background')
+  }
+  Object.assign(state, original)
+})
 
 test('an audio stream is spotted in ffprobe stream lines, emptiness is not', () => {
   expect(hasAudioTrack('audio\n')).toBe(true)

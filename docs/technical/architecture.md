@@ -13,6 +13,7 @@ How a picture or video gets from Claude's tool call to the terminal, and which m
 | `media.ts` | Getting files ready to draw: PNG conversion, video frames cut a chunk at a time, the side-by-side clip of two runs |
 | `layout.ts` | Sizing: from the room a player has to its box in cells and the pixels its picture needs |
 | `player.tsx` | Playback (timer, frame swaps, seek, compare) and the components that draw the player |
+| `sound.ts` | A video's sound: the stream check, the cut sound file, ffplay and its clock |
 | `tmux.ts` | Inside tmux: turns on `allow-passthrough` for the pane and forwards Claude Code's picture commands, wrapped, through `pipe-pane` |
 | `onboarding.tsx`, `tour.ts` | The settings pane, the welcome and the tour |
 | `updater.ts` | The daily update check and moves between Stable and Latest |

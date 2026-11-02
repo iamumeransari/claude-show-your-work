@@ -69,7 +69,7 @@ Beyond product QA, Claude can show you a video of almost anything it works on. B
 
 Making an ad, an animation or a launch video? Each cut plays right in the chat, in a full-featured video player:
 
-- **Video Controls:** Play, pause, scrub through the timeline, and skip forward or back to the moment you want.
+- **Video Controls:** Play, pause, scrub through the timeline, and skip forward or back to the moment you want. A video with sound has Unmute; it plays muted until you press it.
 - **Timestamps:** The sidebar walks you through what happens in the video, step by step. Each step is timestamped, so one click takes you right to that moment.
 - **Compare Versions:** When Claude makes a new version of a video, it opens in the same player. You can flip between drafts in History or play the old and new versions side by side, in sync.
 - **Quick Functions:** Open the video in QuickTime Player for a bigger view, or save it straight to your Downloads folder in one click.
@@ -195,7 +195,7 @@ You choose whether to share anonymous usage data. You can make that choice durin
 
 Here's everything the plugin does on your computer, so you know exactly what you're installing. Your pictures and videos never leave your machine.
 
-To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted.
+To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). After you press Unmute, `ffplay` (part of ffmpeg) plays a video's sound, and on macOS `osascript` reads how long your speakers or headphones take to play it, so the picture waits for the sound. When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted.
 
 A few short scripts run with `sh` and `perl`. They find `ffmpeg` and your home folder, read the terminal's cell size so pictures fit, tidy the plugin's temp folder, open a viewer on Linux, and switch between the Stable and Latest channels. It also uses `cp`, `mkdir`, `rm`, `cat` and `touch` for its own temp files, and `claude plugin` to install its own updates from this repository, at most once a day. You can turn updates off. The updater will be turned off after the plugin moves to the Claude Code plugin directory, which keeps it up to date instead.
 

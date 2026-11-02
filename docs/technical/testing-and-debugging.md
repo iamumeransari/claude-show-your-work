@@ -28,6 +28,8 @@ Biome (`biome.json`), lint only: the formatter is off so diffs stay small. The r
 ## The test harness (`claude-code/testing`)
 
 - Every test loads the module, so a loader rule broken anywhere fails every test. That's the fastest way to catch the rules in `plugin-loader-and-hooks.md`.
+- **Tests that mount a component run the bundle, not the modules.** A test's `import { state } from '../hooks/state'` is a different copy from the one the mounted plugin uses: setting it changes nothing the plugin sees. Drive the plugin as a session would (answer its `process.run`, press its buttons). The test's own `$` has no `process.run` or `ui.invalidate`, so a plugin function can't be called with it.
+- **`mock.clock` doesn't move `Date.now()`.** Anything timed with `Date.now()` (the play timer's real-time accounting, the sound's give-ups) never times out under it.
 - Pure functions are exported and tested directly (`tests/fit.test.ts`, `tests/stats.test.ts`). Prefer pulling logic into a small exported function over driving it through hooks.
 - Render tests mount a component with `$.ui.mount(target)` and read `drawn()`. Press buttons with `mounted.press({ key })`.
 - **Hooks registered with `on(...)` in a test return `{ value }` or `{ deny }`.** Returning a bare object (like `{ deny: '...' }` meant as a result) turns into a rejection.
@@ -88,3 +90,14 @@ claude --plugin-dir ~/claude-mods/claude-show-your-work --settings '{"enabledPlu
 - `SHOW_YOUR_WORK_DEBUG=1` before `claude` turns on `debug.log` in the temp folder (`$TMPDIR/claude-show-your-work-<uid>/debug.log`). It holds the last 20,000 lines and is rewritten once a second. Ask a user for it when something only happens on their machine; it holds no file contents.
 - `/reload-plugins` picks up edits; `/img <path>` shows any file without Claude; `/show-your-work tour` exercises video, compare and history.
 - Several sessions can share this folder (forks, other tabs). Check `git status` and `git reflog` before committing; another session may have edited or amended.
+
+## Sound
+
+`python3 tools/sound-align.py` checks that frames and the sound file line up, with no Claude Code involved (see `playing-video.md`). Run it after touching any ffmpeg command in `media.ts` or `sound.ts`.
+
+- The plugin harness can't spawn `ffplay`; test sound in `tools/pty-harness.py` runs. Set `SDL_AUDIODRIVER=dummy` in the environment Claude Code starts with: `ffplay` then plays to SDL's dummy device, silently, and still reports its position. That device runs at about 0.97x real time, which also shows the picture follows the sound rather than the wall clock.
+- The play button reads `▶ Play`, then `❚❚ Pause`, then `▶ Resume` after a pause or skip: a scenario clicking `Play` a second time clicks nothing.
+- Count `pgrep -f 'ffplay -nodisp'` after each step (pause, skip, mute, the clip's end, closing Claude Code): it must be 0 whenever the picture isn't moving.
+- `debug.log` has `sound at=<s> frame=<n> target=<n>` on every tick with sound, and `sound` events (`cut`, `play`, `stop` with why).
+- **To test a hung `ffplay`, freeze the real one:** `kill -STOP` its pid mid-play (it stays alive and reports nothing): the plugin logs `sound_stalled` within 0.6 s, the engine kills the stopped child, and sound starts again from the frame on screen. Stopped within ~0.2 s of starting, before its first position: `sound_no_clock` after 2.5 s, then the same. A fake `ffplay` earlier on `PATH` doesn't work on macOS: the login shell's `path_helper` puts `/opt/homebrew/bin` (`/etc/paths.d/homebrew`) ahead of it.
+- `tests/sound-play.test.ts` answers `process.run` and `process.spawn` with a fake `ffplay`. A fake must print a status line while it "starts", as the real one prints `nan` lines: an async generator only sees `return()` at a `yield`, so one sleeping silently looks unkillable.

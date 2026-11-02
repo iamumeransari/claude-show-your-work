@@ -255,6 +255,14 @@ test('a blank opening of any flat tone is found, and the times move with it', ()
   expect(leadFrom(frame(0, 30, 200), 12)).toBe(0)
   expect(leadFrom(frame(0, 250, 252) + frame(0.1, 251, 252), 12)).toBe(0)
   expect(leadFrom('', 12)).toBe(0)
+  // As ffmpeg 8 prints it with every key (metadata takes only one key=; asking
+  // for two printed only the last, and nothing was ever found).
+  const full = (t: number, lo: number, hi: number) => {
+    const keys = ['YMIN', 'YLOW', 'YAVG', 'YHIGH', 'YMAX', 'ULOW', 'UHIGH', 'SATAVG', 'HUEMED', 'YDIF']
+      .map(k => `[Parsed_metadata_3 @ 0x1] lavfi.signalstats.${k}=${k === 'YLOW' || k === 'YMIN' ? lo : k === 'YHIGH' || k === 'YMAX' ? hi : 128}\n`).join('')
+    return `[Parsed_metadata_3 @ 0x1] frame:${t * 10}    pts:${t * 10}       pts_time:${t}\n${keys}`
+  }
+  expect(leadFrom(full(0, 235, 235) + full(0.1, 235, 235) + full(0.2, 30, 220), 12)).toBe(0.2)
   expect(shiftTimes([{ title: 'a', at: 2 }, { title: 'b' }, { title: 'c', at: 0.3 }], 0.64)).toEqual([{ title: 'a', at: 1.36 }, { title: 'b' }, { title: 'c', at: 0 }])
 })
 
@@ -559,3 +567,4 @@ test('tmux inside Ghostty or kitty reads files as they do', () => {
     Object.assign(state, saved)
   }
 })
+

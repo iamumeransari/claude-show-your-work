@@ -10,11 +10,13 @@ A Claude Code plugin that draws pictures and videos in the chat, in Ghostty and 
 - `media.ts`: preparing pictures and videos, frames, the side-by-side clip, the frame cache
 - `history.ts`: version history and the shown item behind a result's marker
 - `player.tsx`: playback and the player's components
+- `sound.ts`: a video's sound beside its frames (ffplay), off until Unmute
 - `tmux.ts`: passing Claude Code's pictures through tmux
 - `onboarding.tsx` and `tour.ts`: settings, welcome and tour
 - `telemetry.ts` and `updater.ts`: usage stats and updates
 - `diagnostics.ts`: the local debug log (structured events and problems) and `/show-your-work diagnose`; never sent anywhere
 - `tools/pty-harness.py`: Claude Code in a hidden terminal that answers like Ghostty; runs a scenario and fails on any problem the plugin logs
+- `tools/sound-align.py`: checks that a video's frames and its sound file line up, through the plugin's own ffmpeg commands
 
 Before changing an area, read its notes in `docs/technical/`:
 

@@ -51,6 +51,12 @@ export const state = {
   sessionId: '',
   drawCause: 'background' as DrawCause,
   inTmux: false,
+  // Sound (sound.ts): ffplay's path ('' when missing), whether the session
+  // runs where its speakers aren't the person's (ssh, a background session),
+  // and whether the person turned sound on. Off at every session start.
+  ffplay: '',
+  isFarFromSpeakers: false,
+  isSoundOn: false,
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',

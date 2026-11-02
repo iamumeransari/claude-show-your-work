@@ -29,7 +29,7 @@ export function setUp($: EngineInterface): Promise<void> {
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
@@ -44,6 +44,11 @@ export function setUp($: EngineInterface): Promise<void> {
     const sshConnection = await Promise.resolve().then(() => $.env.get('SSH_CONNECTION')).catch(() => undefined)
     const sshTty = await Promise.resolve().then(() => $.env.get('SSH_TTY')).catch(() => undefined)
     if (sshConnection || sshTty) state.sendBytes = true
+    // Sound plays on this machine's speakers: over ssh, or from a background
+    // session nobody may be watching, it would play to the wrong room.
+    const kind = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_SESSION_KIND')).catch(() => undefined)
+    state.ffplay = got('fy')
+    state.isFarFromSpeakers = !!(sshConnection || sshTty) || kind === 'bg'
     const engine = await Promise.resolve().then(() => $.session.version()).catch(() => null)
     state.canColourButtons = !!engine && isAtLeast(engine.base ?? engine.version, '2.1.295')
     await Promise.resolve().then(() => measureCells($)).catch(() => undefined)

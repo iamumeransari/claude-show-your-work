@@ -12,6 +12,7 @@ import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, ke
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
+import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
 
 // Playback per drawn site (a transcript row's tool_use_id, or the pane).
 type Player = {
@@ -30,6 +31,11 @@ type Player = {
   // state.drawnBytes when this player's picture was last sent
   drawnAt?: number
   hasAutoplayed?: boolean
+  // Started by itself, not by the person: plays without sound until they
+  // press Play or Unmute.
+  isQuiet?: boolean
+  // When the play timer last ran: the sound ends once it has been quiet a second.
+  tickedAt?: number
   // how many bar cells the scrub row last drew, so playback redraws only on a change
   segments?: number
   // which page of key changes the sidebar shows
@@ -515,10 +521,29 @@ export function changeAt(shown: Shown, seconds: number): { check: Check; was: bo
 }
 
 export function stop($: EngineInterface, site: string) {
+  halt(site)
+  redraw($, site)
+}
+
+// Every pause goes through here, so the sound stops with the picture.
+function halt(site: string, why = 'pause') {
   const one = player(site)
   one.timer?.cancel()
   one.timer = undefined
-  redraw($, site)
+  haltSound(site, why)
+}
+
+// Sound on or off for the whole session. Turning it on lets this player's
+// sound start even if it began by itself; the file is cut now, so Play
+// doesn't wait for it.
+function toggleSound($: EngineInterface, site: string, media: Shown) {
+  state.isSoundOn = !state.isSoundOn
+  if (state.isSoundOn) {
+    player(site).isQuiet = false
+    void prepareSound($, media.source, media.frames)
+    measureLatency($)
+  } else haltAllSound('muted')
+  redraw($)
 }
 
 export function play($: EngineInterface, site: string, media: Shown, shown?: Shown) {
@@ -528,8 +553,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
   // One video plays at a time: starting this one pauses the rest.
   for (const [other, p] of players) {
     if (other !== site && p.timer) {
-      p.timer.cancel()
-      p.timer = undefined
+      halt(other, 'other_player')
       versions.set(other, (versions.get(other) ?? 0) + 1)
     }
   }
@@ -558,9 +582,68 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
   let tickAt = Date.now()
   let shownFrame = one.frame
   const startFrame = one.frame
+  // With sound on, the sound is the clock (sound.ts): each tick shows the
+  // frame for the moment being heard. 'hold' keeps the picture still while
+  // the sound starts (~0.5 s) or while the frames ahead are cut; the sound
+  // is stopped meanwhile, so neither runs ahead. A start that keeps failing,
+  // or a hold that lasts, gives up the sound for this play: the clip plays
+  // on silently by real time, as without sound.
+  let soundStarts = 0
+  let waitSince = 0
+  let holdSince = 0
+  const wantsSound = () => state.isSoundOn && !one.isQuiet && !one.isSplit && soundUsable() && !!media.source
+  const giveUpSound = (why: string) => {
+    soundStarts = SOUND_RESTARTS
+    haltSound(site, why)
+    problem('sound_gave_up', { site, why })
+  }
+  const soundStep = (at: number): 'silent' | 'hold' | number => {
+    if (!wantsSound()) {
+      haltSound(site, 'muted')
+      return 'silent'
+    }
+    const heard = soundNow(site, at)
+    if (heard.kind === 'starting') return 'hold'
+    if (heard.kind === 'on') {
+      const target = Math.max(0, Math.min(frames.count - 1, Math.floor(heard.seconds * frames.fps)))
+      debug(`sound at=${heard.seconds.toFixed(3)} frame=${one.frame} target=${target}`)
+      if (isFrameCut(media, target)) return target
+      haltSound(site, 'frames_behind')
+      void frameReady($, media, target, site)
+      // Stopped too often for frames this play: the machine can't keep up,
+      // so the picture plays on silently rather than stuttering.
+      if (soundStarts >= SOUND_RESTARTS) {
+        problem('sound_gave_up', { site, why: 'frames_behind' })
+        return 'silent'
+      }
+      return 'hold'
+    }
+    if (soundStarts >= SOUND_RESTARTS) return 'silent'
+    const track = soundTrack(media.source, frames)
+    if (track?.status === 'none') return 'silent'
+    if (track?.status !== 'ready') {
+      void prepareSound($, media.source, frames)
+      // Only a play's first moment waits for the file, and not for long;
+      // later, the sound joins once it's ready.
+      waitSince ||= at
+      return one.frame === startFrame && at - waitSince < SOUND_WAIT_MS ? 'hold' : 'silent'
+    }
+    const from = one.frame / frames.fps
+    if (!soundLeft(track, from)) return 'silent'
+    // Two seconds of frames first, so the sound doesn't stop again at once.
+    const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps * 2))
+    if (!isFrameCut(media, ahead)) {
+      void frameReady($, media, ahead, site)
+      return 'hold'
+    }
+    soundStarts += 1
+    if (!startSound($, site, track.wav, from, () => one.tickedAt ?? 0)) giveUpSound('spawn')
+    return 'hold'
+  }
   debug(`play fps=${frames.fps} count=${frames.count} from=${one.frame}`)
   one.timer = $.clock.every(Math.round(1000 / frames.fps), () => {
     const at = Date.now()
+    one.tickedAt = at
     debug(`tick gap=${at - tickAt} frame=${one.frame} owed=${owed.toFixed(2)}`)
     // The frames the real time since the last tick is worth, one at least. A
     // tick asks for the next only once it has run, so ticks come a little late
@@ -571,18 +654,35 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (one.frame !== shownFrame) owed = 0
     if (one.frame === startFrame) owed = Math.min(owed, 1)
     if (one.frame >= frames.count - 1) return stop($, site)
-    if (owed < 1) return
-    const target = Math.min(frames.count - 1, one.frame + Math.floor(owed))
-    let coming = target
-    if (!shown?.pair || !one.isSplit) {
-      if (!isAsking && !isFrameCut(media, target)) {
-        isAsking = true
-        void frameReady($, media, target, site).finally(() => { isAsking = false })
-      } else if (!isAsking) void frameReady($, media, target, site)
-      // The furthest frame on the way that's already cut.
-      while (coming > one.frame && !isFrameCut(media, coming)) coming--
-      if (coming <= one.frame) return void debug(`wait frame=${target}`)
-      if (coming < one.frame + Math.floor(owed) - 1) debug(`skip to=${coming} clock=${target}`)
+    const heard = soundStep(at)
+    if (heard === 'hold') {
+      owed = 0
+      holdSince ||= at
+      if (at - holdSince > SOUND_HOLD_MAX_MS) giveUpSound('held_too_long')
+      return
+    }
+    holdSince = 0
+    let coming: number
+    if (heard !== 'silent') {
+      owed = 0
+      if (heard <= one.frame) return
+      coming = heard
+      // Keeps the cutting ahead going, as the silent path does.
+      void frameReady($, media, heard, site)
+    } else {
+      if (owed < 1) return
+      const target = Math.min(frames.count - 1, one.frame + Math.floor(owed))
+      coming = target
+      if (!shown?.pair || !one.isSplit) {
+        if (!isAsking && !isFrameCut(media, target)) {
+          isAsking = true
+          void frameReady($, media, target, site).finally(() => { isAsking = false })
+        } else if (!isAsking) void frameReady($, media, target, site)
+        // The furthest frame on the way that's already cut.
+        while (coming > one.frame && !isFrameCut(media, coming)) coming--
+        if (coming <= one.frame) return void debug(`wait frame=${target}`)
+        if (coming < one.frame + Math.floor(owed) - 1) debug(`skip to=${coming} clock=${target}`)
+      }
     }
     owed = Math.max(0, owed - (coming - one.frame))
     one.frame = coming
@@ -608,8 +708,7 @@ function seek($: EngineInterface, site: string, media: Shown, seconds: number, s
   const frames = media.frames
   if (!frames) return
   const one = player(site)
-  one.timer?.cancel()
-  one.timer = undefined
+  halt(site, 'seek')
   one.frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
   draw($, site, media, shown)
   redraw($, site)
@@ -620,8 +719,7 @@ function flip($: EngineInterface, site: string, shown: Shown, toCompare: boolean
   if (!shown.compare || !!one.isCompare === toCompare) return
   const from = sideOf(shown, site)
   const wasPlaying = !!one.timer
-  one.timer?.cancel()
-  one.timer = undefined
+  halt(site, 'flip')
   one.isCompare = toCompare
   const to = sideOf(shown, site)
   // Same moment on the other side, lined up on the steps both runs share.
@@ -646,8 +744,7 @@ function split($: EngineInterface, site: string, shown: Shown, isOn: boolean) {
   const one = player(site)
   if (!shown.compare || (isOn && !shown.pair) || !!one.isSplit === isOn) return
   const wasPlaying = !!one.timer
-  one.timer?.cancel()
-  one.timer = undefined
+  halt(site, 'split')
   if (one.isCompare && shown.compare.frames && shown.frames)
     one.frame = Math.max(0, Math.min(shown.frames.count - 1, Math.round(toUpdated(shown, one.frame / shown.compare.frames.fps) * shown.frames.fps)))
   one.isCompare = false
@@ -704,7 +801,7 @@ function Scrub(ui: Ui, $: EngineInterface, site: string, media: Shown, width: nu
 
   return (
     <Box flexDirection="row" flexWrap="nowrap" width={width}>
-      <Button key="play" variant="primary" label={word} onPress={() => { act(word.includes('Pause') ? 'pause' : 'play'); if (!word.includes('Pause')) tourHeard($, 'play'); toggle($, site, media, shown) }} />
+      <Button key="play" variant="primary" label={word} onPress={() => { act(word.includes('Pause') ? 'pause' : 'play'); if (!word.includes('Pause')) tourHeard($, 'play'); one.isQuiet = false; toggle($, site, media, shown) }} />
       <Text dimColor> {elapsed} </Text>
       {chunks.map((c, i) => (
         <Button
@@ -1354,13 +1451,13 @@ export async function Viewer(
   // A video the agent shows starts playing by itself, once.
   if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
     one.hasAutoplayed = true
+    one.isQuiet = true
     void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
   }
 
   // The single view with the QA sidebar is the default; side by side is a click away.
   if (!state.canImage) {
-    one.timer?.cancel()
-    one.timer = undefined
+    halt(site, 'cannot_draw')
     return Warning(ui, $, site, shown, columns - 8)
   }
   resized($, site, media, shown, own)
@@ -1376,8 +1473,7 @@ export async function Viewer(
   let file = plainAt(media, one.frame)
   if (await isGone($, file)) {
     if (!media.source || media.source === file || (await isGone($, media.source))) {
-      one.timer?.cancel()
-      one.timer = undefined
+      halt(site, 'expired')
       problem('expired', { site, frame: one.frame })
       return Expired(ui, $, shown, columns - 8)
     }
@@ -1394,6 +1490,12 @@ export async function Viewer(
   probe($, site, viewKey(site), pic)
   if (one.isSplit && shown.pair && frames) return SplitView(ui, $, site, shown, columns, viewport?.rows ?? 40, isPane, prLink)
 
+  // Unmute shows only on a clip with a sound stream, where sound can reach
+  // the person. The look runs after the draw: a newer render cancels what a
+  // render starts, and a cancelled look is asked again by the next one.
+  const track = soundUsable() && frames ? soundTrack(media.source, frames) : undefined
+  const hasSound = !!track && track.status !== 'none'
+  if (soundUsable() && frames && !track) void $.clock.sleep(SHARPEN_DELAY_MS).then(() => probeSound($, media.source, frames)).then(t => { if (t && t.status !== 'none') redraw($, site) }, () => undefined)
   const actions = Actions(ui, $, media, source, isNarrow)
   // The top corner opens it: the page it shows, else the file itself.
   // Only a web address opens as a page: a model's url could name an app, a
@@ -1427,6 +1529,7 @@ export async function Viewer(
         <Box flexDirection="row" columnGap={2}>
           {frames && <Button key="back" plain dimColor label="« 5s" onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - 5, shown)} />}
           {frames && <Button key="forward" plain dimColor label="5s »" onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + 5, shown)} />}
+          {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? 'Mute' : 'Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
         </Box>
         <Box flexDirection="row" columnGap={2}>
           {opener}

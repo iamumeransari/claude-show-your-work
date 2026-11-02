@@ -116,19 +116,12 @@ export function trimFrames($: EngineInterface) {
   return $.process.run(['sh', '-c', TRIM_SH, state.TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
 }
 
-// A recording often opens on a blank page while the browser loads: white,
-// off-white, grey or dark, maybe with a small spinner or logo. Any frame that
-// is nearly one flat tone counts as blank; the clip starts at the first real one.
-async function whiteLead($: EngineInterface, real: string, duration: number): Promise<number> {
-  const r = await $.process.run([state.ffmpeg, '-v', 'info', '-t', '8', '-i', real,
-    '-vf', 'fps=10,scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YLOW:key=lavfi.signalstats.YHIGH',
-    '-an', '-f', 'null', '-']).catch(() => null)
-  return r ? leadFrom(r.stderr, duration) : 0
-}
-
-// The blank opening in that log: the time of the first frame whose 10th to
-// 90th percentile brightness spreads wider than a flat page does, if that
-// leaves something after it.
+// A screen recording's blank opening (a page loading: one flat tone, maybe a
+// spinner), in the log of `ffmpeg -t 8 -i <clip> -vf fps=10,scale=160:-2,
+// signalstats,metadata=print -an -f null -`: the time of the first frame whose
+// 10th to 90th percentile brightness spreads wider than a flat page does, if
+// that leaves something after it. Print every key: metadata takes one key=,
+// and a second replaces the first. Not used while the skip is off.
 export function leadFrom(log: string, duration: number): number {
   let t = 0, low = -1
   for (const line of log.split('\n')) {
@@ -258,8 +251,9 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
     if (!state.hasVideoTools) throw new Error(noFfmpeg(state.isMac))
   }
-  const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'default=nw=1', real])
+  const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name:format=duration', '-of', 'default=nw=1', real])
   const field = (name: string) => Number(new RegExp(`^${name}=([0-9.]+)`, 'm').exec(facts.stdout)?.[1] ?? Number.NaN)
+  hwDecode.set(real, state.isMac && /^codec_name=(h264|hevc)$/m.test(facts.stdout))
   // Frames stay within PX_MAX in every Picture size (see sharpen).
   const cut = Math.min(PX_MAX, cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell))
   const own = field('width') > 0 && field('height') > 0 ? { sourceWidth: field('width'), sourceHeight: field('height') } : {}
@@ -284,7 +278,9 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   state.generation += 1
   const dir = folder ? `${state.TMP}/${folder}` : `${state.TMP}/v${state.generation}-${Math.floor(await $.clock.now())}`
   await $.process.run(['mkdir', '-p', dir])
-  const lead = await whiteLead($, real, probed)
+  // The blank-opening skip is off: every clip plays from its start (see
+  // leadFrom, and known-issues.md for how it would be turned on).
+  const lead = 0
   const known = Number.isFinite(probed) && probed > 0
   // A clip of known length is decoded as it plays, a chunk at a time (see
   // ensureChunk); one without (MediaRecorder webm) is cut whole, as before.
@@ -292,7 +288,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   const pngsIn = async () => (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).map(f => `${dir}/${f.name}`)
   const made = await cutFrames($, isFew => [
     // The palette waits for the end of its input: only the first chunk is read.
-    state.ffmpeg, '-v', 'error', ...(lead ? ['-ss', String(lead)] : []), ...(known ? ['-t', chunkSeconds(Math.min(CHUNK, total), fps)] : []), '-i', real,
+    state.ffmpeg, '-v', 'error', ...decodeFlags(real), ...(lead ? ['-ss', String(lead)] : []), ...(known ? ['-t', chunkSeconds(Math.min(CHUNK, total), fps)] : []), '-i', real,
     '-vf', `fps=${fps},${scaleFor(cut, isFew)}`,
     '-frames:v', String(known ? Math.min(CHUNK, total) : MAX_FRAMES), '-compression_level', '1', '-y', `${dir}/f%05d.png`,
   ], pngsIn)
@@ -366,6 +362,7 @@ const cutChunks = new Set<string>()
 const chunkKey = (f: Frames, i: number) => `${f.dir}#${Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)}`
 export const isFrameCut = (media: Shown, i: number) => !media.frames || cutChunks.has(chunkKey(media.frames, i))
 
+
 // A frame that should be on disk isn't (the temp folder was cleaned, or the
 // cache trimmed): forget its chunk was cut and cut it again from the source.
 // False when the source itself is gone too.
@@ -397,8 +394,23 @@ const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cu
 // so the rare chunk with one (a very wide window, grainy footage) is cut again
 // in 256 colours. Every other chunk keeps full colour; the check is a stat per
 // frame and no process.
+// H.264 and HEVC decode on the Mac's media engine: the same frames, and it
+// leaves the CPU to the PNGs, which matters when the machine is busy (a render
+// running: 0.37x real time against 0.28x for a 60 Mbit/s 1080p clip). Not
+// for other codecs: AV1 fails outright on Macs without its decoder instead of
+// falling back. A cut that fails with it is run again without it.
+const hwDecode = new Map<string, boolean>()
+const decodeFlags = (source: string) => (hwDecode.get(source) ? ['-hwaccel', 'videotoolbox'] : [])
+const withoutHw = (argv: string[]) => argv.filter((a, k) => a !== '-hwaccel' && argv[k - 1] !== '-hwaccel')
+
 async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], files: () => Promise<string[]>) {
-  const made = await $.process.run(cut(state.sendBytes))
+  let made = await $.process.run(cut(state.sendBytes))
+  if (made.exitCode !== 0 && cut(state.sendBytes).includes('-hwaccel')) {
+    debug(`hw decode failed, cut again without it: ${made.stderr.trim().slice(0, 80)}`)
+    const plain = cut
+    cut = isFew => withoutHw(plain(isFew))
+    made = await $.process.run(cut(state.sendBytes))
+  }
   if (made.exitCode !== 0 || state.sendBytes || readsAnyFile()) return made
   const sizes = await Promise.all((await files()).map(f => Promise.resolve().then(() => $.fs.stat(f)).then(st => st.size, () => 0)))
   if (!sizes.some(size => size > BYTES_MAX)) return made
@@ -420,7 +432,7 @@ function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, 
     await $.process.run(['mkdir', '-p', f.dir])
     const n = Math.min(CHUNK, f.count - first)
     const cutChunk = (isFew: boolean) => [
-      state.ffmpeg, '-v', 'error', '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-t', chunkSeconds(n, f.fps), '-i', source,
+      state.ffmpeg, '-v', 'error', ...decodeFlags(source), '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-t', chunkSeconds(n, f.fps), '-i', source,
       '-vf', `fps=${f.fps},${scaleFor(f.cut, isFew)}`, '-frames:v', String(n),
       '-start_number', String(first + 1), '-compression_level', '1', '-y', `${f.dir}/f%05d.png`,
     ]

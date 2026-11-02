@@ -11,6 +11,7 @@ import type { PaneProps } from './layout'
 import { debug, diagnosis, flushDebug } from './diagnostics'
 import { flush, track } from './telemetry'
 import { setUp } from './setup'
+import { haltAllSound } from './sound'
 import { forwardPictures, stopForwarding } from './tmux'
 import { CLEAN_SH, exists, expand, findPasted, identityOf, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
 import type { Notice } from './media'
@@ -193,6 +194,9 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    // The next session starts muted, and nothing sounds past this one.
+    state.isSoundOn = false
+    haltAllSound('session_end')
     await flush($).catch(() => undefined)
     await stopForwarding($)
 

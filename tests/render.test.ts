@@ -367,6 +367,26 @@ test('a skip during playback plays on from the new place', async ($, on) => {
   expect(played.every((f, i) => i === 0 || f > played[i - 1]!)).toBe(true)
 })
 
+test('View pauses a playing video', async ($, on) => {
+  const clock = mock.clock(on)
+  on('store.get', () => ({ value: undefined }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } }))
+  on('ui.blit', () => ({ value: {} }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }) as any)
+  const clip = { ...shown, frames: { ...shown.frames, count: 120, duration: 10 } }
+  const mounted = await $.ui.mount({
+    plugin: 'show-your-work', surface: 'terminal', component: 'ToolResult', requestId: 'view',
+    props: { tool_use_id: 'view', tool: 'mcp__show-your-work__show_video', output: `Shown.\nshow-your-work:${JSON.stringify(clip)}`, isErrored: false },
+    viewport: { columns: 140, rows: 50 },
+  } as any)
+  await mounted.press({ key: 'play' })
+  await clock.advance(500)
+  expect(JSON.stringify(await mounted.drawn()).includes('Pause')).toBe(true)
+  await mounted.press({ key: 'page' })
+  await clock.advance(100)
+  expect(JSON.stringify(await mounted.drawn()).includes('Pause')).toBe(false)
+})
+
 test('side by side plays its merged frames in order, made from both sides', async ($, on) => {
   const clock = mock.clock(on)
   on('store.get', () => ({ value: undefined }))

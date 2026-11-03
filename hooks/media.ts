@@ -482,6 +482,9 @@ function learn($: EngineInterface, dir: string) {
 }
 const clampFrame = (f: Frames, i: number) => Math.max(0, Math.min(i, f.count - 1))
 export const isFrameCut = (media: Shown, i: number) => !media.frames || disk(media.frames.dir).has(clampFrame(media.frames, i))
+// Every frame from `from` to `to` is on disk: frames left from an earlier
+// play can sit past a gap, so one frame ahead says nothing about those before it.
+export const isRunCut = (media: Shown, from: number, to: number) => !media.frames || firstMissing(media.frames, clampFrame(media.frames, from)) > clampFrame(media.frames, to)
 function firstMissing(f: Frames, i: number) {
   const s = disk(f.dir)
   let k = i
@@ -512,6 +515,9 @@ type Decoder = {
   reached: number
   isPlay: boolean
   startedAt: number
+  // When its first frame landed (0 before): ffmpeg's start alone takes
+  // seconds on a busy machine, so idling and chasing count from here.
+  goingAt: number
   wantedAt: number
   isOver: boolean
   // Stopped from outside (a newer decoder, another clip used).
@@ -523,14 +529,19 @@ type Decoder = {
   thenPlay?: () => void
 }
 const decoders = new Map<string, Decoder>()
+// The furthest frame a finished decoder made in a folder, until the next one
+// starts: those frames are still ahead of the playhead, so pruning them would
+// only make them decode again (seconds on a busy machine).
+const finishedAt = new Map<string, number>()
 
 // `buffered`: seconds already on disk ahead of the playhead, taken off the
 // head start (see START_SECONDS).
 function decode($: EngineInterface, s: Spec, source: string, from: number, isPlay: boolean, buffered = 0): Decoder {
   decoders.get(s.dir)?.stop()
+  finishedAt.delete(s.dir)
   const ahead = aheadOf(s.fps)
   const end = Math.min(s.count, from + (isPlay ? (canPace ? s.count : ahead * 2) : ahead))
-  const d: Decoder = { from, end, reached: from, isPlay, startedAt: Date.now(), wantedAt: Date.now(), isOver: false, isCancelled: false, error: '', stop: () => { d.isOver = d.isCancelled = true } }
+  const d: Decoder = { from, end, reached: from, isPlay, startedAt: Date.now(), goingAt: 0, wantedAt: Date.now(), isOver: false, isCancelled: false, error: '', stop: () => { d.isOver = d.isCancelled = true } }
   decoders.set(s.dir, d)
   debug(`decode from=${from} to=${end} play=${isPlay}`)
   const argv = (hw: boolean, isFew: boolean, pace: boolean, at: number) => [
@@ -549,7 +560,10 @@ function decode($: EngineInterface, s: Spec, source: string, from: number, isPla
   const see = async (made: number, isFew: boolean) => {
     const st = await $.fs.stat(fileOf(s, made - 1)).catch(() => null)
     if (!st) return 'wait'
-    if (d.reached === d.from) debug(`decode first=${d.from} ms=${Date.now() - d.startedAt}`)
+    if (!d.goingAt) {
+      debug(`decode first=${d.from} ms=${Date.now() - d.startedAt}`)
+      d.goingAt = d.wantedAt = Date.now()
+    }
     for (let k = d.reached; k < made; k++) disk(s.dir).add(k)
     d.reached = made
     wake(s.dir)
@@ -612,7 +626,7 @@ function decode($: EngineInterface, s: Spec, source: string, from: number, isPla
           continue
         }
         if (hw) {
-          debug(`hw decode failed, decode again without it: ${d.error.slice(0, 80)}`)
+          debug(`hw decode failed (code=${res?.code} signal=${res?.signal} at=${d.reached}), decode again without it: ${d.error.slice(0, 80)}`)
           hw = false
           continue
         }
@@ -620,7 +634,10 @@ function decode($: EngineInterface, s: Spec, source: string, from: number, isPla
       }
     } finally {
       d.isOver = true
-      if (decoders.get(s.dir) === d) decoders.delete(s.dir)
+      if (decoders.get(s.dir) === d) {
+        decoders.delete(s.dir)
+        if (!d.isCancelled) finishedAt.set(s.dir, d.reached)
+      }
       wake(s.dir)
       if (!d.isCancelled) d.thenPlay?.()
     }
@@ -633,9 +650,11 @@ function decode($: EngineInterface, s: Spec, source: string, from: number, isPla
 // it covers `i`.
 // `isChase`: the playhead's clock asking, ahead of a decoder that runs slow
 // (a busy machine); a decoder is then started afresh there only once it's
-// had CHASE_MS, so a slow one isn't restarted on every tick and never gets
+// had CHASE_MS since its first frame, so a slow one isn't restarted on every tick and never gets
 // going. A seek or a skip starts afresh at once.
 const CHASE_MS = 2000
+// A decoder with no frame yet is waited for this long before a chase restarts it.
+const START_LIMIT_MS = 10000
 function ensure($: EngineInterface, f: Frames, source: string | undefined, i: number, isPlay: boolean, isChase = false): Decoder | undefined {
   i = clampFrame(f, i)
   const ahead = aheadOf(f.fps)
@@ -646,7 +665,7 @@ function ensure($: EngineInterface, f: Frames, source: string | undefined, i: nu
     if (isPlay) d.wantedAt = Date.now()
     // It gets there soon enough: within a second of where it has got to.
     const isNear = start >= d.from && start <= d.end && start <= d.reached + f.fps
-    const isPatient = isChase && start >= d.from && Date.now() - d.startedAt < CHASE_MS
+    const isPatient = isChase && start >= d.from && (d.goingAt ? Date.now() - d.goingAt < CHASE_MS : Date.now() - d.startedAt < START_LIMIT_MS)
     if ((isNear || isPatient) && (d.isPlay || !isPlay)) return d
     if (isNear) {
       d.thenPlay = () => void ensure($, f, source, d.reached, true)
@@ -684,8 +703,11 @@ function until($: EngineInterface, dir: string, i: number, d: Decoder | undefine
 export async function recutFrame($: EngineInterface, media: Shown, i: number): Promise<boolean> {
   const f = media.frames
   if (!f || !media.source || (await isGone($, media.source))) return false
-  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
   i = clampFrame(f, i)
+  // There after all (a draw that looked while the frame was being written):
+  // stopping the decoder for it would only stall playback.
+  if (!(await isGone($, frameFile(f, i)))) return true
+  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
   disk(f.dir).delete(i)
   decoders.get(f.dir)?.stop()
   await until($, f.dir, i, ensure($, f, media.source, i, false))
@@ -702,7 +724,7 @@ function watch(dir: string, site: string, i: number, isPlaying: boolean) {
   at.set(site, { frame: i, isPlaying })
 }
 // The clip in use keeps BEHIND_SECONDS behind its playhead and whatever is
-// decoded ahead of it (`decoded`, its decoder's furthest frame); others keep
+// decoded ahead of it (`decoded`: the end of its decoder's range, or where a finished one got to); others keep
 // only the frame they show, and every clip its poster.
 export function isKept(i: number, watchers: readonly { frame: number; isPlaying: boolean }[], fps: number, decoded = 0) {
   return i === 0 || watchers.some(v => (v.isPlaying ? i >= v.frame - behindOf(fps) && i <= Math.max(v.frame + aheadOf(fps), decoded) : i === v.frame))
@@ -719,7 +741,9 @@ function prune($: EngineInterface, dir: string, fps: number) {
     // Not drawn by any player yet (a clip being prepared): keep what's made.
     if (!watchers.length) return
     const d = decoders.get(dir)
-    const decoded = d && !d.isOver ? d.reached : 0
+    // A running decoder's whole range: its progress lags the files it has
+    // written, and deleting those left holes that restarted it.
+    const decoded = d && !d.isOver ? d.end : (finishedAt.get(dir) ?? 0)
     const files = await $.fs.list(dir).catch(() => [])
     const gone: string[] = []
     for (const { name } of files) {

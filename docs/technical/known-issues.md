@@ -21,6 +21,15 @@ What's broken or unproven, and what was fixed and why, so nobody has to find the
 - **Other terminals and systems are unproven.** Whether Warp, WezTerm, kitty and Konsole report their tty size in pixels (as Ghostty does) is assumed, not measured; the plugin only scales a cell under 10 px wide. Linux and Windows haven't been run with Large or resizing.
 - **Reported: the terminal feels sticky with pictures on screen, and scrolling up sometimes jumps back.** Seen in the user's Ghostty while temporary debug logging (a `sips` call and a log write on every redraw) was in the local copy; removed. Measured headless afterwards with five pictures and a playing video: each scroll step answered in 1–26 ms, no jump back while scrolled up or during playback. If it's still seen on screen, the cause is Ghostty decoding pictures sent again on scroll back (`mayBeDropped`), or a box growing when a sharper copy arrives (the content height changes under the scroll position).
 
+## Fixed in 0.8.3
+
+- Stutter on a busy machine. Each of these restarted the decoder, and a restart's first frame takes 1–7 s under load:
+  - Pruning deleted frames the decoder had written but not yet reported (its progress lags the files). The running decoder's whole range is now kept, and so is a finished one's.
+  - A decoder stopped itself as idle the moment its slow first frame landed, and a chase restarted one that hadn't produced a frame yet. Both now count from the first frame (`goingAt`).
+  - A draw that saw the frame on screen as missing stopped the decoder to cut it again. `recutFrame` checks the file again first.
+- The sound restarted into a gap: frames left from an earlier play sit past it, so "a second ahead is on disk" now means every frame up to there (`isRunCut`).
+- View pauses a playing video.
+
 ## Fixed after 0.7.0 (not yet released)
 
 | Bug | Since | Cause | Fix |

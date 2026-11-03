@@ -8,7 +8,7 @@ import { settings, state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
 import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
-import { compareFrame, frameFile, frameReady, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
+import { compareFrame, frameFile, frameReady, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, isRunCut, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
@@ -631,7 +631,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (!soundLeft(track, from)) return 'silent'
     // A second of frames ahead first, so the sound doesn't stop again at once.
     const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
-    if (!isFrameCut(media, ahead)) {
+    if (!isRunCut(media, one.frame, ahead)) {
       void frameReady($, media, one.frame, site, true, true)
       return 'hold'
     }
@@ -1506,11 +1506,13 @@ export async function Viewer(
       key="page"
       plain
       label={page ? '↗ Open page' : '↗ View'}
-      onPress={() =>
+      onPress={() => {
+        // Watched elsewhere now: the video here pauses.
+        if (one.timer) stop($, site)
         act(page ? 'open_page' : 'open_file') || void $.process.run(openArgv(page ?? source)).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
         )
-      }
+      }}
     />
   )
 

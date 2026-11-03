@@ -69,7 +69,7 @@ Beyond product QA, Claude can show you a video of almost anything it works on. B
 
 Making an ad, an animation or a launch video? Each cut plays right in the chat, in a full-featured video player:
 
-- **Video Controls:** Play, pause, scrub through the timeline, and skip forward or back to the moment you want. A video with sound plays with its sound, including when Claude shows it and it starts by itself; Mute turns sound off for the session.
+- **Video Controls:** Play, pause, scrub through the timeline, and skip forward or back to the moment you want. A video with sound plays with its sound; Mute turns sound off for the session.
 - **Timestamps:** The sidebar walks you through what happens in the video, step by step. Each step is timestamped, so one click takes you right to that moment.
 - **Compare Versions:** When Claude makes a new version of a video, it opens in the same player. You can flip between drafts in History or play the old and new versions side by side, in sync.
 - **Quick Functions:** Open the video in QuickTime Player for a bigger view, or save it straight to your Downloads folder in one click.

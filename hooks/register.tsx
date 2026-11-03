@@ -17,7 +17,7 @@ import { CLEAN_SH, exists, expand, findPasted, identityOf, keyOf, locate, NO_FFM
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
 import { hadVersionBefore06, PLUGIN } from './updater'
-import { atStep, cantDraw, causeOf, draw, freshCalls, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
+import { atStep, cantDraw, causeOf, draw, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
 import type { Ui } from './player'
 import { ensureSettings, goToStop, loadSettings, Opening, openSettings, openUpdate, openWelcome, Settings, startBackground, startTour, Tour, TOUR_TEXT, UPDATE, UpdatePane, WELCOME_TEXT } from './onboarding'
 
@@ -247,7 +247,6 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: /^mcp__show-your-work__show_(image|video)$/ }, async ($, e) => {
-    freshCalls.add(e.tool_use_id)
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -369,11 +368,10 @@ export const register: Register = on => {
       if (!n) return next(e)
       return NoticeBox($.ui.resolve(e) as Ui, $, (e.viewport?.columns ?? 100) - 8, { ...n, copy: n.prompt, label: 'Copy prompt', action: `copy_${n.kind}_prompt` })
     }
-    // Scrolled out of view: stop playing, and don't start there.
+    // Scrolled out of view: stop playing.
     const one = player(e.requestId)
     if (props.onScreen === null) {
       if (one.timer) stop($, e.requestId)
-      one.hasAutoplayed = true
       if (!one.wasAway) debug(`away ${e.requestId}`)
       one.wasAway = true
     } else if (one.wasAway && props.onScreen) {

@@ -34,7 +34,7 @@ Over ssh frames are cut with a 256-colour palette (`PALETTE`), no dithering. Mea
 
 ## Playback
 
-- A video Claude shows plays once by itself (`freshCalls`), not ones a reload redraws.
+- No video plays by itself, in the tour or when Claude shows one: each waits for Play.
 - Scrolling a player out of view stops it; scrolling back sends the frame on screen again.
 - Clicking a change pauses the video at that moment.
 - Compare plays the original and updated recordings side by side, in sync: times are mapped through the checks both sides share (`anchors`, `mapTime`).

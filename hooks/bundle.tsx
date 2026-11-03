@@ -1742,8 +1742,8 @@ export async function stopForwarding($: EngineInterface) {
 }
 
 // ── sound.ts ──────────────────────────────────────────────────────────────
-// A video's sound, beside its frames. Off until the person turns it on, and
-// never from a video that started by itself.
+// A video's sound, beside its frames. On by default, with Mute for the session,
+// only once the person presses Play.
 //
 // The sound is the clock: ffplay reports where it is about every 35 ms, and
 // the player shows the frame for that moment (play in player.tsx), so picture
@@ -2016,10 +2016,6 @@ type Player = {
   resend?: boolean
   // state.drawnBytes when this player's picture was last sent
   drawnAt?: number
-  hasAutoplayed?: boolean
-  // Started by itself, not by the person: plays without sound until they
-  // press Play or Unmute.
-  isQuiet?: boolean
   // When the play timer last ran: the sound ends once it has been quiet a second.
   tickedAt?: number
   // how many bar cells the scrub row last drew, so playback redraws only on a change
@@ -2036,8 +2032,6 @@ type Player = {
   resizeTicket?: number
 }
 export const players = new Map<string, Player>()
-// Calls made since this load: only these autoplay, not every window a reload redraws.
-export const freshCalls = new Set<string>()
 // Each window's own repaint count, beside state.version for all of them.
 export const versions = new Map<string, number>()
 
@@ -2522,13 +2516,11 @@ function halt(site: string, why = 'pause') {
   haltSound(site, why)
 }
 
-// Sound on or off for the whole session. Turning it on lets this player's
-// sound start even if it began by itself; the file is cut now, so Play
+// Sound on or off for the whole session. Turning it on cuts the file now, so Play
 // doesn't wait for it.
 function toggleSound($: EngineInterface, site: string, media: Shown) {
   state.isSoundOn = !state.isSoundOn
   if (state.isSoundOn) {
-    player(site).isQuiet = false
     void prepareSound($, media.source, media.frames)
     measureLatency($)
   } else haltAllSound('muted')
@@ -2580,7 +2572,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
   let soundStarts = 0
   let waitSince = 0
   let holdSince = 0
-  const wantsSound = () => state.isSoundOn && !one.isQuiet && !one.isSplit && soundUsable() && !!media.source
+  const wantsSound = () => state.isSoundOn && !one.isSplit && soundUsable() && !!media.source
   const giveUpSound = (why: string) => {
     soundStarts = SOUND_RESTARTS
     haltSound(site, why)
@@ -2798,7 +2790,7 @@ function Scrub(ui: Ui, $: EngineInterface, site: string, media: Shown, width: nu
 
   return (
     <Box flexDirection="row" flexWrap="nowrap" width={width}>
-      <Button key="play" variant="primary" label={word} onPress={() => { act(word.includes('Pause') ? 'pause' : 'play'); if (!word.includes('Pause')) tourHeard($, 'play'); one.isQuiet = false; toggle($, site, media, shown) }} />
+      <Button key="play" variant="primary" label={word} onPress={() => { act(word.includes('Pause') ? 'pause' : 'play'); if (!word.includes('Pause')) tourHeard($, 'play'); toggle($, site, media, shown) }} />
       <Text dimColor> {elapsed} </Text>
       {chunks.map((c, i) => (
         <Button
@@ -3445,13 +3437,6 @@ export async function Viewer(
   const run = (argv: string[], note: string) => () => {
     void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
-  // A video the agent shows starts playing by itself, once, with sound
-  // unless it's muted.
-  if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
-    one.hasAutoplayed = true
-    void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
-  }
-
   // The single view with the QA sidebar is the default; side by side is a click away.
   if (!state.canImage) {
     halt(site, 'cannot_draw')
@@ -4170,7 +4155,6 @@ async function finishWelcome($: EngineInterface) {
 // as a picture with no controls, then held on its last frame. A still
 // without ffmpeg.
 let splash: Shown | null = null
-let hasPlayedSplash = false
 async function prepareSplash($: EngineInterface) {
   const opened = await prepare($, `${$.plugin.root}/assets/splash.mp4`, 'show-your-work')
     .catch(() => prepare($, `${$.plugin.root}/assets/splash.jpg`, 'show-your-work'))
@@ -4250,11 +4234,6 @@ export async function Opening($: EngineInterface, e: Parameters<EngineInterface[
   let view = null
   // Where pictures can't draw, the heading alone: a warning has no place here.
   if (splash && state.canImage) {
-    // Plays by itself once, as a video Claude shows does.
-    if (!hasPlayedSplash) {
-      hasPlayedSplash = true
-      freshCalls.add(site)
-    }
     view = await Viewer($, e, atStep(splash, site), site, false, viewport)
   }
   return (
@@ -4382,16 +4361,13 @@ function loadDemo($: EngineInterface) {
   void prepareTour($).catch(() => undefined)
 }
 
-// Each stop starts its player fresh; a video starts playing by itself.
+// Each stop starts its player fresh; its video waits for Play.
 export function goToStop($: EngineInterface, to: number) {
   stop($, state.tourSite)
   players.delete(state.tourSite)
-  // A stop's video starts by itself, so without sound until Play or Unmute.
-  player(state.tourSite).isQuiet = true
   state.tourStop = Math.max(0, Math.min(STOPS.length - 1, to))
   state.isStopDone = false
   const media = mediaOf(STOPS[state.tourStop]!)
-  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play') void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
   void update($, welcome, n => n + 1)
 }
 
@@ -4764,7 +4740,6 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: /^mcp__show-your-work__show_(image|video)$/ }, async ($, e) => {
-    freshCalls.add(e.tool_use_id)
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -4886,11 +4861,10 @@ export const register: Register = on => {
       if (!n) return next(e)
       return NoticeBox($.ui.resolve(e) as Ui, $, (e.viewport?.columns ?? 100) - 8, { ...n, copy: n.prompt, label: 'Copy prompt', action: `copy_${n.kind}_prompt` })
     }
-    // Scrolled out of view: stop playing, and don't start there.
+    // Scrolled out of view: stop playing.
     const one = player(e.requestId)
     if (props.onScreen === null) {
       if (one.timer) stop($, e.requestId)
-      one.hasAutoplayed = true
       if (!one.wasAway) debug(`away ${e.requestId}`)
       one.wasAway = true
     } else if (one.wasAway && props.onScreen) {

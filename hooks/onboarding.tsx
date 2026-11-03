@@ -13,7 +13,7 @@ import { BRANCHES, checkForUpdate, findUpdate, installUpdate, PLUGIN } from './u
 import type { Found } from './updater'
 import { STOPS } from './tour'
 import type { Stop } from './tour'
-import { atStep, freshCalls, play, player, players, redraw, stop, Viewer } from './player'
+import { atStep, play, player, players, redraw, stop, Viewer } from './player'
 import type { Ui } from './player'
 
 // ── Settings and welcome ─────────────────────────────────────────────────
@@ -204,7 +204,6 @@ async function finishWelcome($: EngineInterface) {
 // as a picture with no controls, then held on its last frame. A still
 // without ffmpeg.
 let splash: Shown | null = null
-let hasPlayedSplash = false
 async function prepareSplash($: EngineInterface) {
   const opened = await prepare($, `${$.plugin.root}/assets/splash.mp4`, 'show-your-work')
     .catch(() => prepare($, `${$.plugin.root}/assets/splash.jpg`, 'show-your-work'))
@@ -284,11 +283,6 @@ export async function Opening($: EngineInterface, e: Parameters<EngineInterface[
   let view = null
   // Where pictures can't draw, the heading alone: a warning has no place here.
   if (splash && state.canImage) {
-    // Plays by itself once, as a video Claude shows does.
-    if (!hasPlayedSplash) {
-      hasPlayedSplash = true
-      freshCalls.add(site)
-    }
     view = await Viewer($, e, atStep(splash, site), site, false, viewport)
   }
   return (
@@ -416,16 +410,13 @@ function loadDemo($: EngineInterface) {
   void prepareTour($).catch(() => undefined)
 }
 
-// Each stop starts its player fresh; a video starts playing by itself.
+// Each stop starts its player fresh; its video waits for Play.
 export function goToStop($: EngineInterface, to: number) {
   stop($, state.tourSite)
   players.delete(state.tourSite)
-  // A stop's video starts by itself, so without sound until Play or Unmute.
-  player(state.tourSite).isQuiet = true
   state.tourStop = Math.max(0, Math.min(STOPS.length - 1, to))
   state.isStopDone = false
   const media = mediaOf(STOPS[state.tourStop]!)
-  if (media?.frames && STOPS[state.tourStop]!.goal !== 'play') void $.clock.sleep(400).then(() => { if (mediaOf(STOPS[state.tourStop]!) === media) play($, state.tourSite, media, media) }, () => undefined)
   void update($, welcome, n => n + 1)
 }
 

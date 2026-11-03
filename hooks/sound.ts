@@ -1,5 +1,5 @@
-// A video's sound, beside its frames. Off until the person turns it on, and
-// never from a video that started by itself.
+// A video's sound, beside its frames. On by default, with Mute for the session,
+// only once the person presses Play.
 //
 // The sound is the clock: ffplay reports where it is about every 35 ms, and
 // the player shows the frame for that moment (play in player.tsx), so picture

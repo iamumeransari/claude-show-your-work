@@ -1,4 +1,5 @@
-export type Frames = { dir: string; count: number; fps: number; duration: number; lead?: number; cut?: number }
+// `raw`: the frames are raw RGB files of that many pixels (see usesRaw), not PNGs.
+export type Frames = { dir: string; count: number; fps: number; duration: number; lead?: number; cut?: number; raw?: { width: number; height: number } }
 
 // One QA check: its name, whether it passed, and when it happens in a clip.
 export type Check = { name: string; ok: boolean; at?: number; url?: string }

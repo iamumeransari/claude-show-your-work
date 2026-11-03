@@ -3,7 +3,8 @@
 Code involved: it makes clips that flash white and beep at the same moments
 (a picture or sound stream starting late, 25 and 29.97 fps, a blank opening,
 two minutes long), runs them through the same ffmpeg commands the plugin uses
-(media.ts: the first chunk and later chunks; sound.ts: the sound file), and reports how far each flash's frame is from its beep, in ms.
+(media.ts: the decoders, from the start and from a later frame; sound.ts:
+the sound file), and reports how far each flash's frame is from its beep, in ms.
 
     python3 tools/sound-align.py            every case
     python3 tools/sound-align.py 29.97fps   one case
@@ -15,7 +16,7 @@ to those commands here. Needs ffmpeg and ffprobe on PATH.
 import json, math, os, re, struct, subprocess, sys, tempfile, wave
 D = os.path.join(tempfile.gettempdir(), 'syw-sound-align')
 FF, FP = 'ffmpeg', 'ffprobe'
-MAX_STREAMED, MAX_FPS, CHUNK, RATE = 3600, 12, 24, 22050
+MAX_STREAMED, MAX_FPS, FIRST, RATE = 3600, 12, 24, 22050
 run = lambda a: subprocess.run(a, capture_output=True, text=True)
 
 def make(name, dur, events, vfps=30, ar=48000, aoff=0.0, voff=0.0, white_head=0.0):
@@ -50,23 +51,25 @@ def lead_from(log, duration):
             low = -1
     return 0
 
-def chunk_seconds(n, fps): return str(round((n + 1) / fps, 3))
 def num(x): return str(x) if x != int(x) else str(int(x))
 
 # As media.ts: H.264 and HEVC decode on the media engine on macOS.
 HW = ['-hwaccel', 'videotoolbox'] if sys.platform == 'darwin' else []
 
 def frames_of(src, fps, lead, total):
-    """Brightness of every frame, cut chunk by chunk exactly like the plugin."""
+    """Brightness of every frame, decoded exactly like the plugin: the first
+    two seconds from the start (a clip shown), then one decoder from there
+    with -ss to the end (the play)."""
     out = []
-    for c in range(math.ceil(total / CHUNK)):
-        first = c * CHUNK; n = min(CHUNK, total - first)
-        ss = (['-ss', num(lead)] if lead else []) if c == 0 else ['-ss', num(round(lead + first / fps, 3))]
-        r = subprocess.run([FF, '-v', 'error', *HW, *ss, '-t', chunk_seconds(n, fps), '-i', src,
+    first = min(FIRST, total)
+    for at, n in ((0, first), (first, total - first)):
+        if n <= 0: continue
+        ss = ['-ss', num(round(lead + at / fps, 3))] if lead or at else []
+        r = subprocess.run([FF, '-v', 'error', *HW, *ss, '-i', src,
                             '-vf', f'fps={fps},scale=160:-2,scale=32:18,format=gray', '-frames:v', str(n), '-f', 'rawvideo', '-'], capture_output=True)
         b = r.stdout
         got = [sum(b[i*576:(i+1)*576]) / 576 for i in range(len(b) // 576)]
-        assert len(got) == n, (c, len(got), n)
+        assert len(got) == n, (at, len(got), n)
         out += got
     return out
 

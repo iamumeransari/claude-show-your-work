@@ -10,7 +10,7 @@ How a picture or video gets from Claude's tool call to the terminal, and which m
 | `state.ts` | What more than one module reads or changes: the session's facts, playback and tour progress, the settings |
 | `setup.ts` | Found once per session: temp folder, home, ffmpeg and ffprobe, ssh, the terminal |
 | `history.ts` | Every shown file kept in `.show-your-work/`, linked to the version before, and the marker a tool result carries |
-| `media.ts` | Getting files ready to draw: PNG conversion, video frames cut a chunk at a time, the side-by-side clip of two runs |
+| `media.ts` | Getting files ready to draw: PNG conversion, video frames decoded as a clip plays, the side-by-side clip of two runs |
 | `layout.ts` | Sizing: from the room a player has to its box in cells and the pixels its picture needs |
 | `player.tsx` | Playback (timer, frame swaps, seek, compare) and the components that draw the player |
 | `sound.ts` | A video's sound: the stream check, the cut sound file, ffplay and its clock |
@@ -26,12 +26,12 @@ How a picture or video gets from Claude's tool call to the terminal, and which m
 
 1. **Claude calls `show_image` or `show_video`** with a path, and optionally a title, changes, checks, a `compare` file and a `previous` version.
 2. **`tool.call` hook** (`register.tsx`): finds the file (`locate`), refuses anything that isn't a picture or video, and copies it into the version history (`storeVersion`, `history.ts`), linked to the version before it.
-3. **Preparing** (`prepare`, `media.ts`): a picture becomes a PNG at the width the player needs. A video gets a poster frame and its first 2 s chunk of frames; the rest are cut as it plays. A compare file is prepared the same way, and two videos get their matching moments lined up (`anchors`).
+3. **Preparing** (`prepare`, `media.ts`): a picture becomes a PNG at the width the player needs. A video shows as soon as its first frame is decoded; the first 2 s follow, and the rest are decoded as it plays. A compare file is prepared the same way, and two videos get their matching moments lined up (`anchors`).
 4. **The result** goes back to Claude as a line of text plus a marker holding the prepared item. Claude never receives the picture, so showing it costs no tokens.
 5. **`ui.render` for the `ToolResult`** (`register.tsx`): reads the marker (`shownOf`) and draws the `Viewer` (`player.tsx`). An unchanged player hands back its last drawing, and a picture scrolled back into view is only re-sent if the terminal may have dropped it.
 6. **Sizing** (`layout.ts`): the terminal's cell size in pixels comes from the tty. The player picks a box in cells for the picture's shape, and a sharper copy is made in the background if the box needs more pixels.
 7. **Drawing**: the `Image` element points the terminal at the PNG by path, and the terminal draws it through the kitty graphics protocol's Unicode placeholders (Ghostty and kitty only). Over ssh the bytes are sent instead.
-8. **Playback** (`player.tsx`): a timer advances one frame at a time at up to 12 fps. Each frame is swapped in with `$.ui.blit`, one swap in flight per picture with the newest frame winning. Chunks 5 s ahead are cut in advance and 5 s behind are kept; the rest are pruned.
+8. **Playback** (`player.tsx`): a timer advances one frame at a time at up to 12 fps, raw RGB frames where the terminal reads files (PNG over ssh and in Orca). Each frame is swapped in with `$.ui.blit`, one swap in flight per picture with the newest frame winning. Chunks 5 s ahead are cut in advance and 5 s behind are kept; the rest are pruned.
 
 ## Core structures
 
@@ -47,7 +47,7 @@ What the modules pass around, and where each lives. Knowing these is most of kno
 | `players` | `player.tsx` | One `Player` per site (a tool result, an `/img` row, the tour): the frame on screen, its timer, which tab and view, whether it's scrolled away, the box last drawn and its never-repeating `boxGeneration`. |
 | `copies`, `making`, `chosen` | `player.tsx` | Every copy of a source by width (made at `COPY_WIDTHS` and kept), the widths being made now, and the copy each player last chose, which frame swaps follow (`syncCopy`). |
 | `swaps` | `player.tsx` | Per picture, the one `$.ui.blit` in flight and the newest frame waiting, so frames never queue or land out of order. |
-| `cutChunks` | `media.ts` | Which 2 s chunks of which clip are cut, so playing, seeking and cutting ahead never cut one twice. `recutFrame` forgets one whose files were cleaned away. |
+| `onDisk`, `decoders` | `media.ts` | Which frames of which folder are on disk, and the one ffmpeg decoding each folder. `recutFrame` forgets a frame whose file was cleaned away. |
 
 Module state (these maps, `state`) resets on `/reload-plugins`; anything saved lives in `$.store` (settings, install id, update check time, history folders).
 
@@ -55,6 +55,6 @@ Module state (these maps, `state`) resets on `/reload-plugins`; anything saved l
 
 - A picture is the wrong size, blurry, cropped or stale after a resize: `known-issues.md` first, then `showing-images.md` ("A resize, end to end"), then `layout.ts` and `fitCopy` in `player.tsx`.
 - A setting doesn't stick or resets after a reload: `ensureSettings` (`onboarding.tsx`), then `updates-and-onboarding.md`.
-- A video stutters or stalls: `player.tsx` (`play`, `blit`), `media.ts` (`ensureChunk`), then `playing-video.md` and its timing log.
+- A video stutters or stalls: `player.tsx` (`play`, `blit`), `media.ts` (`ensure`, `decode`), then `playing-video.md` and its timing log.
 - A version is missing from History: `history.ts`, then `cache-and-version-history.md`.
 - The plugin doesn't load at all: `plugin-loader-and-hooks.md`, and run `claude plugin test .`.

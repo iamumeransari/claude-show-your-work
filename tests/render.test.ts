@@ -337,6 +337,87 @@ test('a playing video swaps its frames in order, one at a time, at its frame rat
   expect(played.every((f, i) => i === 0 || f > played[i - 1]!)).toBe(true)
 })
 
+test('a skip during playback plays on from the new place', async ($, on) => {
+  const clock = mock.clock(on)
+  on('store.get', () => ({ value: undefined }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } }))
+  const swapped: number[] = []
+  on('ui.blit', (_$, e) => {
+    const m = /f(\d+)\.png$/.exec(String((e as any).source?.file ?? ''))
+    if (m) swapped.push(Number(m[1]))
+    return { value: {} }
+  })
+  const clip = { ...shown, frames: { ...shown.frames, count: 120, duration: 10 } }
+  const output = `Shown.\nshow-your-work:${JSON.stringify(clip)}`
+  const target = {
+    plugin: 'show-your-work', surface: 'terminal', component: 'ToolResult', requestId: 'skip',
+    props: { tool_use_id: 'skip', tool: 'mcp__show-your-work__show_video', output, isErrored: false },
+    viewport: { columns: 140, rows: 50 },
+  } as any
+  const mounted = await $.ui.mount(target)
+  await mounted.press({ key: 'play' })
+  await clock.advance(500)
+  await mounted.press({ key: 'forward' })
+  swapped.length = 0
+  await clock.advance(1000)
+  // From about frame 43 (0.5 s + 3 s in), still moving a second later.
+  const played = swapped.filter((f, i) => i === 0 || f !== swapped[i - 1])
+  expect(played.length).toBeGreaterThanOrEqual(8)
+  expect(played[0]!).toBeGreaterThanOrEqual(40)
+  expect(played.every((f, i) => i === 0 || f > played[i - 1]!)).toBe(true)
+})
+
+test('side by side plays its merged frames in order, made from both sides', async ($, on) => {
+  const clock = mock.clock(on)
+  on('store.get', () => ({ value: undefined }))
+  // Every side frame is already cut; merged frames are made by ffmpeg.
+  const merged = new Set<number>()
+  const copies = new Map<string, string>()
+  on('fs.stat', (_$, e) => {
+    const m = /\/tmp\/p\/f(\d+)\.png$/.exec(String((e as any).path))
+    if (m && !merged.has(Number(m[1]))) return { deny: 'ENOENT: no such file' } as any
+    return { value: { kind: 'file', size: 1, mtimeMs: 0, isLink: false } } as any
+  })
+  on('process.run', (_$, e) => {
+    const argv: string[] = (e as any).argv
+    // Outside Ghostty a frame is drawn from a temp-folder copy: which frame it is.
+    if (argv[0] === 'sh' && String(argv[2]).includes('cp -c')) copies.set(String(argv[4]), String(argv[3]))
+    const out = argv.at(-1) ?? ''
+    if (out.startsWith('/tmp/p/f')) {
+      const first = Number(argv[argv.indexOf('-start_number') + 1])
+      const n = Number(argv[argv.indexOf('-frames:v') + 1])
+      for (let k = first; k < first + n; k++) merged.add(k)
+    }
+    return { value: { exitCode: 0, stdout: '', stderr: '' } } as any
+  })
+  const swapped: number[] = []
+  on('ui.blit', (_$, e) => {
+    const file = String((e as any).source?.file ?? '')
+    const m = /\/tmp\/p\/f(\d+)\.png$/.exec(copies.get(file) ?? file)
+    if (m) swapped.push(Number(m[1]))
+    return { value: {} }
+  })
+  const before = { ...shown, path: '/tmp/o/f00001.png', source: '/tmp/o.webm', frames: { dir: '/tmp/o', count: 30, fps: 12, duration: 2.5 } }
+  const clip = {
+    ...shown, frames: { ...shown.frames, count: 30, duration: 2.5 }, compare: before,
+    pair: { dir: '/tmp/p', count: 30, fps: 12, duration: 2.5 }, pairWidth: 1960, pairHeight: 540, sync: [[0, 0]],
+  }
+  const output = `Shown.\nshow-your-work:${JSON.stringify(clip)}`
+  const target = {
+    plugin: 'show-your-work', surface: 'terminal', component: 'ToolResult', requestId: 'pair',
+    props: { tool_use_id: 'pair', tool: 'mcp__show-your-work__show_video', output, isErrored: false },
+    viewport: { columns: 140, rows: 50 },
+  } as any
+  const mounted = await $.ui.mount(target)
+  await mounted.press({ key: 'side-both' })
+  await clock.advance(300)
+  await mounted.press({ key: 'play' })
+  await clock.advance(1500)
+  const played = swapped.filter((f, i) => i === 0 || f !== swapped[i - 1])
+  expect(played.length).toBeGreaterThanOrEqual(10)
+  expect(played.every((f, i) => i === 0 || f > played[i - 1]!)).toBe(true)
+})
+
 test('on a slow terminal, playback drops frames instead of queueing or reordering them', async ($, on) => {
   const clock = mock.clock(on)
   on('store.get', () => ({ value: undefined }))

@@ -194,8 +194,8 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    // The next session starts muted, and nothing sounds past this one.
-    state.isSoundOn = false
+    // The next session starts with sound on, and nothing sounds past this one.
+    state.isSoundOn = true
     haltAllSound('session_end')
     await flush($).catch(() => undefined)
     await stopForwarding($)

@@ -53,7 +53,7 @@ To show a refactor or a new setting changes nothing in the default path, run the
 - `frame`: each frame swapped in, its width and the box it went into.
 - `resize`, `resend`: a box change and its never-repeating generation; the frame sent again after it.
 - `measure`: a cell measurement, or one cancelled (the last size kept).
-- `log`: the playback timings (`tick`, `wait`, `cut chunk`, `drop`).
+- `log`: the playback timings (`tick`, `wait`, `skip`, `drop`) and the decoders (`decode from=… to=… play=…`, `decode first=… ms=…` for its first frame, `decode idle`).
 - `problem`: something that shouldn't happen. Problems are also kept in memory without the debug log, a few hundred at most, for `/show-your-work diagnose`. Current checks: `frame_wider_than_box` and `picture_wider_than_box` (Large: the terminal would crop it), `resend_cancelled`, `no_cell_size`.
 
 Add an event or a problem check wherever a bug was found by guessing, so the next one is found by reading. Never start a process or read a file to log something: the log is written from memory once a second. (A `sips` call per draw, added once for debugging, made the terminal laggy.)

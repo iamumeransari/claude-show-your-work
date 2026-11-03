@@ -8,7 +8,7 @@ import { settings, state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
 import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
-import { compareFrame, frameFile, frameReady, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
+import { compareFrame, frameFile, frameReady, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
@@ -242,7 +242,7 @@ const viewKey = (site: string) => (player(site).isCompare ? 'view-original' : 'v
 const plainAt = (media: Shown, frame: number) =>
   media.frames ? frameFile(media.frames, Math.min(frame, media.frames.count - 1)) : media.path
 
-type Source = { png: string } | { file: string; format: 'png'; generation?: number }
+type Source = { png: string } | { file: string; format: 'png'; generation?: number } | { file: string; format: 'rgb'; width: number; height: number }
 
 // Claude Code takes at most 2 MiB of picture as bytes: a bigger one is sent as
 // a smaller copy, made once with whatever the machine has (sips, ffmpeg or
@@ -339,6 +339,9 @@ async function readableCopy($: EngineInterface, file: string, size: number, id: 
   return r?.exitCode === 0 ? copy : file
 }
 export async function pngSource($: EngineInterface, file: string): Promise<Source> {
+  // A raw video frame: the terminal reads its pixels as they are.
+  const raw = rawSizeOf(file)
+  if (raw) return { file, format: 'rgb' as const, ...raw }
   if (state.sendBytes) {
     const png = await bytesOf($, file)
     if (png) return { png }
@@ -489,19 +492,19 @@ export function draw($: EngineInterface, site: string, media: Shown, shown?: Sho
   if (one.isSplit && shown?.pair) {
     const at = Math.min(one.frame, shown.pair.count - 1), pair = shown.pair
     const ticket = ++tickets
-    void pairReady($, shown, at, site).then(() => blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket)).catch(() => undefined)
+    void pairReady($, shown, at, site, !!one.timer).then(() => blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket)).catch(() => undefined)
     return
   }
   if (one.isSplit && shown?.compare) {
     const at = compareFrame(shown, one.frame), compare = shown.compare, frame = one.frame
     const ticket = ++tickets
-    void frameReady($, compare, at, site).then(() => blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket)).catch(() => undefined)
-    void frameReady($, shown, frame, site).then(() => blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket)).catch(() => undefined)
+    void frameReady($, compare, at, site, true, !!one.timer).then(() => blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket)).catch(() => undefined)
+    void frameReady($, shown, frame, site, true, !!one.timer).then(() => blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket)).catch(() => undefined)
     return
   }
   const frame = one.frame
   const ticket = ++tickets
-  void frameReady($, media, frame, site).then(() => blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket)).catch(() => undefined)
+  void frameReady($, media, frame, site, true, !!one.timer).then(() => blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket)).catch(() => undefined)
 }
 
 // A side's checks in words: "4 checks fail" or "all 11 checks pass".
@@ -607,9 +610,13 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (heard.kind === 'on') {
       const target = Math.max(0, Math.min(frames.count - 1, Math.floor(heard.seconds * frames.fps)))
       debug(`sound at=${heard.seconds.toFixed(3)} frame=${one.frame} target=${target}`)
-      if (isFrameCut(media, target)) return target
+      // Behind the picture (just after a start, less the device's delay): the
+      // picture waits for it. Those frames may be gone (pruned behind a skip
+      // back); stopping the sound for them restarted it at the same moment
+      // over and over.
+      if (target <= one.frame || isFrameCut(media, target)) return target
       haltSound(site, 'frames_behind')
-      void frameReady($, media, target, site)
+      void frameReady($, media, target, site, true, true, true)
       // Stopped too often for frames this play: the machine can't keep up,
       // so the picture plays on silently rather than stuttering.
       if (soundStarts >= SOUND_RESTARTS) {
@@ -630,10 +637,10 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     }
     const from = one.frame / frames.fps
     if (!soundLeft(track, from)) return 'silent'
-    // Two seconds of frames first, so the sound doesn't stop again at once.
-    const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps * 2))
+    // A second of frames ahead first, so the sound doesn't stop again at once.
+    const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
     if (!isFrameCut(media, ahead)) {
-      void frameReady($, media, ahead, site)
+      void frameReady($, media, one.frame, site, true, true)
       return 'hold'
     }
     soundStarts += 1
@@ -668,7 +675,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       if (heard <= one.frame) return
       coming = heard
       // Keeps the cutting ahead going, as the silent path does.
-      void frameReady($, media, heard, site)
+      void frameReady($, media, heard, site, true, true, true)
     } else {
       if (owed < 1) return
       const target = Math.min(frames.count - 1, one.frame + Math.floor(owed))
@@ -676,8 +683,8 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       if (!shown?.pair || !one.isSplit) {
         if (!isAsking && !isFrameCut(media, target)) {
           isAsking = true
-          void frameReady($, media, target, site).finally(() => { isAsking = false })
-        } else if (!isAsking) void frameReady($, media, target, site)
+          void frameReady($, media, target, site, true, true, true).finally(() => { isAsking = false })
+        } else if (!isAsking) void frameReady($, media, target, site, true, true, true)
         // The furthest frame on the way that's already cut.
         while (coming > one.frame && !isFrameCut(media, coming)) coming--
         if (coming <= one.frame) return void debug(`wait frame=${target}`)
@@ -704,13 +711,17 @@ function toggle($: EngineInterface, site: string, media: Shown, shown?: Shown) {
 
 // A jump pauses: the frames at the new place may not be cut yet, and a clip
 // left playing there stood still under Pause.
-function seek($: EngineInterface, site: string, media: Shown, seconds: number, shown?: Shown) {
+// `keepsPlaying`: a skip during playback plays on from there (sound too);
+// a scrub or a jump to a check stops, so the frame can be looked at.
+function seek($: EngineInterface, site: string, media: Shown, seconds: number, shown?: Shown, keepsPlaying = false) {
   const frames = media.frames
   if (!frames) return
   const one = player(site)
+  const wasPlaying = !!one.timer
   halt(site, 'seek')
   one.frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
   draw($, site, media, shown)
+  if (keepsPlaying && wasPlaying) play($, site, media, shown)
   redraw($, site)
 }
 
@@ -1448,10 +1459,10 @@ export async function Viewer(
   const run = (argv: string[], note: string) => () => {
     void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
-  // A video the agent shows starts playing by itself, once.
+  // A video the agent shows starts playing by itself, once, with sound
+  // unless it's muted.
   if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
     one.hasAutoplayed = true
-    one.isQuiet = true
     void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
   }
 
@@ -1461,7 +1472,7 @@ export async function Viewer(
     return Warning(ui, $, site, shown, columns - 8)
   }
   resized($, site, media, shown, own)
-  await frameReady($, media, one.frame, site)
+  await frameReady($, media, one.frame, site, !!one.timer, !!one.timer)
   // Only expired when the original is gone. A frame not on disk yet (a copy
   // just made for a resized window, or one the cache trimmed) is cut again
   // from the original, outside this draw: Claude Code cancels the processes a
@@ -1490,6 +1501,9 @@ export async function Viewer(
   probe($, site, viewKey(site), pic)
   if (one.isSplit && shown.pair && frames) return SplitView(ui, $, site, shown, columns, viewport?.rows ?? 40, isPane, prLink)
 
+  // A plain ♪, like the other controls' marks: Unicode's text speakers
+  // (U+1F568 to U+1F56A) are missing from macOS fonts and draw as boxes, and
+  // 🔊 is a colour emoji. Muted dims the button.
   // Unmute shows only on a clip with a sound stream, where sound can reach
   // the person. The look runs after the draw: a newer render cancels what a
   // render starts, and a cancelled look is asked again by the next one.
@@ -1527,9 +1541,9 @@ export async function Viewer(
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
-          {frames && <Button key="back" plain dimColor label="« 5s" onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - 5, shown)} />}
-          {frames && <Button key="forward" plain dimColor label="5s »" onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + 5, shown)} />}
-          {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? 'Mute' : 'Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
+          {frames && <Button key="back" plain dimColor label={`« ${SKIP_SECONDS}s`} onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - SKIP_SECONDS, shown, true)} />}
+          {frames && <Button key="forward" plain dimColor label={`${SKIP_SECONDS}s »`} onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + SKIP_SECONDS, shown, true)} />}
+          {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? '♪ Mute' : '♪ Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
         </Box>
         <Box flexDirection="row" columnGap={2}>
           {opener}

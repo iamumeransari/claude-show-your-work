@@ -53,10 +53,11 @@ export const state = {
   inTmux: false,
   // Sound (sound.ts): ffplay's path ('' when missing), whether the session
   // runs where its speakers aren't the person's (ssh, a background session),
-  // and whether the person turned sound on. Off at every session start.
+  // and whether sound is on: on at every session start; Mute holds for the
+  // rest of the session. Tour videos are quiet until Play.
   ffplay: '',
   isFarFromSpeakers: false,
-  isSoundOn: false,
+  isSoundOn: true,
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',

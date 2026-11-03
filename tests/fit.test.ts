@@ -5,7 +5,7 @@ import { isInstalledCopy } from '../hooks/telemetry'
 import { isAtLeast } from '../hooks/setup'
 import { STOPS } from '../hooks/tour'
 import { settings, state } from '../hooks/state'
-import { readsAnyFile, anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, chunksBehind, chunksAhead, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
+import { isKept, rawSizeOf, readsAnyFile, anchors, mapTime, align, matchOf, expand, frameFile, pairHeightOf, sameMoment, sampleRate, aheadOf, strideFor, spreadMatch, leadFrom, shiftTimes, keyOf, looseName, pngDims } from '../hooks/media'
 import { parseShown, timesThatMean, versionsOf, noteOf, handleOf } from '../hooks/history'
 import { liveChange, inClipOrder, barChunks, changeAt, qaTotals, checkDiff, resultWords, resumeCommand, isScratch, toolLine, urlAt, playWord, openFailure, causeOf, profileOf, withoutPicturesLine, copyWidthFor, bestCopy, anyTerminalReads, terminalOf, pngSource } from '../hooks/player'
 
@@ -47,11 +47,31 @@ test('long clips are sampled slower so they stay under 3600 frames', () => {
   expect(frameFile({ dir: '/t', count: 3, fps: 12, duration: 1 }, 0)).toBe('/t/f00001.png')
 })
 
-test('5 s of frames stay behind the playhead and 5 s are cut ahead', () => {
-  // A chunk is 24 frames: 5 s is 60 frames at 12 fps.
-  expect(chunksBehind(12)).toBe(3)
-  expect(chunksBehind(1)).toBe(1)
-  expect(chunksAhead(12)).toBe(3)
+test('the clip in use keeps 3 s behind and 3 s ahead; others keep only their frame', () => {
+  expect(aheadOf(12)).toBe(36)
+  expect(aheadOf(1)).toBe(3)
+  const playing = [{ frame: 100, isPlaying: true }]
+  // 3 s behind is 36 frames at 12 fps.
+  expect(isKept(64, playing, 12)).toBe(true)
+  expect(isKept(63, playing, 12)).toBe(false)
+  // 3 s ahead, or as far as the decoder has got.
+  expect(isKept(136, playing, 12)).toBe(true)
+  expect(isKept(137, playing, 12)).toBe(false)
+  expect(isKept(150, playing, 12, 150)).toBe(true)
+  expect(isKept(151, playing, 12, 150)).toBe(false)
+  const paused = [{ frame: 100, isPlaying: false }]
+  expect(isKept(100, paused, 12)).toBe(true)
+  expect(isKept(101, paused, 12)).toBe(false)
+  // The poster always stays.
+  expect(isKept(0, paused, 12)).toBe(true)
+})
+
+test('a raw frame is named .rgb and knows its size; a PNG frame does not', () => {
+  const raw = { dir: '/t/v-raw', count: 10, fps: 12, duration: 1, raw: { width: 1670, height: 940 } }
+  expect(frameFile(raw, 4)).toBe('/t/v-raw/f00005.rgb')
+  expect(rawSizeOf('/t/v-raw/f00005.rgb')).toEqual({ width: 1670, height: 940 })
+  expect(frameFile({ dir: '/t/v-png', count: 10, fps: 12, duration: 1 }, 4)).toBe('/t/v-png/f00005.png')
+  expect(rawSizeOf('/t/v-png/f00005.png')).toBe(undefined)
 })
 
 test('the picture sizes to the terminal within its limits', () => {

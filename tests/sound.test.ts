@@ -69,8 +69,8 @@ test('sound only where it reaches the person: ffplay found, not over ssh or from
   }
 })
 
-test('every session starts muted', () => {
-  expect(state.isSoundOn).toBe(false)
+test('every session starts with sound on', () => {
+  expect(state.isSoundOn).toBe(true)
 })
 
 test("the moment heard is ffplay's position, moved on by the time since, less the output device's delay", () => {

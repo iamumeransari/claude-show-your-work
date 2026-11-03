@@ -6,21 +6,26 @@ import { expect, mock, test } from 'claude-code/testing'
 // clock doesn't move Date.now, so the give-ups that time real seconds (no
 // position, a stalled one, the orphan check) are checked in a real session
 // instead: see Sound in docs/technical/testing-and-debugging.md.
-const clip = (id: string) => ({
+const clip = (id: string, seconds = 3) => ({
   kind: 'video', path: `/tmp/${id}/f00001.png`, source: `/tmp/${id}.mov`, width: 960, height: 540, title: 'Sound', generation: 1,
-  frames: { dir: `/tmp/${id}`, count: 36, fps: 12, duration: 3 },
+  frames: { dir: `/tmp/${id}`, count: seconds * 12, fps: 12, duration: seconds },
 })
-// A 3 s mono 22.05 kHz sound file.
-const WAV_BYTES = 44 + 44100 * 3
+// A 10 s mono 22.05 kHz sound file (the longest clip here; a shorter one ends first).
+const wavBytes = (_path: string) => 44 + 44100 * 10
 const WHERE = 'home=/tmp\nff=/bin/ffmpeg\nfp=/bin/ffprobe\nfy=/bin/ffplay\ncl=\nos=Darwin\n'
 
 type Spawned = { argv: string[]; ended: boolean }
 
 // The setup shell finds ffplay; ffprobe finds a sound stream (or not); ffmpeg
 // and mv succeed; osascript reports the output device's delay, when given. Anything else is refused, as the harness would.
-function machine(on: any, hasSound = true, latency?: string) {
+function machine(on: any, hasSound = true, latency?: string, goneBelow = 0) {
   on('store.get', () => ({ value: undefined }))
-  on('fs.stat', (_$: any, e: any) => ({ value: { kind: 'file', size: String(e.path).endsWith('.wav') ? WAV_BYTES : 1, mtimeMs: 0, isLink: false } }))
+  on('fs.stat', (_$: any, e: any) => {
+    // Frames pruned behind the playhead (all but the poster) are gone.
+    const m = /f(\d+)\.png$/.exec(String(e.path))
+    if (m && Number(m[1]) > 1 && Number(m[1]) <= goneBelow) return { deny: 'ENOENT: no such file' }
+    return { value: { kind: 'file', size: String(e.path).endsWith('.wav') ? wavBytes(String(e.path)) : 1, mtimeMs: 0, isLink: false } }
+  })
   on('process.run', (_$: any, e: any) => {
     const argv: string[] = e.argv
     if (argv[0] === 'sh' && String(argv[2]).includes('command -v ffplay')) return { value: { exitCode: 0, stdout: WHERE, stderr: '' } }
@@ -37,6 +42,11 @@ function machine(on: any, hasSound = true, latency?: string) {
 // -ss, advancing at `rate` times real time, every 35 ms, until it's stopped.
 function ffplay(on: any, clock: any, spawned: Spawned[], startMs = 500, rate = 1) {
   on('process.spawn', async function* (_$: any, e: any) {
+    // A frame decoder (ffmpeg): every frame is already on disk here (fs.stat).
+    if (!e.argv.includes('-nodisp')) {
+      yield { stream: 'stdout', text: 'frame=0\nprogress=end\n' }
+      return { value: { code: 0, signal: null } }
+    }
     const run = { argv: [...e.argv], ended: false }
     spawned.push(run)
     const from = Number(e.argv[e.argv.indexOf('-ss') + 1])
@@ -67,10 +77,10 @@ function frames(on: any) {
   return swapped
 }
 
-async function mountOf($: any, id: string) {
+async function mountOf($: any, id: string, seconds = 3) {
   const mounted = await $.ui.mount({
     plugin: 'show-your-work', surface: 'terminal', component: 'ToolResult', requestId: id,
-    props: { tool_use_id: id, tool: 'mcp__show-your-work__show_video', output: `Shown.\nshow-your-work:${JSON.stringify(clip(id))}`, isErrored: false },
+    props: { tool_use_id: id, tool: 'mcp__show-your-work__show_video', output: `Shown.\nshow-your-work:${JSON.stringify(clip(id, seconds))}`, isErrored: false },
     viewport: { columns: 140, rows: 50 },
   } as any)
   await mounted.drawn()
@@ -94,7 +104,7 @@ test('a clip without sound has no Unmute, and plays as before', async ($, on) =>
   expect(swapped.at(-1)!).toBeGreaterThanOrEqual(10)
 })
 
-test('a clip with sound plays muted until Unmute; then the picture follows the sound, and Pause or Mute ends it', async ($, on) => {
+test('sound is on by default; muted, Play is silent; unmuted, the picture follows the sound, and Pause or Mute ends it', async ($, on) => {
   const clock = mock.clock(on)
   machine(on)
   const spawned: Spawned[] = []
@@ -103,9 +113,11 @@ test('a clip with sound plays muted until Unmute; then the picture follows the s
   const swapped = frames(on)
   const mounted = await mountOf($, 'loud')
   await clock.advance(400)
-  must((await textOf(mounted)).includes('Unmute'), "check 1: (await textOf(mounted)).includes('Unmute')")
+  must(!(await textOf(mounted)).includes('Unmute') && (await textOf(mounted)).includes('Mute'), "check 1: sound is on by default")
 
   // Muted: Play spawns nothing.
+  await mounted.press({ key: 'sound' })
+  must((await textOf(mounted)).includes('Unmute'), "check 1b: Mute shows Unmute")
   await mounted.press({ key: 'play' })
   await clock.advance(500)
   expect(spawned.length).toBe(0)
@@ -163,7 +175,6 @@ test('on a slow output device (Bluetooth headphones) the picture waits for the s
   const swapped = frames(on)
   const mounted = await mountOf($, 'slow')
   await clock.advance(400)
-  await mounted.press({ key: 'sound' })
   swapped.length = 0
   await mounted.press({ key: 'play' })
   await clock.advance(2300)
@@ -173,4 +184,20 @@ test('on a slow output device (Bluetooth headphones) the picture waits for the s
   const shown = swapped.at(-1)! - 1
   expect(Math.abs(shown - (played - 0.5) * 12)).toBeLessThanOrEqual(2)
   await mounted.press({ key: 'play' })
+})
+
+test('with the frames just before the start gone, the sound starts once and never loops on the same moment', async ($, on) => {
+  const clock = mock.clock(on)
+  // Half a second of device delay: the moment heard starts before the frame on screen.
+  machine(on, true, '0.5', 36)
+  const spawned: Spawned[] = []
+  ffplay(on, clock, spawned, 300, 1)
+  frames(on)
+  const mounted = await mountOf($, 'skipped', 10)
+  await clock.advance(400)
+  // Paused: 3s » to frame 36, then play from there.
+  await mounted.press({ key: 'forward' })
+  await mounted.press({ key: 'play' })
+  await clock.advance(2500)
+  expect(spawned.length).toBe(1)
 })

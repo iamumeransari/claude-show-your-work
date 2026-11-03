@@ -370,7 +370,33 @@ export async function locate($: EngineInterface, raw: string): Promise<string> {
   return hit ? `${dir.replace(/\/$/, '')}/${hit.name}` : path
 }
 
-export const frameFile = (frames: Frames, i: number) => `${frames.dir}/f${String(i + 1).padStart(5, '0')}.png`
+// A video's frames are raw RGB files wherever the terminal reads the
+// plugin's files itself: nothing to compress, and the terminal draws them
+// without decoding. A PNG cost ~0.2 s of CPU a frame for 1080p camera footage
+// (zlib; only 30% smaller there), so on a busy machine cutting fell to 0.3x
+// real time and playback froze; raw cut at 0.9x with a fifth of the CPU.
+// PNG only where raw can't go: pictures sent as bytes (ssh: 4.7 MB a frame
+// through the connection) or a terminal that reads small files only (Orca).
+export const usesRaw = () => !state.sendBytes && readsAnyFile()
+// Each raw folder's frame size, for the terminal (a raw file has no header).
+const rawSizes = new Map<string, { width: number; height: number }>()
+export function frameFile(frames: Frames, i: number) {
+  if (frames.raw) rawSizes.set(frames.dir, frames.raw)
+  return `${frames.dir}/f${String(i + 1).padStart(5, '0')}.${frames.raw ? 'rgb' : 'png'}`
+}
+// The pixel size of a raw frame file, or undefined for a PNG.
+export const rawSizeOf = (file: string) => (file.endsWith('.rgb') ? rawSizes.get(file.slice(0, file.lastIndexOf('/'))) : undefined)
+// What ffmpeg writes a frame as: raw RGB at an exact size, or a PNG.
+const frameOut = (raw: boolean, scale: string) =>
+  raw ? ['-vf', `${scale},format=rgb24`, '-c:v', 'rawvideo', '-f', 'image2', '-atomic_writing', '1'] : ['-vf', scale, '-compression_level', '1']
+// A raw frame's height from its size on disk: ffmpeg picks it (-2 keeps the
+// aspect, after any rotation), so it's read back rather than worked out.
+async function rawSize($: EngineInterface, file: string, width: number) {
+  const st = await $.fs.stat(file)
+  const height = Math.round(st.size / 3 / width)
+  if (!width || height * width * 3 !== st.size) throw new Error(`not a raw frame: ${file}`)
+  return { width, height }
+}
 
 // How fast to sample a clip of known length so it stays under MAX_STREAMED.
 export const sampleRate = (duration: number) =>
@@ -409,7 +435,7 @@ export async function pngSize($: EngineInterface, png: string) {
 }
 
 // Frames on disk are a cache: past 500 MB the oldest folders go, and a window
-// that plays one again decodes it again (ensureChunk). The newest two stay.
+// that plays one again decodes it again (decode). The newest two stay.
 const FRAMES_CAP_KB = 500_000
 // Folders this session is playing are never trimmed.
 export function trimFrames($: EngineInterface) {
@@ -559,7 +585,8 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   const cut = Math.min(PX_MAX, cutAt ?? frameWidth(field('width'), field('height'), state.termSize, state.cell))
   const own = field('width') > 0 && field('height') > 0 ? { sourceWidth: field('width'), sourceHeight: field('height') } : {}
   // A clip is cut once per width: a bigger window cuts it again, bigger.
-  const folder = key && `v-${keyOf(`${key}|${cut}${state.sendBytes ? '|bytes' : ''}`)}`
+  const raw = usesRaw()
+  const folder = key && `v-${keyOf(`${key}|${cut}${state.sendBytes ? '|bytes' : ''}${raw ? '|raw' : ''}`)}`
   // The same file shown before: its folder, frames and size are already there.
   if (folder) {
     const dir = `${state.TMP}/${folder}`
@@ -567,8 +594,8 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     if (meta) {
       const frames = { ...meta.frames, dir }
       await $.process.run(['touch', dir]).catch(() => undefined)
-      await ensureChunk($, frames, real, 0)
-      await prefill($, frames, real)
+      await learn($, dir)
+      if (!disk(dir).has(0)) await until($, dir, 0, ensure($, frames, real, 0, false))
       return { kind: 'video', path: frameFile(frames, 0), source: real, width: meta.width, height: meta.height, ...own, title, generation: ++state.generation, frames }
     }
   }
@@ -583,27 +610,34 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   // leadFrom, and known-issues.md for how it would be turned on).
   const lead = 0
   const known = Number.isFinite(probed) && probed > 0
-  // A clip of known length is decoded as it plays, a chunk at a time (see
-  // ensureChunk); one without (MediaRecorder webm) is cut whole, as before.
+  // A clip of known length is decoded as it plays (see decode); one without
+  // (MediaRecorder webm) is cut whole, as before.
   const total = known ? Math.max(1, Math.min(MAX_STREAMED, Math.floor((probed - lead) * fps))) : 0
-  const pngsIn = async () => (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).map(f => `${dir}/${f.name}`)
-  const made = await cutFrames($, isFew => [
-    // The palette waits for the end of its input: only the first chunk is read.
-    state.ffmpeg, '-v', 'error', ...decodeFlags(real), ...(lead ? ['-ss', String(lead)] : []), ...(known ? ['-t', chunkSeconds(Math.min(CHUNK, total), fps)] : []), '-i', real,
-    '-vf', `fps=${fps},${scaleFor(cut, isFew)}`,
-    '-frames:v', String(known ? Math.min(CHUNK, total) : MAX_FRAMES), '-compression_level', '1', '-y', `${dir}/f%05d.png`,
-  ], pngsIn)
-  if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
-  const pngs = (await $.fs.list(dir)).filter(f => f.name.endsWith('.png')).length
-  if (!pngs) throw new Error(`no frames in ${real}`)
-  const count = known ? Math.max(pngs, total) : pngs
-  const frames = { dir, count, fps, duration: count / fps, cut, ...(lead ? { lead } : {}) }
+  const ext = raw ? 'rgb' : 'png'
+  let count: number
+  if (known) {
+    // The first second is decoded straight away; the clip shows as soon as
+    // its first frame is there (0.7 s for 1080p camera footage).
+    const d = decode($, { dir, count: total, fps, lead, ext, scale: scaleFor(cut, false) }, real, 0, false)
+    await until($, dir, 0, d, 60000)
+    if (!disk(dir).has(0)) throw new Error(`ffmpeg could not read ${real}: ${d.error}`)
+    count = total
+  } else {
+    const framesIn = async () => (await $.fs.list(dir)).filter(f => f.name.endsWith(`.${ext}`)).map(f => `${dir}/${f.name}`)
+    const made = await cutFrames($, isFew => [
+      state.ffmpeg, '-v', 'error', ...decodeFlags(real), ...(lead ? ['-ss', String(lead)] : []), '-i', real,
+      ...frameOut(raw, `fps=${fps},${scaleFor(cut, isFew)}`), '-frames:v', String(MAX_FRAMES), '-y', `${dir}/f%05d.${ext}`,
+    ], framesIn)
+    if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
+    count = (await framesIn()).length
+    if (!count) throw new Error(`no frames in ${real}`)
+    await learn($, dir)
+  }
+  const size = raw ? await rawSize($, `${dir}/f00001.rgb`, cut) : await pngSize($, `${dir}/f00001.png`)
+  const frames: Frames = { dir, count, fps, duration: count / fps, cut, ...(lead ? { lead } : {}), ...(raw ? { raw: size } : {}) }
   const poster = frameFile(frames, 0)
-
-  const size = await pngSize($, poster)
-  if (folder) await writeMeta($, dir, { frames: { count, fps, duration: frames.duration, cut, ...(lead ? { lead } : {}) }, ...size })
+  if (folder) await writeMeta($, dir, { frames: { count, fps, duration: frames.duration, cut, ...(lead ? { lead } : {}), ...(raw ? { raw: size } : {}) }, ...size })
   void trimFrames($)
-  if (known) await prefill($, frames, real)
   return { kind: 'video', path: poster, source: real, ...size, ...own, title, generation: state.generation, frames }
 }
 
@@ -617,38 +651,59 @@ export async function rescaleVideo($: EngineInterface, m: Shown, width: number, 
   const source = m.source
   if (!f || !source) return null
   const key = await identityOf($, source)
-  const dir = `${state.TMP}/v-${keyOf(`${key}|${width}${state.sendBytes ? '|bytes' : ''}`)}`
-  const frames: Frames = { ...f, dir, cut: width }
+  const raw = usesRaw()
+  const dir = `${state.TMP}/v-${keyOf(`${key}|${width}${state.sendBytes ? '|bytes' : ''}${raw ? '|raw' : ''}`)}`
+  // The new size keeps the frames' aspect (after any rotation), even rows.
+  const frames: Frames = { ...f, dir, cut: width, raw: raw && m.width > 0 ? { width, height: Math.max(2, Math.round((width * m.height) / m.width / 2) * 2) } : undefined }
   const i = Math.max(0, Math.min(at, f.count - 1))
   await $.process.run(['mkdir', '-p', dir])
-  await ensureChunk($, frames, source, i)
+  await learn($, dir)
+  if (!disk(dir).has(i)) await until($, dir, i, ensure($, frames, source, i, false))
   const shown = frameFile(frames, i)
   if (await isGone($, shown)) return null
-  const size = await pngSize($, shown)
-  await writeMeta($, dir, { frames: { count: f.count, fps: f.fps, duration: f.duration, cut: width, ...(f.lead ? { lead: f.lead } : {}) }, ...size })
+  const size = frames.raw ?? (await pngSize($, shown))
+  await writeMeta($, dir, { frames: { count: f.count, fps: f.fps, duration: f.duration, cut: width, ...(f.lead ? { lead: f.lead } : {}), ...(frames.raw ? { raw: frames.raw } : {}) }, ...size })
   void trimFrames($)
   return { ...m, path: shown, ...size, generation: ++state.generation, frames }
 }
 
-// Frames are decoded from the clip as it plays, 24 at a time: the chunk on
-// screen and the ones a 5 s skip either way reaches stay on disk, the rest
-// go. A frame asked for again further away (a long seek, a window scrolled
-// back to) is decoded again. The poster, frame 1, always stays.
-const CHUNK = 24
-// Every chunk is cut at normal priority. Chunks two or more ahead used to be
-// cut at macOS's utility class (nice 10 on Linux) to give way to other work,
-// but with every core busy macOS starves that class outright: a chunk never
-// finished, and when playback reached it, it waited on that cut and froze
-// for good (#14). Cutting only runs while a video plays, 5 s ahead at most.
-// Chunks are cut with ffmpeg's default threads, one cut at a time (see
-// cutAhead). One thread each looked enough on a plain test clip (1 s at
-// 2400 px in 0.85 s), but real footage is far heavier: a 72 Mbit/s 1080p
-// H.264 export with keyframes up to 3 s apart took 4.9 s per 2 s chunk on
-// one thread (7.7 s with every core busy), so playback waited on every chunk
-// and ran in slow motion (#14). Default threads: 1.4 s (2.4 s busy), at about
-// 310 MB peak instead of 133 MB. The side-by-side clip still uses one thread.
+// ── Frames as a clip plays ───────────────────────────────────────────────
+//
+// One ffmpeg per frames folder decodes the clip straight through from where
+// it's needed. Cutting it two seconds at a time started a process per chunk
+// and decoded each chunk again from the keyframe before it (3 s apart in
+// camera footage): most of the work was thrown away.
+//
+// While a clip plays, its decoder reads at the clip's own pace (-readrate 1)
+// with a head start, so it stays about AHEAD_SECONDS ahead instead
+// of racing to the end; on a busy machine it reads as fast as it can. A clip
+// shown but not playing gets AHEAD_SECONDS from where it is, then its decoder
+// ends. A play that stops (no frame asked for in PLAY_IDLE_MS) ends its
+// decoder; the frames it made stay. A frame asked for outside what the
+// decoder covers (a seek, a scrub, a skip) starts a new one there.
+//
+// The clip in use keeps BEHIND_SECONDS behind the playhead, so « 3s and a
+// scrub back land on frames that are there: they were decoded on the way past
+// and cost only disk. Every other clip keeps only the frame it shows, and
+// every clip its poster. Nothing is ever paused with SIGSTOP: a stopped
+// ffmpeg could outlive Claude Code holding its memory.
+// Both skips land on frames already there: « 3s behind, 3s » ahead.
+export const AHEAD_SECONDS = 3
+export const BEHIND_SECONDS = 3
+// The skip buttons: « 3s and 3s ».
+export const SKIP_SECONDS = 3
+const PLAY_IDLE_MS = 1000
+// ffmpeg's first frame from a new place: 0.7 to 1.5 s for 1080p camera
+// footage (start-up, then the stretch from the keyframe before it). A clip
+// shown decodes AHEAD_SECONDS, so on Play its decoder has that long to start
+// before the frames on disk run out, and each decoder's head start is sized
+// to settle about AHEAD_SECONDS ahead once its first frame is out.
+const START_SECONDS = 1.5
+export const aheadOf = (fps: number) => Math.max(2, Math.round(AHEAD_SECONDS * fps))
+const behindOf = (fps: number) => Math.round(BEHIND_SECONDS * fps)
+// Default threads: real footage is heavy (a 72 Mbit/s 1080p H.264 export took
+// 4.9 s per 2 s on one thread, #14). The side-by-side merge uses one thread.
 const ONE_THREAD = ['-threads', '1', '-filter_threads', '1']
-const decoding = new Map<string, Promise<void>>()
 export function exists($: EngineInterface, file: string) {
   return $.fs.stat(file).then(() => true, () => false)
 }
@@ -657,53 +712,37 @@ export function isGone($: EngineInterface, file: string) {
   return $.fs.stat(file).then(() => false, (e: unknown) => /ENOENT|not found|no such file/i.test(String((e as Error)?.message ?? e)))
 }
 
-// Chunks whose frames were cut: playback waits on any other. Only a hint:
-// cutting still checks the files, so a chunk the cache cleaner took comes back.
-const cutChunks = new Set<string>()
-const chunkKey = (f: Frames, i: number) => `${f.dir}#${Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)}`
-export const isFrameCut = (media: Shown, i: number) => !media.frames || cutChunks.has(chunkKey(media.frames, i))
-
-
-// A frame that should be on disk isn't (the temp folder was cleaned, or the
-// cache trimmed): forget its chunk was cut and cut it again from the source.
-// False when the source itself is gone too.
-export async function recutFrame($: EngineInterface, media: Shown, i: number): Promise<boolean> {
-  const f = media.frames
-  if (!f || !media.source || (await isGone($, media.source))) return false
-  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
-  cutChunks.delete(chunkKey(f, i))
-  await ensureChunk($, f, media.source, i)
-  return !(await isGone($, frameFile(f, Math.min(i, f.count - 1))))
-}
-
 // A terminal that refuses a picture file draws an empty box, and nothing comes
 // back to say so. Ghostty and kitty read any file up to 400 MB (checked in
 // their source), inside tmux too. Others may not: Orca reads one only from a
 // temp folder or the terminal's own worktree, and only up to 2 MiB (#16).
 // Elsewhere a still is drawn from a temp-folder copy under 2 MB (pngSource),
-// and a chunk with a frame over it is cut again in 256 colours (cutFrames).
+// and a folder with a frame over it is decoded in 256 colours from there on.
 const READS_ANY_FILE = new Set(['ghostty', 'kitty'])
 export const readsAnyFile = () => READS_ANY_FILE.has(state.terminalName) || READS_ANY_FILE.has(state.outerTerminal)
 export const BYTES_MAX = 2_000_000
-// Over ssh every frame crosses as bytes: 256 colours, one palette per chunk,
-// no dithering, halve them. Frames on this machine go by path in full colour.
-const PALETTE = ',split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none'
-// How much of the clip a chunk reads, a frame's slack included.
-export const chunkSeconds = (frames: number, fps: number) => String(+((frames + 1) / fps).toFixed(3))
+// Over ssh every frame crosses as bytes: 256 colours, no dithering, halve
+// them. A palette per frame, so frames stream out as they're decoded (one
+// for the whole clip would wait for its end). Frames on this machine go by
+// path in full colour.
+const PALETTE = ',split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=none'
 const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : "scale='min(1600,iw)':-2") + (isFew ? PALETTE : '')
-// Runs a cut. Outside Ghostty and kitty, a frame over BYTES_MAX may not draw,
-// so the rare chunk with one (a very wide window, grainy footage) is cut again
-// in 256 colours. Every other chunk keeps full colour; the check is a stat per
-// frame and no process.
+const fewColours = new Set<string>()
 // H.264 and HEVC decode on the Mac's media engine: the same frames, and it
-// leaves the CPU to the PNGs, which matters when the machine is busy (a render
+// leaves the CPU free, which matters when the machine is busy (a render
 // running: 0.37x real time against 0.28x for a 60 Mbit/s 1080p clip). Not
 // for other codecs: AV1 fails outright on Macs without its decoder instead of
-// falling back. A cut that fails with it is run again without it.
+// falling back. A decoder that fails with it runs again without it.
 const hwDecode = new Map<string, boolean>()
 const decodeFlags = (source: string) => (hwDecode.get(source) ? ['-hwaccel', 'videotoolbox'] : [])
 const withoutHw = (argv: string[]) => argv.filter((a, k) => a !== '-hwaccel' && argv[k - 1] !== '-hwaccel')
+// ffmpeg before 7.1 has no -readrate_catchup (6.1 no initial burst): there,
+// a playing clip is decoded a few seconds at a time instead.
+let canPace = true
 
+// A whole clip in one go (one with no known length). Outside Ghostty and
+// kitty, a frame over BYTES_MAX may not draw, so a clip with one is cut again
+// in 256 colours.
 async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], files: () => Promise<string[]>) {
   let made = await $.process.run(cut(state.sendBytes))
   if (made.exitCode !== 0 && cut(state.sendBytes).includes('-hwaccel')) {
@@ -719,109 +758,321 @@ async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], 
   return $.process.run(cut(true))
 }
 
-function ensureChunk($: EngineInterface, f: Frames, source: string | undefined, i: number): Promise<void> {
-  const c = Math.floor(Math.max(0, Math.min(i, f.count - 1)) / CHUNK)
-  const key = `${f.dir}#${c}`
-  const running = decoding.get(key)
-  if (running) return running
-  const job = (async () => {
-    const first = c * CHUNK
-    // The frame asked for, not the chunk's first: the poster outlives its chunk.
-    if (await exists($, frameFile(f, Math.max(0, Math.min(i, f.count - 1))))) return
-    if (!source) return
-    const cutAt = Date.now()
-    await $.process.run(['mkdir', '-p', f.dir])
-    const n = Math.min(CHUNK, f.count - first)
-    const cutChunk = (isFew: boolean) => [
-      state.ffmpeg, '-v', 'error', ...decodeFlags(source), '-ss', String(+((f.lead ?? 0) + first / f.fps).toFixed(3)), '-t', chunkSeconds(n, f.fps), '-i', source,
-      '-vf', `fps=${f.fps},${scaleFor(f.cut, isFew)}`, '-frames:v', String(n),
-      '-start_number', String(first + 1), '-compression_level', '1', '-y', `${f.dir}/f%05d.png`,
-    ]
-    await cutFrames($, cutChunk, async () => Array.from({ length: n }, (_, k) => frameFile(f, first + k)))
-    debug(`cut chunk=${c} ms=${Date.now() - cutAt}`)
-    await prune($, f.dir, c, f.fps)
-  })().then(() => { cutChunks.add(key) }, () => undefined).finally(() => decoding.delete(key))
-  decoding.set(key, job)
+// The frames each folder holds, as far as this session knows: what its
+// decoders wrote, and what was there when the folder was first used. Only a
+// hint: a frame found gone is decoded again (recutFrame).
+const onDisk = new Map<string, Set<number>>()
+function disk(dir: string) {
+  let s = onDisk.get(dir)
+  if (!s) onDisk.set(dir, (s = new Set()))
+  return s
+}
+const learnt = new Map<string, Promise<void>>()
+function learn($: EngineInterface, dir: string) {
+  let job = learnt.get(dir)
+  if (!job) {
+    job = $.fs.list(dir).then(files => {
+      for (const { name } of files) {
+        const m = /^f(\d+)\.(png|rgb)$/.exec(name)
+        if (m) disk(dir).add(Number(m[1]) - 1)
+      }
+    }, () => undefined)
+    learnt.set(dir, job)
+  }
   return job
 }
+const clampFrame = (f: Frames, i: number) => Math.max(0, Math.min(i, f.count - 1))
+export const isFrameCut = (media: Shown, i: number) => !media.frames || disk(media.frames.dir).has(clampFrame(media.frames, i))
+function firstMissing(f: Frames, i: number) {
+  const s = disk(f.dir)
+  let k = i
+  while (k < f.count && s.has(k)) k++
+  return k
+}
+// Whoever waits on a folder's frames looks again when one lands.
+const wakers = new Map<string, Set<() => void>>()
+function wake(dir: string) {
+  for (const w of [...(wakers.get(dir) ?? [])]) w()
+}
 
-// Where each player is in each frames folder, as a chunk number.
-const watching = new Map<string, Map<string, number>>()
-function watch(dir: string, site: string, i: number) {
+// What a decoder writes: the folder, the clip's timing, the file type and
+// the scale filter (exact for raw frames, keep-the-aspect for the first).
+type Spec = { dir: string; count: number; fps: number; lead?: number; ext: 'rgb' | 'png'; scale: string; gpuScale?: string }
+const specOf = (f: Frames): Spec => ({
+  dir: f.dir, count: f.count, fps: f.fps, lead: f.lead, ext: f.raw ? 'rgb' : 'png', scale: f.raw ? `scale=${f.raw.width}:${f.raw.height}` : scaleFor(f.cut, false),
+  // Scaled where it was decoded, on the media engine: 23% less CPU for 1080p
+  // camera footage (12 s: 2.65 s against 3.43 s). 10-bit HEVC comes down as p010.
+  ...(f.raw ? { gpuScale: `scale_vt=w=${f.raw.width}:h=${f.raw.height},hwdownload,format=nv12|p010le` } : {}),
+})
+const fileOf = (s: Spec, i: number) => `${s.dir}/f${String(i + 1).padStart(5, '0')}.${s.ext}`
+
+type Decoder = {
+  // Frames [from, end) are its; every frame before `reached` is on disk.
+  from: number
+  end: number
+  reached: number
+  isPlay: boolean
+  startedAt: number
+  wantedAt: number
+  isOver: boolean
+  // Stopped from outside (a newer decoder, another clip used).
+  isCancelled: boolean
+  error: string
+  stop: () => void
+  // A clip shown, then played while its first second was decoding: the
+  // playing decoder starts where this one ends.
+  thenPlay?: () => void
+}
+const decoders = new Map<string, Decoder>()
+
+// `buffered`: seconds already on disk ahead of the playhead, taken off the
+// head start (see START_SECONDS).
+function decode($: EngineInterface, s: Spec, source: string, from: number, isPlay: boolean, buffered = 0): Decoder {
+  decoders.get(s.dir)?.stop()
+  const ahead = aheadOf(s.fps)
+  const end = Math.min(s.count, from + (isPlay ? (canPace ? s.count : ahead * 2) : ahead))
+  const d: Decoder = { from, end, reached: from, isPlay, startedAt: Date.now(), wantedAt: Date.now(), isOver: false, isCancelled: false, error: '', stop: () => { d.isOver = d.isCancelled = true } }
+  decoders.set(s.dir, d)
+  debug(`decode from=${from} to=${end} play=${isPlay}`)
+  const argv = (hw: boolean, isFew: boolean, pace: boolean, at: number) => [
+    state.ffmpeg, '-v', 'error', '-nostdin', ...(hw ? decodeFlags(source) : []), ...(hw && s.gpuScale ? ['-hwaccel_output_format', 'videotoolbox_vld'] : []),
+    // The clip's own pace with a second's start. Catching up at 4x covers
+    // the stretch from the keyframe before `at`: without it the first frame
+    // took 1.8 s instead of 0.7 s and the decoder ran behind from there.
+    ...(isPlay && pace ? ['-readrate', '1', '-readrate_initial_burst', String(+Math.max(0, AHEAD_SECONDS + START_SECONDS - buffered).toFixed(2)), '-readrate_catchup', '4'] : []),
+    '-ss', String(+((s.lead ?? 0) + at / s.fps).toFixed(3)), '-i', source,
+    ...frameOut(s.ext === 'rgb', `fps=${s.fps},${hw && s.gpuScale ? s.gpuScale : s.scale}${isFew && s.ext === 'png' ? PALETTE : ''}`),
+    '-frames:v', String(d.end - at), '-start_number', String(at + 1),
+    '-progress', 'pipe:1', '-stats_period', '0.1', '-y', `${s.dir}/f%05d.${s.ext}`,
+  ]
+  // What the latest progress line says is written, checked on disk: frames
+  // land in order, so the newest one there means all before it are too.
+  const see = async (made: number, isFew: boolean) => {
+    const st = await $.fs.stat(fileOf(s, made - 1)).catch(() => null)
+    if (!st) return 'wait'
+    if (d.reached === d.from) debug(`decode first=${d.from} ms=${Date.now() - d.startedAt}`)
+    for (let k = d.reached; k < made; k++) disk(s.dir).add(k)
+    d.reached = made
+    wake(s.dir)
+    if (s.ext === 'png' && !isFew && !state.sendBytes && !readsAnyFile() && st.size > BYTES_MAX) return 'too_big'
+    return 'ok'
+  }
+  void (async () => {
+    let hw = decodeFlags(source).length > 0
+    let isFew = state.sendBytes || fewColours.has(s.dir)
+    try {
+      for (let tries = 0; tries < 4 && !d.isOver && d.reached < d.end; tries++) {
+        const at = d.reached
+        const stream = $.process.spawn({ argv: argv(hw, isFew, canPace, at) })
+        d.stop = () => {
+          d.isOver = d.isCancelled = true
+          void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+        }
+        let isTooBig = false
+        let err = ''
+        try {
+          for await (const chunk of stream) {
+            if (d.isOver) break
+            if (chunk.stream === 'stderr') {
+              err += chunk.text
+              continue
+            }
+            const m = [...chunk.text.matchAll(/frame=(\d+)/g)].pop()
+            if (m && at + Number(m[1]) > d.reached && (await see(at + Number(m[1]), isFew)) === 'too_big') {
+              isTooBig = true
+              break
+            }
+            // A player waiting on a frame asks nothing more meanwhile: never idle then.
+            if (d.isPlay && Date.now() - d.wantedAt > PLAY_IDLE_MS && !wakers.get(s.dir)?.size) {
+              debug(`decode idle dir=${s.dir.split('/').pop()} at=${d.reached}`)
+              d.isOver = true
+              break
+            }
+          }
+        } catch (e) {
+          err += String(e)
+        }
+        if (d.isOver) break
+        const res = await stream.result.catch(() => null)
+        if (isTooBig) {
+          debug('decode again in 256 colours: a frame is over 2 MB')
+          fewColours.add(s.dir)
+          isFew = true
+          continue
+        }
+        if (res?.code === 0) {
+          // The last progress line can come before the last file lands.
+          if (d.reached < d.end) await see(d.end, isFew)
+          break
+        }
+        d.error = err.trim().slice(0, 200)
+        if (/readrate/i.test(err) && canPace) {
+          debug('no -readrate_catchup: decoding a few seconds at a time')
+          canPace = false
+          d.end = Math.min(d.end, d.reached + aheadOf(s.fps) * 2)
+          continue
+        }
+        if (hw) {
+          debug(`hw decode failed, decode again without it: ${d.error.slice(0, 80)}`)
+          hw = false
+          continue
+        }
+        break
+      }
+    } finally {
+      d.isOver = true
+      if (decoders.get(s.dir) === d) decoders.delete(s.dir)
+      wake(s.dir)
+      if (!d.isCancelled) d.thenPlay?.()
+    }
+  })()
+  return d
+}
+
+// Starts a decoder for frame `i` when it isn't on disk or, while playing,
+// when what's on disk ahead of it runs short. The one running is kept while
+// it covers `i`.
+// `isChase`: the playhead's clock asking, ahead of a decoder that runs slow
+// (a busy machine); a decoder is then started afresh there only once it's
+// had CHASE_MS, so a slow one isn't restarted on every tick and never gets
+// going. A seek or a skip starts afresh at once.
+const CHASE_MS = 2000
+function ensure($: EngineInterface, f: Frames, source: string | undefined, i: number, isPlay: boolean, isChase = false): Decoder | undefined {
+  i = clampFrame(f, i)
+  const ahead = aheadOf(f.fps)
+  // Where the frames on disk from `i` run out: what a decoder has to make.
+  const start = firstMissing(f, i)
+  const d = decoders.get(f.dir)
+  if (d && !d.isOver) {
+    if (isPlay) d.wantedAt = Date.now()
+    // It gets there soon enough: within a second of where it has got to.
+    const isNear = start >= d.from && start <= d.end && start <= d.reached + f.fps
+    const isPatient = isChase && start >= d.from && Date.now() - d.startedAt < CHASE_MS
+    if ((isNear || isPatient) && (d.isPlay || !isPlay)) return d
+    if (isNear) {
+      d.thenPlay = () => void ensure($, f, source, d.reached, true)
+      return d
+    }
+  }
+  if (!source) return undefined
+  // Playing: started as soon as the play does (AHEAD_SECONDS on disk at
+  // most), so its first frame lands before the frames on disk run out.
+  if (start >= f.count || start - i > (isPlay ? ahead : 0)) return undefined
+  return decode($, specOf(f), source, start, isPlay, (start - i) / f.fps)
+}
+
+// Resolves once frame `i` is on disk, or once nothing will put it there.
+function until($: EngineInterface, dir: string, i: number, d: Decoder | undefined, limitMs = 20000): Promise<void> {
+  return new Promise<void>(resolve => {
+    let set = wakers.get(dir)
+    if (!set) wakers.set(dir, (set = new Set()))
+    const done = () => {
+      set.delete(check)
+      resolve()
+    }
+    const check = () => {
+      if (disk(dir).has(i) || !d || d.isOver) done()
+    }
+    set.add(check)
+    check()
+    void $.clock.sleep(limitMs).then(done, done)
+  })
+}
+
+// A frame that should be on disk isn't (the temp folder was cleaned, or the
+// cache trimmed): forget it and decode it again from the source. False when
+// the source itself is gone too.
+export async function recutFrame($: EngineInterface, media: Shown, i: number): Promise<boolean> {
+  const f = media.frames
+  if (!f || !media.source || (await isGone($, media.source))) return false
+  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
+  i = clampFrame(f, i)
+  disk(f.dir).delete(i)
+  decoders.get(f.dir)?.stop()
+  await until($, f.dir, i, ensure($, f, media.source, i, false))
+  return !(await isGone($, frameFile(f, i)))
+}
+
+// Where each player is in each frames folder, and whether it's the one the
+// person is using (playing, or last played, paused or scrubbed).
+type Watcher = { frame: number; isPlaying: boolean }
+const watching = new Map<string, Map<string, Watcher>>()
+function watch(dir: string, site: string, i: number, isPlaying: boolean) {
   let at = watching.get(dir)
   if (!at) watching.set(dir, (at = new Map()))
-  at.set(site, Math.floor(i / CHUNK))
+  at.set(site, { frame: i, isPlaying })
+}
+// The clip in use keeps BEHIND_SECONDS behind its playhead and whatever is
+// decoded ahead of it (`decoded`, its decoder's furthest frame); others keep
+// only the frame they show, and every clip its poster.
+export function isKept(i: number, watchers: readonly { frame: number; isPlaying: boolean }[], fps: number, decoded = 0) {
+  return i === 0 || watchers.some(v => (v.isPlaying ? i >= v.frame - behindOf(fps) && i <= Math.max(v.frame + aheadOf(fps), decoded) : i === v.frame))
 }
 
-// Chunks 5 s behind the playhead stay on disk and 5 s ahead are cut in
-// advance, so « 5s and 5s » land on frames that are ready, and playback has
-// room to spare when cutting runs slower than the clip.
-const BEHIND_SECONDS = 5
-const AHEAD_SECONDS = 5
-const chunksFor = (seconds: number, fps: number) => Math.max(1, Math.ceil((seconds * fps) / CHUNK))
-export const chunksBehind = (fps: number) => chunksFor(BEHIND_SECONDS, fps)
-export const chunksAhead = (fps: number) => chunksFor(AHEAD_SECONDS, fps)
+// Deletes the frames no player in the folder keeps, at most once a second.
+const prunedAt = new Map<string, number>()
+function prune($: EngineInterface, dir: string, fps: number) {
+  const now = Date.now()
+  if (now - (prunedAt.get(dir) ?? 0) < 1000) return
+  prunedAt.set(dir, now)
+  void (async () => {
+    const watchers = [...(watching.get(dir)?.values() ?? [])]
+    // Not drawn by any player yet (a clip being prepared): keep what's made.
+    if (!watchers.length) return
+    const d = decoders.get(dir)
+    const decoded = d && !d.isOver ? d.reached : 0
+    const files = await $.fs.list(dir).catch(() => [])
+    const gone: string[] = []
+    for (const { name } of files) {
+      const m = /^f(\d+)\.(png|rgb)$/.exec(name)
+      if (!m) continue
+      const i = Number(m[1]) - 1
+      if (isKept(i, watchers, fps, decoded)) continue
+      gone.push(`${dir}/${name}`)
+      disk(dir).delete(i)
+    }
+    if (gone.length) await $.process.run(['rm', '-f', ...gone]).catch(() => undefined)
+  })()
+}
 
-// Keeps, in a frames folder, the chunks a skip back or forward reaches around
-// the chunk just made and around every player on that folder, and the poster.
-async function prune($: EngineInterface, dir: string, c: number, fps: number) {
-  const keep = [c, ...(watching.get(dir)?.values() ?? [])]
-  const behind = chunksBehind(fps)
-  const ahead = chunksAhead(fps) + 1
-  const files = await $.fs.list(dir).catch(() => [])
-  const gone = files.map(f => f.name).filter(name => {
-    const m = /^f(\d+)\.png$/.exec(name)
-    if (!m) return false
-    const i = Number(m[1]) - 1
-    return i > 0 && !keep.some(k => i >= (k - behind) * CHUNK && i < (k + ahead + 1) * CHUNK)
-  })
-  if (gone.length) {
-    for (const k of [...cutChunks]) if (k.startsWith(`${dir}#`) && !keep.some(c2 => { const j = Number(k.slice(dir.length + 1)); return j >= c2 - behind && j <= c2 + ahead })) cutChunks.delete(k)
-    await $.process.run(['rm', '-f', ...gone.map(n => `${dir}/${n}`)]).catch(() => undefined)
+// The clip in use changed: every other one keeps only the frame it shows,
+// and stops decoding.
+let inUse = ''
+function use($: EngineInterface, site: string) {
+  if (inUse === site) return
+  inUse = site
+  for (const [dir, at] of watching) {
+    if (at.has(site)) continue
+    for (const w of at.values()) w.isPlaying = false
+    decoders.get(dir)?.stop()
+    prunedAt.delete(dir)
+    prune($, dir, fpsOf.get(dir) ?? 12)
   }
 }
+const fpsOf = new Map<string, number>()
 
-// The frame a side shows, decoded if it has to be; then the chunks a 5s »
-// reaches are cut ahead, one at a time so a busy machine isn't swamped.
-export async function frameReady($: EngineInterface, media: Shown, i: number, site?: string): Promise<void> {
+// The frame a side shows, decoded if it has to be. `isUsed`: the person is
+// using this clip (playing, paused on it, scrubbing), so it keeps its window.
+// `isPlay`: it's playing, so its decoder runs on ahead of the playhead.
+// `isChase`: the play clock asking (see ensure).
+export async function frameReady($: EngineInterface, media: Shown, i: number, site?: string, isUsed = false, isPlay = false, isChase = false): Promise<void> {
   const f = media.frames
   if (!f) return
-  if (site) watch(f.dir, site, i)
-  await ensureChunk($, f, media.source, i)
-  void cutAhead($, f, media.source, i)
-}
-
-// One cut at a time, nearest first: each already uses every core, and two
-// at once would double the memory for no gain.
-const CUT_WORKERS = 1
-const cuttingAhead = new Set<string>()
-async function cutAhead($: EngineInterface, f: Frames, source: string | undefined, i: number) {
-  if (cuttingAhead.has(f.dir)) return
-  cuttingAhead.add(f.dir)
-  try {
-    const todo: number[] = []
-    for (let d = 1; d <= chunksAhead(f.fps); d++) {
-      const j = i + d * CHUNK
-      if (j >= f.count) break
-      if (!cutChunks.has(chunkKey(f, j))) todo.push(j)
-    }
-    let taken = 0
-    const worker = async () => {
-      while (taken < todo.length) {
-        await ensureChunk($, f, source, todo[taken++]!)
-      }
-    }
-    await Promise.all(Array.from({ length: CUT_WORKERS }, worker))
-  } finally {
-    cuttingAhead.delete(f.dir)
+  fpsOf.set(f.dir, f.fps)
+  i = clampFrame(f, i)
+  if (site) {
+    // A clip just shown is the one about to be watched: it takes the window.
+    const isNew = !watching.get(f.dir)?.has(site)
+    watch(f.dir, site, i, isUsed || isNew || inUse === site)
+    if (isUsed || isNew) use($, site)
   }
-}
-
-// Before a video is shown, the first 5 s ahead are cut too, so playback
-// starts with room to spare. Never more than PREFILL_MS of waiting.
-const PREFILL_MS = 4000
-async function prefill($: EngineInterface, f: Frames, source: string | undefined) {
-  await Promise.race([cutAhead($, f, source, 0), $.clock.sleep(PREFILL_MS)]).catch(() => undefined)
+  await learn($, f.dir)
+  // On disk but not known (made by another session since): not decoded again.
+  if (!disk(f.dir).has(i) && (await exists($, frameFile(f, i)))) disk(f.dir).add(i)
+  const d = ensure($, f, media.source, i, isPlay, isChase)
+  if (site) prune($, f.dir, f.fps)
+  if (disk(f.dir).has(i)) return
+  await until($, f.dir, i, d)
 }
 
 // Moments both runs share (a check by the same name), as [updated, original]
@@ -997,14 +1248,15 @@ export const pairHeightOf = (updated: { height: number }, original: { height: nu
 export async function preparePair($: EngineInterface, original: Shown, updated: Shown) {
   const f = updated.frames!, g = original.frames!
   state.generation += 1
+  const height = pairHeightOf(updated, original)
   // p2: pairs made before the time-first matching are never reused.
-  const dir = `${state.TMP}/p2-${keyOf(`${f.dir}|${g.dir}|${pairHeightOf(updated, original)}`)}`
+  const dir = `${state.TMP}/p2-${keyOf(`${f.dir}|${g.dir}|${height}`)}`
   type PairMeta = { pair: Omit<Frames, 'dir'>; pairWidth: number; pairHeight: number; sync: [number, number][] }
   const known = (await readMeta($, dir)) as PairMeta | null
   if (known) {
     const pair = { ...known.pair, dir }
     await $.process.run(['touch', dir]).catch(() => undefined)
-    await pairChunk($, pair, updated, original, i => compareFrame({ ...updated, compare: original, sync: known.sync }, i), 0)
+    await pairReady($, { ...updated, compare: original, pair, sync: known.sync }, 0)
     return { pair, pairWidth: known.pairWidth, pairHeight: known.pairHeight, sync: known.sync }
   }
   // Two runs of the same steps take about as long: then the same moment on
@@ -1018,55 +1270,99 @@ export async function preparePair($: EngineInterface, original: Shown, updated: 
     ? spreadMatch(matchOf(align(ta, tb, 0.01, Math.max(2, Math.round((0.6 * f.fps) / stride)), 0.02), ta.length), stride, f.count, g.count - 1)
     : byTime()
   await $.process.run(['mkdir', '-p', dir])
-  const pair = { dir, count: f.count, fps: f.fps, duration: f.duration }
-  await pairChunk($, pair, updated, original, i => match[i] ?? 0, 0)
+  // Each side scaled to the merged height, at an even width. The merged
+  // frames are PNGs (two clips, rarely played: simpler than raw for little
+  // cost), made from the sides' frames, raw or not.
+  const width = sideWidth(original, height) + PAIR_GAP + sideWidth(updated, height)
+  const pair: Frames = { dir, count: f.count, fps: f.fps, duration: f.duration }
+  const sync = turns(match, f.fps, g.fps)
+  await pairReady($, { ...updated, compare: original, pair, sync }, 0)
   if (!(await exists($, frameFile(pair, 0)))) return null
-  const size = await pngSize($, frameFile(pair, 0))
-  const made = { pair, pairWidth: size.width, pairHeight: size.height, sync: turns(match, f.fps, g.fps) }
+  const made = { pair, pairWidth: width, pairHeight: height, sync }
   await writeMeta($, dir, { ...made, pair: { count: pair.count, fps: pair.fps, duration: pair.duration } })
 
   return made
 }
+const sideWidth = (side: Shown, height: number) => Math.max(2, Math.round((side.width * height) / Math.max(1, side.height) / 2) * 2)
 
-// One chunk of the merged clip, Original left and Updated right, made from
-// the two sides' frames for that stretch (decoded first if they have to be).
-function pairChunk($: EngineInterface, pair: Frames, updated: Shown, original: Shown, jOf: (i: number) => number, i: number): Promise<void> {
-  const c = Math.floor(Math.max(0, Math.min(i, pair.count - 1)) / CHUNK)
-  const key = `${pair.dir}#${c}`
-  const running = decoding.get(key)
+// Merged frames from the first one missing at `i`, up to a second of them,
+// PNGs made from the two sides' frames (decoded as the clip plays). One merge at a
+// time per pair; a frame both sides don't have yet waits for them.
+const merging = new Map<string, Promise<void>>()
+function merge($: EngineInterface, shown: Shown, i: number, isPlay: boolean): Promise<void> {
+  const pair = shown.pair!, original = shown.compare!
+  const running = merging.get(pair.dir)
   if (running) return running
-  const f = updated.frames!, g = original.frames!
+  const f = shown.frames!, g = original.frames!
+  const jOf = (k: number) => clampFrame(g, compareFrame(shown, k))
   const job = (async () => {
-    const first = c * CHUNK, n = Math.min(CHUNK, pair.count - first)
-    if (await exists($, frameFile(pair, Math.max(0, Math.min(i, pair.count - 1))))) return
-    const js = Array.from({ length: n }, (_, k) => Math.max(0, Math.min(g.count - 1, jOf(first + k))))
-    await ensureChunk($, f, updated.source, first)
-    for (const jc of new Set(js.map(j => Math.floor(j / CHUNK)))) await ensureChunk($, g, original.source, jc * CHUNK)
-    const tmp = `${pair.dir}/c${c}`
+    const first = firstMissing(pair, i)
+    // A second a merge, so the first merged frame lands soon.
+    const want = Math.min(pair.count, i + aheadOf(pair.fps), firstMissing(pair, i) + Math.round(pair.fps))
+    if (first >= want) return
+    await Promise.all([learn($, f.dir), learn($, g.dir)])
+    // On disk but not known (made by another session since): not decoded again.
+    await Promise.all([[f, first], [g, jOf(first)]].map(async ([side, k]) => {
+      if (!disk((side as Frames).dir).has(k as number) && (await exists($, frameFile(side as Frames, k as number)))) disk((side as Frames).dir).add(k as number)
+    }))
+    await Promise.all([
+      until($, f.dir, first, ensure($, f, shown.source, first, isPlay)),
+      until($, g.dir, jOf(first), ensure($, g, original.source, jOf(first), isPlay)),
+    ])
+    let n = 0
+    while (first + n < want && disk(f.dir).has(first + n) && disk(g.dir).has(jOf(first + n))) n++
+    if (!n) return
+    const tmp = `${pair.dir}/m${first}`
     await $.process.run(['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
-    const links = js.map((j, k) => `ln -sf "${frameFile(g, j)}" "$0/o/f${String(k + 1).padStart(5, '0')}.png"; ln -sf "${frameFile(f, first + k)}" "$0/u/f${String(k + 1).padStart(5, '0')}.png"`).join('\n')
+    const ext = (side: Frames) => (side.raw ? 'rgb' : 'png')
+    const links = Array.from({ length: n }, (_, k) => {
+      const name = String(k + 1).padStart(5, '0')
+      return `ln -sf "${frameFile(g, jOf(first + k))}" "$0/o/f${name}.${ext(g)}"; ln -sf "${frameFile(f, first + k)}" "$0/u/f${name}.${ext(f)}"`
+    }).join('\n')
     await $.process.run(['sh', '-c', links, tmp])
-    // Needed on screen now: normal priority.
-    await $.process.run([
-      state.ffmpeg, '-v', 'error', ...ONE_THREAD, '-framerate', String(f.fps), '-i', `${tmp}/o/f%05d.png`, '-framerate', String(f.fps), '-i', `${tmp}/u/f%05d.png`,
-      '-filter_complex', `[0:v]scale=-2:${pairHeightOf(updated, original)},pad=iw+${PAIR_GAP}:ih:0:0:color=${SIDEBAR.replace('#', '0x')}[a];[1:v]scale=-2:${pairHeightOf(updated, original)}[b];[a][b]hstack=inputs=2`,
-      '-frames:v', String(n), '-threads', '1', '-start_number', String(first + 1), '-compression_level', '1', `${pair.dir}/f%05d.png`,
+    // Raw frames have no header: ffmpeg is told their format and size.
+    const input = (side: Frames, sub: string) => [
+      ...(side.raw ? ['-f', 'image2', '-c:v', 'rawvideo', '-pixel_format', 'rgb24', '-video_size', `${side.raw.width}x${side.raw.height}`] : []),
+      '-framerate', String(pair.fps), '-i', `${tmp}/${sub}/f%05d.${ext(side)}`,
+    ]
+    const height = pairHeightOf(shown, original)
+    const made = await $.process.run([
+      state.ffmpeg, '-v', 'error', '-nostdin', ...ONE_THREAD, ...input(g, 'o'), ...input(f, 'u'),
+      '-filter_complex', `[0:v]scale=${sideWidth(original, height)}:${height},pad=iw+${PAIR_GAP}:ih:0:0:color=${SIDEBAR.replace('#', '0x')}[a];[1:v]scale=${sideWidth(shown, height)}:${height}[b];[a][b]hstack=inputs=2`,
+      '-compression_level', '1', '-frames:v', String(n), '-start_number', String(first + 1), '-y', `${pair.dir}/f%05d.png`,
     ])
     await $.process.run(['rm', '-rf', tmp])
-    await prune($, pair.dir, c, pair.fps)
-  })().catch(() => undefined).finally(() => decoding.delete(key))
-  decoding.set(key, job)
+    if (made.exitCode !== 0) return void debug(`merge failed: ${made.stderr.trim().slice(0, 120)}`)
+    for (let k = first; k < first + n; k++) disk(pair.dir).add(k)
+    wake(pair.dir)
+  })().catch(() => undefined).finally(() => merging.delete(pair.dir))
+  merging.set(pair.dir, job)
   return job
 }
 
-// The merged frame on screen, made if it has to be, the next chunk ahead.
-export async function pairReady($: EngineInterface, shown: Shown, i: number, site?: string): Promise<void> {
-  const pair = shown.pair
-  if (!pair || !shown.compare) return
-  if (site) watch(pair.dir, site, i)
-  const jOf = (k: number) => compareFrame(shown, k)
-  await pairChunk($, pair, shown, shown.compare, jOf, i)
-  if (i % CHUNK >= CHUNK / 2 && i + CHUNK < pair.count) void pairChunk($, pair, shown, shown.compare, jOf, i + CHUNK)
+// The merged frame on screen, made if it has to be, and the second after it.
+export async function pairReady($: EngineInterface, shown: Shown, i: number, site?: string, isPlay = false): Promise<void> {
+  const pair = shown.pair, original = shown.compare
+  if (!pair || !original?.frames || !shown.frames) return
+  const f = shown.frames, g = original.frames
+  i = clampFrame(pair, i)
+  const j = clampFrame(g, compareFrame(shown, i))
+  for (const [dir, fps] of [[pair.dir, pair.fps], [f.dir, f.fps], [g.dir, g.fps]] as const) fpsOf.set(dir, fps)
+  if (site) {
+    // The merged frames and both sides' keep a window while the pair is shown.
+    watch(pair.dir, site, i, true)
+    watch(f.dir, site, i, true)
+    watch(g.dir, site, j, true)
+    use($, site)
+  }
+  await Promise.all([learn($, pair.dir), learn($, f.dir), learn($, g.dir)])
+  if (!disk(pair.dir).has(i) && (await exists($, frameFile(pair, i)))) disk(pair.dir).add(i)
+  // Keeps both sides' decoders going while the pair plays.
+  ensure($, f, shown.source, i, isPlay)
+  ensure($, g, original.source, j, isPlay)
+  if (site) for (const [dir, fps] of [[pair.dir, pair.fps], [f.dir, f.fps], [g.dir, g.fps]] as const) prune($, dir, fps)
+  for (let tries = 0; tries < 3 && !disk(pair.dir).has(i); tries++) await merge($, shown, i, isPlay)
+  void merge($, shown, i, isPlay)
 }
 
 // Resolves a path to something the terminal can draw: a PNG (other image
@@ -1932,7 +2228,7 @@ const viewKey = (site: string) => (player(site).isCompare ? 'view-original' : 'v
 const plainAt = (media: Shown, frame: number) =>
   media.frames ? frameFile(media.frames, Math.min(frame, media.frames.count - 1)) : media.path
 
-type Source = { png: string } | { file: string; format: 'png'; generation?: number }
+type Source = { png: string } | { file: string; format: 'png'; generation?: number } | { file: string; format: 'rgb'; width: number; height: number }
 
 // Claude Code takes at most 2 MiB of picture as bytes: a bigger one is sent as
 // a smaller copy, made once with whatever the machine has (sips, ffmpeg or
@@ -2029,6 +2325,9 @@ async function readableCopy($: EngineInterface, file: string, size: number, id: 
   return r?.exitCode === 0 ? copy : file
 }
 export async function pngSource($: EngineInterface, file: string): Promise<Source> {
+  // A raw video frame: the terminal reads its pixels as they are.
+  const raw = rawSizeOf(file)
+  if (raw) return { file, format: 'rgb' as const, ...raw }
   if (state.sendBytes) {
     const png = await bytesOf($, file)
     if (png) return { png }
@@ -2179,19 +2478,19 @@ export function draw($: EngineInterface, site: string, media: Shown, shown?: Sho
   if (one.isSplit && shown?.pair) {
     const at = Math.min(one.frame, shown.pair.count - 1), pair = shown.pair
     const ticket = ++tickets
-    void pairReady($, shown, at, site).then(() => blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket)).catch(() => undefined)
+    void pairReady($, shown, at, site, !!one.timer).then(() => blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket)).catch(() => undefined)
     return
   }
   if (one.isSplit && shown?.compare) {
     const at = compareFrame(shown, one.frame), compare = shown.compare, frame = one.frame
     const ticket = ++tickets
-    void frameReady($, compare, at, site).then(() => blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket)).catch(() => undefined)
-    void frameReady($, shown, frame, site).then(() => blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket)).catch(() => undefined)
+    void frameReady($, compare, at, site, true, !!one.timer).then(() => blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket)).catch(() => undefined)
+    void frameReady($, shown, frame, site, true, !!one.timer).then(() => blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket)).catch(() => undefined)
     return
   }
   const frame = one.frame
   const ticket = ++tickets
-  void frameReady($, media, frame, site).then(() => blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket)).catch(() => undefined)
+  void frameReady($, media, frame, site, true, !!one.timer).then(() => blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket)).catch(() => undefined)
 }
 
 // A side's checks in words: "4 checks fail" or "all 11 checks pass".
@@ -2297,9 +2596,13 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (heard.kind === 'on') {
       const target = Math.max(0, Math.min(frames.count - 1, Math.floor(heard.seconds * frames.fps)))
       debug(`sound at=${heard.seconds.toFixed(3)} frame=${one.frame} target=${target}`)
-      if (isFrameCut(media, target)) return target
+      // Behind the picture (just after a start, less the device's delay): the
+      // picture waits for it. Those frames may be gone (pruned behind a skip
+      // back); stopping the sound for them restarted it at the same moment
+      // over and over.
+      if (target <= one.frame || isFrameCut(media, target)) return target
       haltSound(site, 'frames_behind')
-      void frameReady($, media, target, site)
+      void frameReady($, media, target, site, true, true, true)
       // Stopped too often for frames this play: the machine can't keep up,
       // so the picture plays on silently rather than stuttering.
       if (soundStarts >= SOUND_RESTARTS) {
@@ -2320,10 +2623,10 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     }
     const from = one.frame / frames.fps
     if (!soundLeft(track, from)) return 'silent'
-    // Two seconds of frames first, so the sound doesn't stop again at once.
-    const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps * 2))
+    // A second of frames ahead first, so the sound doesn't stop again at once.
+    const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
     if (!isFrameCut(media, ahead)) {
-      void frameReady($, media, ahead, site)
+      void frameReady($, media, one.frame, site, true, true)
       return 'hold'
     }
     soundStarts += 1
@@ -2358,7 +2661,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       if (heard <= one.frame) return
       coming = heard
       // Keeps the cutting ahead going, as the silent path does.
-      void frameReady($, media, heard, site)
+      void frameReady($, media, heard, site, true, true, true)
     } else {
       if (owed < 1) return
       const target = Math.min(frames.count - 1, one.frame + Math.floor(owed))
@@ -2366,8 +2669,8 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       if (!shown?.pair || !one.isSplit) {
         if (!isAsking && !isFrameCut(media, target)) {
           isAsking = true
-          void frameReady($, media, target, site).finally(() => { isAsking = false })
-        } else if (!isAsking) void frameReady($, media, target, site)
+          void frameReady($, media, target, site, true, true, true).finally(() => { isAsking = false })
+        } else if (!isAsking) void frameReady($, media, target, site, true, true, true)
         // The furthest frame on the way that's already cut.
         while (coming > one.frame && !isFrameCut(media, coming)) coming--
         if (coming <= one.frame) return void debug(`wait frame=${target}`)
@@ -2394,13 +2697,17 @@ function toggle($: EngineInterface, site: string, media: Shown, shown?: Shown) {
 
 // A jump pauses: the frames at the new place may not be cut yet, and a clip
 // left playing there stood still under Pause.
-function seek($: EngineInterface, site: string, media: Shown, seconds: number, shown?: Shown) {
+// `keepsPlaying`: a skip during playback plays on from there (sound too);
+// a scrub or a jump to a check stops, so the frame can be looked at.
+function seek($: EngineInterface, site: string, media: Shown, seconds: number, shown?: Shown, keepsPlaying = false) {
   const frames = media.frames
   if (!frames) return
   const one = player(site)
+  const wasPlaying = !!one.timer
   halt(site, 'seek')
   one.frame = Math.max(0, Math.min(frames.count - 1, Math.round(seconds * frames.fps)))
   draw($, site, media, shown)
+  if (keepsPlaying && wasPlaying) play($, site, media, shown)
   redraw($, site)
 }
 
@@ -3138,10 +3445,10 @@ export async function Viewer(
   const run = (argv: string[], note: string) => () => {
     void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
-  // A video the agent shows starts playing by itself, once.
+  // A video the agent shows starts playing by itself, once, with sound
+  // unless it's muted.
   if (frames && !isPane && !one.hasAutoplayed && freshCalls.has(site)) {
     one.hasAutoplayed = true
-    one.isQuiet = true
     void $.clock.sleep(400).then(() => play($, site, media, shown), () => undefined)
   }
 
@@ -3151,7 +3458,7 @@ export async function Viewer(
     return Warning(ui, $, site, shown, columns - 8)
   }
   resized($, site, media, shown, own)
-  await frameReady($, media, one.frame, site)
+  await frameReady($, media, one.frame, site, !!one.timer, !!one.timer)
   // Only expired when the original is gone. A frame not on disk yet (a copy
   // just made for a resized window, or one the cache trimmed) is cut again
   // from the original, outside this draw: Claude Code cancels the processes a
@@ -3180,6 +3487,9 @@ export async function Viewer(
   probe($, site, viewKey(site), pic)
   if (one.isSplit && shown.pair && frames) return SplitView(ui, $, site, shown, columns, viewport?.rows ?? 40, isPane, prLink)
 
+  // A plain ♪, like the other controls' marks: Unicode's text speakers
+  // (U+1F568 to U+1F56A) are missing from macOS fonts and draw as boxes, and
+  // 🔊 is a colour emoji. Muted dims the button.
   // Unmute shows only on a clip with a sound stream, where sound can reach
   // the person. The look runs after the draw: a newer render cancels what a
   // render starts, and a cancelled look is asked again by the next one.
@@ -3217,9 +3527,9 @@ export async function Viewer(
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
-          {frames && <Button key="back" plain dimColor label="« 5s" onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - 5, shown)} />}
-          {frames && <Button key="forward" plain dimColor label="5s »" onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + 5, shown)} />}
-          {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? 'Mute' : 'Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
+          {frames && <Button key="back" plain dimColor label={`« ${SKIP_SECONDS}s`} onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - SKIP_SECONDS, shown, true)} />}
+          {frames && <Button key="forward" plain dimColor label={`${SKIP_SECONDS}s »`} onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + SKIP_SECONDS, shown, true)} />}
+          {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? '♪ Mute' : '♪ Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
         </Box>
         <Box flexDirection="row" columnGap={2}>
           {opener}
@@ -3395,10 +3705,11 @@ export const state = {
   inTmux: false,
   // Sound (sound.ts): ffplay's path ('' when missing), whether the session
   // runs where its speakers aren't the person's (ssh, a background session),
-  // and whether the person turned sound on. Off at every session start.
+  // and whether sound is on: on at every session start; Mute holds for the
+  // rest of the session. Tour videos are quiet until Play.
   ffplay: '',
   isFarFromSpeakers: false,
-  isSoundOn: false,
+  isSoundOn: true,
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',
@@ -4400,8 +4711,8 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    // The next session starts muted, and nothing sounds past this one.
-    state.isSoundOn = false
+    // The next session starts with sound on, and nothing sounds past this one.
+    state.isSoundOn = true
     haltAllSound('session_end')
     await flush($).catch(() => undefined)
     await stopForwarding($)

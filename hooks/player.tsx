@@ -1397,8 +1397,8 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
   if (cause === 'unrecognised') {
     const where = UNRECOGNISED[state.terminalName]?.name ?? 'this terminal'
     return {
-      title: `Turn on ${what} in ${where}`,
-      text: `"${name}" is ready, but Claude Code doesn't recognise ${where} yet, so it keeps ${what} off. Turn on pictures adds one line to your shell profile so they're on from now on, and copies a command. Type /exit and paste it here to reopen this chat.`,
+      title: `Turn on pictures in ${where}`,
+      text: `Claude Code doesn't recognise ${where} yet, so it keeps pictures and videos off. Turn on pictures adds one line to your shell profile so they show from now on, and copies a command. Type /exit and paste it here to reopen this chat.`,
       command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Turn on pictures', action: 'turn_on_pictures',
       claude: `Claude Code keeps pictures off in ${where} unless it starts with ${FORCE}=1, so the person saw a notice instead of ${name}. They can press Turn on pictures on it and reopen the chat to see it.`,
     }

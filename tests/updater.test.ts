@@ -1,10 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 
-import { BRANCHES, MOVE_SH, checkForUpdate } from '../hooks/updater'
+import { BRANCHES, MOVE_SH, checkForUpdate, findUpdate } from '../hooks/updater'
 
 // A stand-in for the engine: GitHub says `latest`, the CLI reports `installed`
 // from a marketplace of `source`, and every command run is recorded.
-function engine(o: { latest?: string; installed?: string; source?: string; ref?: string | null; env?: Record<string, string>; checkedAt?: number; updateExit?: number; addExit?: number; installFailsOnce?: boolean; installFails?: number; missingBinaries?: string[]; noCli?: boolean } = {}) {
+function engine(o: { latest?: string; installed?: string; source?: string; ref?: string | null; env?: Record<string, string>; checkedAt?: number; updateExit?: number; addExit?: number; installFailsOnce?: boolean; installFails?: number; missingBinaries?: string[]; noCli?: boolean; noMarket?: boolean; root?: string } = {}) {
   const runs: string[][] = []
   const fetched: string[] = []
   let installed = o.installed ?? '0.5.0'
@@ -13,6 +13,7 @@ function engine(o: { latest?: string; installed?: string; source?: string; ref?:
   const statuses: string[] = []
   const store = new Map<string, unknown>(o.checkedAt ? [['updateCheckedAt', o.checkedAt]] : [])
   const $ = {
+    plugin: { root: o.root ?? '' },
     env: { get: async (name: string) => o.env?.[name] },
     clock: { now: async () => 10 * 24 * 60 * 60 * 1000 },
     store: { get: async (k: string) => store.get(k), set: async (k: string, v: unknown) => void store.set(k, v) },
@@ -26,7 +27,7 @@ function engine(o: { latest?: string; installed?: string; source?: string; ref?:
         if (o.noCli || o.missingBinaries?.includes(argv[0]!)) throw new Error('ENOENT')
         runs.push(argv)
         const args = argv.slice(1).join(' ')
-        if (args === 'plugin marketplace list --json') return { exitCode: 0, stderr: '', stdout: JSON.stringify([{ name: 'iamumeransari', source: o.source ?? 'git', url: 'https://github.com/iamumeransari/claude-show-your-work.git', ref: o.ref === null ? undefined : o.ref ?? 'releases' }]) }
+        if (args === 'plugin marketplace list --json') return { exitCode: 0, stderr: '', stdout: o.noMarket ? '[]' : JSON.stringify([{ name: 'iamumeransari', source: o.source ?? 'git', url: 'https://github.com/iamumeransari/claude-show-your-work.git', ref: o.ref === null ? undefined : o.ref ?? 'releases' }]) }
         if (args === 'plugin list --json') return { exitCode: 0, stderr: '', stdout: JSON.stringify([{ id: 'show-your-work@iamumeransari', scope: 'user', version: installed }]) }
         if (args.startsWith('plugin update')) return { exitCode: o.updateExit ?? 0, stderr: '', stdout: '' }
         if (args.startsWith('plugin marketplace add') && args.includes('#')) return { exitCode: o.addExit ?? 0, stderr: '', stdout: '' }
@@ -128,6 +129,12 @@ test('a plugin loaded from a folder is never updated', async () => {
   const e = engine({ source: 'directory' })
   await checkForUpdate(e.$, '0.5.0')
   expect(args(e.runs)).toEqual(['plugin marketplace list --json'])
+})
+
+test('an installed copy mid channel move says an update is being installed, not a folder copy', async () => {
+  const root = '/Users/x/.claude/plugins/cache/iamumeransari/show-your-work/0.8.1'
+  expect((await findUpdate(engine({ noMarket: true, root }).$ as any, '0.8.1', BRANCHES.stable)).kind).toBe('busy')
+  expect((await findUpdate(engine({ noMarket: true }).$ as any, '0.8.1', BRANCHES.stable)).kind).toBe('folder')
 })
 
 test('already fetched but not restarted: nothing more is done', async () => {

@@ -4,7 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { state } from './state'
-import { track } from './telemetry'
+import { isInstalledCopy, track } from './telemetry'
 
 // Keeps the plugin current without the user turning on marketplace
 // auto-update: once a day it asks GitHub for the version on the install's
@@ -100,6 +100,7 @@ export type Found =
   | { kind: 'current'; latest: string }
   | { kind: 'pending'; latest: string }
   | { kind: 'folder' }
+  | { kind: 'busy' }
   | { kind: 'pinned'; ref: string }
   | { kind: 'offline' }
   | { kind: 'no_cli' }
@@ -119,7 +120,11 @@ export async function findUpdate($: EngineInterface, current: string, branch: Br
   if (!listed || listed.exitCode !== 0) return { kind: 'no_cli' }
   const markets = jsonOf<{ name: string; source: string; url?: string; ref?: string }[]>(listed.stdout, [])
   const market = markets.find(m => m.name === MARKETPLACE)
-  if (!market || market.source === 'directory') return { kind: 'folder' }
+  // An installed copy whose marketplace is missing is mid channel move
+  // (MOVE_SH removes it, then adds it back): not a folder copy.
+  const isCached = isInstalledCopy(await Promise.resolve().then(() => $.plugin.root).catch(() => ''))
+  if (market?.source === 'directory' || (!market && !isCached)) return { kind: 'folder' }
+  if (!market) return { kind: 'busy' }
   // Added with #v0.5.14 or another ref: the user chose that version.
   const ref = market.ref ?? 'main'
   if (ref !== 'main' && !Object.values(BRANCHES).includes(ref as Branch)) return { kind: 'pinned', ref }
@@ -127,7 +132,7 @@ export async function findUpdate($: EngineInterface, current: string, branch: Br
   if (!isNewer(latest, current)) return { kind: 'current', latest }
   const plugins = jsonOf<{ id: string; scope?: string; version?: string }[]>((await claude($, ['plugin', 'list', '--json']))?.stdout, [])
   const installed = plugins.find(p => p.id === `${PLUGIN}@${MARKETPLACE}`)
-  if (!installed) return { kind: 'folder' }
+  if (!installed) return isCached ? { kind: 'busy' } : { kind: 'folder' }
   // Already fetched by an earlier check; it runs from the next session.
   if (installed.version && !isNewer(latest, installed.version)) return { kind: 'pending', latest }
   return { kind: 'update', latest, scope: installed.scope ?? 'user' }

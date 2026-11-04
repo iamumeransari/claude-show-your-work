@@ -153,6 +153,10 @@ export function UpdatePane(ui: Ui, $: EngineInterface) {
   } else if (found?.kind === 'folder') {
     head = 'This copy runs from a folder, so it doesn\'t update'
     actions = [close]
+  } else if (found?.kind === 'busy') {
+    head = 'An update is being installed'
+    line = 'Check again in a minute.'
+    actions = [close]
   } else if (found?.kind === 'pinned') {
     head = `This install is pinned to ${found.ref}, so it doesn't update`
     actions = [close]
@@ -194,7 +198,8 @@ let hasStarted = false
 async function finishWelcome($: EngineInterface) {
   if (state.isWelcomed) return
   state.isWelcomed = true
-  await $.store.set('toured', true)
+  // Where pictures can't show yet, the tour waits for a session where they do.
+  if (state.canImage) await $.store.set('toured', true)
   await startBackground($)
 }
 
@@ -432,12 +437,20 @@ async function finishTour($: EngineInterface, isSkip: boolean) {
 // Draws the tour in the chat: the current step's player (or "Loading the
 // demo…", or the settings on the last step), with the step bar under it. The
 // bar takes the player's width so their edges line up.
+let isTourHeld = false
 export async function Tour($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], viewport?: { columns: number; rows: number }) {
   const ui = $.ui.resolve(e) as Ui
   const { Box, Text } = ui
   const s = STOPS[state.tourStop]!
   const media = mediaOf(s)
   if (state.isTourDone) return <Text dimColor>✓ Tour finished. /show-your-work tour shows it again.</Text>
+  // Pictures can't show here: the notice says how to turn them on, and the
+  // tour runs again in the first session where they show.
+  if (!state.canImage) {
+    if (!isTourHeld) { isTourHeld = true; void $.store.set('toured', false).catch(() => undefined) }
+    const notice = splash ? await Viewer($, e, atStep(splash, state.tourSite), state.tourSite, false, { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }) : null
+    return notice ?? <Text dimColor>Loading…</Text>
+  }
   const room = { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }
   if (!media && s.media) loadDemo($)
   // Nothing to look at yet: no bar, so Next can't be pressed before the demo shows.

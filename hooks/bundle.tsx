@@ -3412,8 +3412,8 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
   if (cause === 'unrecognised') {
     const where = UNRECOGNISED[state.terminalName]?.name ?? 'this terminal'
     return {
-      title: `Turn on ${what} in ${where}`,
-      text: `"${name}" is ready, but Claude Code doesn't recognise ${where} yet, so it keeps ${what} off. Turn on pictures adds one line to your shell profile so they're on from now on, and copies a command. Type /exit and paste it here to reopen this chat.`,
+      title: `Turn on pictures in ${where}`,
+      text: `Claude Code doesn't recognise ${where} yet, so it keeps pictures and videos off. Turn on pictures adds one line to your shell profile so they show from now on, and copies a command. Type /exit and paste it here to reopen this chat.`,
       command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Turn on pictures', action: 'turn_on_pictures',
       claude: `Claude Code keeps pictures off in ${where} unless it starts with ${FORCE}=1, so the person saw a notice instead of ${name}. They can press Turn on pictures on it and reopen the chat to see it.`,
     }
@@ -4021,6 +4021,7 @@ export type Found =
   | { kind: 'current'; latest: string }
   | { kind: 'pending'; latest: string }
   | { kind: 'folder' }
+  | { kind: 'busy' }
   | { kind: 'pinned'; ref: string }
   | { kind: 'offline' }
   | { kind: 'no_cli' }
@@ -4040,7 +4041,11 @@ export async function findUpdate($: EngineInterface, current: string, branch: Br
   if (!listed || listed.exitCode !== 0) return { kind: 'no_cli' }
   const markets = jsonOf<{ name: string; source: string; url?: string; ref?: string }[]>(listed.stdout, [])
   const market = markets.find(m => m.name === MARKETPLACE)
-  if (!market || market.source === 'directory') return { kind: 'folder' }
+  // An installed copy whose marketplace is missing is mid channel move
+  // (MOVE_SH removes it, then adds it back): not a folder copy.
+  const isCached = isInstalledCopy(await Promise.resolve().then(() => $.plugin.root).catch(() => ''))
+  if (market?.source === 'directory' || (!market && !isCached)) return { kind: 'folder' }
+  if (!market) return { kind: 'busy' }
   // Added with #v0.5.14 or another ref: the user chose that version.
   const ref = market.ref ?? 'main'
   if (ref !== 'main' && !Object.values(BRANCHES).includes(ref as Branch)) return { kind: 'pinned', ref }
@@ -4048,7 +4053,7 @@ export async function findUpdate($: EngineInterface, current: string, branch: Br
   if (!isNewer(latest, current)) return { kind: 'current', latest }
   const plugins = jsonOf<{ id: string; scope?: string; version?: string }[]>((await claude($, ['plugin', 'list', '--json']))?.stdout, [])
   const installed = plugins.find(p => p.id === `${PLUGIN}@${MARKETPLACE}`)
-  if (!installed) return { kind: 'folder' }
+  if (!installed) return isCached ? { kind: 'busy' } : { kind: 'folder' }
   // Already fetched by an earlier check; it runs from the next session.
   if (installed.version && !isNewer(latest, installed.version)) return { kind: 'pending', latest }
   return { kind: 'update', latest, scope: installed.scope ?? 'user' }
@@ -4237,6 +4242,10 @@ export function UpdatePane(ui: Ui, $: EngineInterface) {
   } else if (found?.kind === 'folder') {
     head = 'This copy runs from a folder, so it doesn\'t update'
     actions = [close]
+  } else if (found?.kind === 'busy') {
+    head = 'An update is being installed'
+    line = 'Check again in a minute.'
+    actions = [close]
   } else if (found?.kind === 'pinned') {
     head = `This install is pinned to ${found.ref}, so it doesn't update`
     actions = [close]
@@ -4278,7 +4287,8 @@ let hasStarted = false
 async function finishWelcome($: EngineInterface) {
   if (state.isWelcomed) return
   state.isWelcomed = true
-  await $.store.set('toured', true)
+  // Where pictures can't show yet, the tour waits for a session where they do.
+  if (state.canImage) await $.store.set('toured', true)
   await startBackground($)
 }
 
@@ -4516,12 +4526,20 @@ async function finishTour($: EngineInterface, isSkip: boolean) {
 // Draws the tour in the chat: the current step's player (or "Loading the
 // demo…", or the settings on the last step), with the step bar under it. The
 // bar takes the player's width so their edges line up.
+let isTourHeld = false
 export async function Tour($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0], viewport?: { columns: number; rows: number }) {
   const ui = $.ui.resolve(e) as Ui
   const { Box, Text } = ui
   const s = STOPS[state.tourStop]!
   const media = mediaOf(s)
   if (state.isTourDone) return <Text dimColor>✓ Tour finished. /show-your-work tour shows it again.</Text>
+  // Pictures can't show here: the notice says how to turn them on, and the
+  // tour runs again in the first session where they show.
+  if (!state.canImage) {
+    if (!isTourHeld) { isTourHeld = true; void $.store.set('toured', false).catch(() => undefined) }
+    const notice = splash ? await Viewer($, e, atStep(splash, state.tourSite), state.tourSite, false, { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }) : null
+    return notice ?? <Text dimColor>Loading…</Text>
+  }
   const room = { columns: viewport?.columns ?? 100, rows: Math.max(24, viewport?.rows ?? 40) }
   if (!media && s.media) loadDemo($)
   // Nothing to look at yet: no bar, so Next can't be pressed before the demo shows.

@@ -21,6 +21,11 @@ What's broken or unproven, and what was fixed and why, so nobody has to find the
 - **Other terminals and systems are unproven.** Whether Warp, WezTerm, kitty and Konsole report their tty size in pixels (as Ghostty does) is assumed, not measured; the plugin only scales a cell under 10 px wide. Linux and Windows haven't been run with Large or resizing.
 - **Reported: the terminal feels sticky with pictures on screen, and scrolling up sometimes jumps back.** Seen in the user's Ghostty while temporary debug logging (a `sips` call and a log write on every redraw) was in the local copy; removed. Measured headless afterwards with five pictures and a playing video: each scroll step answered in 1–26 ms, no jump back while scrolled up or during playback. If it's still seen on screen, the cause is Ghostty decoding pictures sent again on scroll back (`mayBeDropped`), or a box growing when a sharper copy arrives (the content height changes under the scroll position).
 
+## Fixed in 1.0.1
+
+- The update pane said "This copy runs from a folder" while a channel switch was running: the switch removes the marketplace for a moment. An installed copy now gets "An update is being installed" (`busy`).
+- Where pictures can't show, the tour waits for a session where they do; the first run shows only the notice.
+
 ## Fixed in 0.8.4
 
 - Sound stuttered and then stopped on a busy machine: each frame that was late stopped and restarted it, and after four restarts it gave up. The picture may now fall up to 1 s behind the sound (`SOUND_LAG_S`), a position counts as stale only after 1.5 s, and the restart count resets after 8 s of clean play.

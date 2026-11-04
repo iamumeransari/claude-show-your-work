@@ -1791,7 +1791,9 @@ const WAV_HEADER = 44
 // ffplay takes ~0.5 s to open the audio device and report its first position.
 const SOUND_START_MS = 2500
 // A position older than this means ffplay stalled: stop it rather than guess.
-const SOUND_STALE_MS = 600
+// A busy machine delays its status lines by half a second and more, and
+// stopping for that was heard as the sound cutting out.
+const SOUND_STALE_MS = 1500
 // The play timer quiet this long means the picture stopped: so does the sound.
 const SOUND_ORPHAN_MS = 1000
 // Starts per play (the first and three after the frames fell behind) before
@@ -2211,6 +2213,10 @@ function makeCopy($: EngineInterface, site: string, m: Shown, source: string, ma
     .finally(() => busy.delete(width))
 }
 const SHARPEN_DELAY_MS = 300
+// How far the picture may trail the sound before the sound stops for it.
+const SOUND_LAG_S = 1
+// Sound playing this long without trouble resets the restarts it may use.
+const SOUND_CLEAN_MS = 8000
 async function widenStill($: EngineInterface, source: string, width: number): Promise<Shown | null> {
   const out = `${state.TMP}/w-${keyOf(source)}-${width}.png`
   const made = state.isMac
@@ -2597,6 +2603,9 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
   // or a hold that lasts, gives up the sound for this play: the clip plays
   // on silently by real time, as without sound.
   let soundStarts = 0
+  // When the sound last started, so a long clean stretch earns its restarts
+  // back: an odd slow moment on a busy machine never silences the rest.
+  let soundSince = 0
   let waitSince = 0
   let holdSince = 0
   const wantsSound = () => state.isSoundOn && !one.isSplit && soundUsable() && !!media.source
@@ -2615,11 +2624,21 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     if (heard.kind === 'on') {
       const target = Math.max(0, Math.min(frames.count - 1, Math.floor(heard.seconds * frames.fps)))
       debug(`sound at=${heard.seconds.toFixed(3)} frame=${one.frame} target=${target}`)
+      if (soundSince && at - soundSince > SOUND_CLEAN_MS) soundStarts = 0
       // Behind the picture (just after a start, less the device's delay): the
       // picture waits for it. Those frames may be gone (pruned behind a skip
       // back); stopping the sound for them restarted it at the same moment
       // over and over.
       if (target <= one.frame || isFrameCut(media, target)) return target
+      // A little behind (a busy machine): the sound plays on and the picture
+      // shows the newest frame it has, rather than stopping the sound, which
+      // was heard as a stutter. Only a real gap stops it.
+      let have = target
+      while (have > one.frame && !isFrameCut(media, have)) have--
+      if (target - have <= Math.round(frames.fps * SOUND_LAG_S)) {
+        void frameReady($, media, target, site, true, true, true)
+        return have
+      }
       haltSound(site, 'frames_behind')
       void frameReady($, media, target, site, true, true, true)
       // Stopped too often for frames this play: the machine can't keep up,
@@ -2649,6 +2668,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       return 'hold'
     }
     soundStarts += 1
+    soundSince = at
     if (!startSound($, site, track.wav, from, () => one.tickedAt ?? 0)) giveUpSound('spawn')
     return 'hold'
   }
@@ -3236,7 +3256,7 @@ export const resumeCommand = (id: string) =>
 
 // Why pictures can't draw here: tmux, a terminal that can't draw Claude
 // Code's pictures, or a background session.
-export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'rex' | 'terminal' | 'background' | 'desktop'
+export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'unrecognised' | 'force' | 'terminal' | 'background' | 'desktop'
 
 // Claude Code draws every picture with kitty Unicode placeholders (a=T,U=1),
 // which Ghostty, kitty and Rex paint (Rex only once Claude Code is started
@@ -3247,6 +3267,10 @@ export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'rex' | 'terminal' | 'backg
 // the picture (#10). So pictures stay off there, known before the first one.
 export const DRAWS_PICTURES = ['ghostty', 'kitty', 'rex']
 export const NO_PLACEHOLDERS: Record<string, string> = { warp: 'Warp', wezterm: 'WezTerm', konsole: 'Konsole' }
+// Terminals known to draw no kitty pictures at all. Any other terminal Claude
+// Code doesn't recognise may be built on Ghostty or kitty (the Herdr
+// app): there pictures draw once Claude Code starts with them forced on.
+export const NO_KITTY = ['apple_terminal', 'vscode', ...Object.keys(NO_PLACEHOLDERS)]
 // 0.6.7 to 0.6.9 offered Turn on pictures in those terminals, which added this
 // marked line to the shell profile. It only made the boxes appear, so it's
 // removed again at session start.
@@ -3267,6 +3291,44 @@ export function withoutPicturesLine(profile: string): string | null {
   return profile.split('\n').filter(l => !l.includes(PROFILE_MARK)).join('\n')
 }
 
+// Terminals that paint Claude Code's pictures but that Claude Code doesn't
+// recognise, so it keeps pictures off unless started with FORCE (it reads it
+// at launch only; set from a plugin it's too late). Turn on pictures adds one
+// line to the shell profile that sets it only in that terminal. Its mark
+// differs from PROFILE_MARK, so removePicturesLine leaves it.
+export const UNRECOGNISED: Record<string, { name: string; sh: string; fish: string }> = {
+  rex: { name: 'Rex', sh: '[ "$TERM_PROGRAM" = rex ]', fish: 'test "$TERM_PROGRAM" = rex' },
+  herdr_app: { name: 'the Herdr app', sh: '[ -n "$HC_TERMINAL_ID" ]', fish: 'set -q HC_TERMINAL_ID' },
+}
+export const FORCE_MARK = '# show-your-work: Claude Code images on in '
+
+// The line Turn on pictures adds for this terminal and shell.
+export function forceLine(shell: string, terminal: string): string | null {
+  const t = UNRECOGNISED[terminal]
+  if (!t) return null
+  const isFish = (shell.split('/').pop() ?? '') === 'fish'
+  return isFish
+    ? `${t.fish}; and set -gx ${FORCE} 1 ${FORCE_MARK}${terminal}`
+    : `${t.sh} && export ${FORCE}=1 ${FORCE_MARK}${terminal}`
+}
+
+// The profile with the line added, or null when it's there already.
+export function withForceLine(profile: string, line: string): string | null {
+  if (profile.split('\n').some(l => l.trim() === line)) return null
+  return `${profile}${profile && !profile.endsWith('\n') ? '\n' : ''}${line}\n`
+}
+
+// Adds the line; resolves with the profile's path, or null when it couldn't.
+export async function turnOnPictures($: EngineInterface): Promise<string | null> {
+  const shell = (await $.env.get('SHELL')) ?? ''
+  const profile = profileOf(shell, state.home, state.isMac)
+  const line = forceLine(shell, state.terminalName)
+  if (!profile || !line) return null
+  const after = withForceLine(await $.fs.read(profile).catch(() => ''), line)
+  if (after === null) return profile
+  return (await $.fs.write(profile, after).then(() => true, () => false)) ? profile : null
+}
+
 export async function removePicturesLine($: EngineInterface) {
   const profile = profileOf((await $.env.get('SHELL')) ?? '', state.home, state.isMac)
   if (!profile) return
@@ -3277,18 +3339,23 @@ export async function removePicturesLine($: EngineInterface) {
 // Herdr, like tmux, sits between Claude Code and the terminal: pictures get
 // through only with its kitty graphics pass-through on, to a terminal that
 // draws them. In Rex, a failed draw without FORCE is Claude Code leaving
-// pictures off; with it, a background session.
+// pictures off; with it, a background session. Any other terminal Claude
+// Code doesn't recognise gets one try with pictures forced on.
 export const causeOf = (tmux: boolean, terminal: string, isForced = false): DrawCause =>
   tmux ? 'tmux'
     : terminal === 'herdr' ? 'herdr'
     : terminal === 'iterm2' ? 'iterm'
-    : terminal === 'rex' && !isForced ? 'rex'
+    : UNRECOGNISED[terminal] && !isForced ? 'unrecognised'
     : DRAWS_PICTURES.includes(terminal) ? 'background'
+    : !isForced && !NO_KITTY.includes(terminal) ? 'force'
     : 'terminal'
 
 // Which terminal this is, from what each one sets in the environment.
-export function terminalOf(env: { program: string; term: string; kitty: boolean; konsole: boolean; lcTerminal?: string }): string {
+export function terminalOf(env: { program: string; term: string; kitty: boolean; konsole: boolean; lcTerminal?: string; herdrApp?: boolean }): string {
   const { program, term } = env
+  // The Herdr desktop app sets TERM_PROGRAM=ghostty, but Claude Code keeps
+  // pictures off there unless forced, and it draws only pictures sent as data (#23).
+  if (env.herdrApp) return 'herdr_app'
   // LC_TERMINAL also crosses ssh.
   if (/iterm/i.test(program) || /^iTerm2$/i.test(env.lcTerminal ?? '')) return 'iterm2'
   if (/ghostty/i.test(program + term)) return 'ghostty'
@@ -3320,6 +3387,16 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
     command: '[terminal]\nkitty_graphics = true', label: 'Copy setting', action: 'copy_herdr_setting',
     claude: `Herdr isn't passing pictures through, so the person saw a notice instead of ${name}. They can set kitty_graphics = true under [terminal] in their Herdr config and restart Herdr, inside Ghostty or kitty.`,
   }
+  // Claude Code keeps pictures off in a terminal it doesn't recognise; one
+  // built on Ghostty or kitty draws them once they're forced on (#23).
+  if (cause === 'force') {
+    return {
+      title: `Restart Claude Code to show ${what} here`,
+      text: `"${name}" is ready, but Claude Code doesn't recognise this terminal, so it keeps ${what} off. If it's built on Ghostty or kitty, press Copy command, type /exit, and paste it here to reopen this chat with ${what} on.`,
+      command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Copy command', action: 'copy_resume_command',
+      claude: `Claude Code doesn't recognise this terminal, so it kept pictures off and the person saw a notice instead of ${name}. They can restart Claude Code with ${FORCE}=1 to see it.`,
+    }
+  }
   // iTerm2 3.5+ draws Claude Code's pictures in its fullscreen view only
   // (the classic renderer would send each one again for every new line).
   if (cause === 'iterm') return {
@@ -3330,11 +3407,16 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
   }
   // Rex paints Claude Code's pictures, but Claude Code only sends them there
   // when started with FORCE (it reads it at launch only).
-  if (cause === 'rex') return {
-    title: `Restart Claude Code to show ${what} in Rex`,
-    text: `"${name}" is ready, but Claude Code keeps ${what} off in Rex until it's started with ${what} turned on. Press Copy command, type /exit, and paste it here to reopen this chat with them on.`,
-    command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Copy command', action: 'copy_resume_command',
-    claude: `Claude Code keeps pictures off in Rex unless it starts with ${FORCE}=1, so the person saw a notice instead of ${name}. They can restart Claude Code with ${FORCE}=1 to see it.`,
+  // Turn on pictures adds the profile line (turnOnPictures) and copies the
+  // command that reopens this chat with them on.
+  if (cause === 'unrecognised') {
+    const where = UNRECOGNISED[state.terminalName]?.name ?? 'this terminal'
+    return {
+      title: `Turn on ${what} in ${where}`,
+      text: `"${name}" is ready, but Claude Code doesn't recognise ${where} yet, so it keeps ${what} off. Turn on pictures adds one line to your shell profile so they're on from now on, and copies a command. Type /exit and paste it here to reopen this chat.`,
+      command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Turn on pictures', action: 'turn_on_pictures',
+      claude: `Claude Code keeps pictures off in ${where} unless it starts with ${FORCE}=1, so the person saw a notice instead of ${name}. They can press Turn on pictures on it and reopen the chat to see it.`,
+    }
   }
   // The desktop app's Code tab draws the plugin's card but not its pictures
   // (#18): the file opens in the system viewer instead.
@@ -3367,7 +3449,14 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
   const file = shown.origin ?? shown.source ?? shown.path
   const onPress = state.drawCause === 'desktop'
     ? () => act(n.action) || void $.process.run(openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
-    : undefined
+    : state.drawCause === 'unrecognised'
+      ? (press: { surface: 'terminal' }) => act(n.action) || void (async () => {
+        const profile = await turnOnPictures($)
+        const copied = await $.ui.copy({ text: n.command, surface: press.surface }).then(r => r.isCopied, () => false)
+        const where = profile ? `Added to ${profile.replace(state.home, '~')}. ` : ''
+        $.ui.toast(copied ? `${where}Copied: type /exit and paste it.` : `${where}Could not copy the command.`)
+      })()
+      : undefined
   return NoticeBox(ui, $, width, { ...n, copy: n.command, onPress })
 }
 
@@ -3390,7 +3479,7 @@ function Expired(ui: Ui, $: EngineInterface, shown: Shown, width: number) {
 // and one button that copies what to paste back (a prompt, or a command).
 // isCalm: something that happens by design (an expired preview), drawn
 // plainly; the warning colour and ⚠ are kept for real problems.
-export function NoticeBox(ui: Ui, $: EngineInterface, width: number, n: { title: string; text: string; command?: string; copy: string; label: string; action: string; link?: { href: string; after: string }; isCalm?: boolean; onPress?: () => void }) {
+export function NoticeBox(ui: Ui, $: EngineInterface, width: number, n: { title: string; text: string; command?: string; copy: string; label: string; action: string; link?: { href: string; after: string }; isCalm?: boolean; onPress?: (press: { surface: 'terminal' }) => void }) {
   const { Box, Text, Button, Link } = ui
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={n.isCalm ? 'subtle' : 'warning'} paddingX={2} paddingY={1} width={Math.max(40, Math.min(width, 96))}>
@@ -3406,7 +3495,7 @@ export function NoticeBox(ui: Ui, $: EngineInterface, width: number, n: { title:
           variant="primary"
           label={n.label}
           onPress={(press: { surface: 'terminal' }) =>
-            n.onPress ? n.onPress() : act(n.action) || void $.ui.copy({ text: n.copy, surface: press.surface }).then(r => $.ui.toast(r.isCopied ? (n.command ? 'Copied. Paste it in your terminal.' : 'Copied. Paste it to Claude.') : 'Could not copy'))
+            n.onPress ? n.onPress(press) : act(n.action) || void $.ui.copy({ text: n.copy, surface: press.surface }).then(r => $.ui.toast(r.isCopied ? (n.command ? 'Copied. Paste it in your terminal.' : 'Copied. Paste it to Claude.') : 'Could not copy'))
           }
         />
       </Box>
@@ -4642,11 +4731,12 @@ export const register: Register = on => {
       state.pluginVersion = manifest.version ?? '0.0.0'
       const program = (await $.env.get('TERM_PROGRAM')) ?? ''
       const term = (await $.env.get('TERM')) ?? ''
-      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '' })
+      const herdrApp = !!(await $.env.get('HC_TERMINAL_ID')) || (await $.env.get('__CFBundleIdentifier')) === 'dev.herdr.app'
+      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '', herdrApp })
       state.terminalName = terminal
       state.isForced = /^(1|true|on|yes)$/i.test((await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) ?? '')
-      // iTerm2 draws pictures from bytes only, never from a file it's named.
-      if (terminal === 'iterm2') state.sendBytes = true
+      // iTerm2 and the Herdr app draw pictures from bytes only, never from a file they're named.
+      if (terminal === 'iterm2' || terminal === 'herdr_app') state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
       state.isDebug = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_DEBUG')) ?? '')
       if (state.isDebug) $.clock.every(1000, () => void flushDebug($))
@@ -4657,10 +4747,12 @@ export const register: Register = on => {
       const isForwarded = state.inTmux && (await forwardPictures($))
       // The desktop app's Code tab draws no pictures (#18).
       const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
-      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
+      // Rex and the Herdr app draw nothing until Claude Code starts with FORCE.
+      const isOff = !state.inTmux && !!UNRECOGNISED[state.terminalName] && !state.isForced
+      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff) {
         state.canImage = false
         state.probed = true
-        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
+        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,

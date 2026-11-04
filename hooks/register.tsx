@@ -17,7 +17,7 @@ import { CLEAN_SH, exists, expand, findPasted, identityOf, keyOf, locate, NO_FFM
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
 import { hadVersionBefore06, PLUGIN } from './updater'
-import { atStep, cantDraw, causeOf, draw, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, stop, terminalOf, toolLine, versions, Viewer } from './player'
+import { atStep, cantDraw, causeOf, draw, mayBeDropped, noteDrawn, NO_PLACEHOLDERS, NoticeBox, player, removePicturesLine, sideOf, UNRECOGNISED, stop, terminalOf, toolLine, versions, Viewer } from './player'
 import type { Ui } from './player'
 import { ensureSettings, goToStop, loadSettings, Opening, openSettings, openUpdate, openWelcome, Settings, startBackground, startTour, Tour, TOUR_TEXT, UPDATE, UpdatePane, WELCOME_TEXT } from './onboarding'
 
@@ -105,11 +105,12 @@ export const register: Register = on => {
       state.pluginVersion = manifest.version ?? '0.0.0'
       const program = (await $.env.get('TERM_PROGRAM')) ?? ''
       const term = (await $.env.get('TERM')) ?? ''
-      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '' })
+      const herdrApp = !!(await $.env.get('HC_TERMINAL_ID')) || (await $.env.get('__CFBundleIdentifier')) === 'dev.herdr.app'
+      const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '', herdrApp })
       state.terminalName = terminal
       state.isForced = /^(1|true|on|yes)$/i.test((await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) ?? '')
-      // iTerm2 draws pictures from bytes only, never from a file it's named.
-      if (terminal === 'iterm2') state.sendBytes = true
+      // iTerm2 and the Herdr app draw pictures from bytes only, never from a file they're named.
+      if (terminal === 'iterm2' || terminal === 'herdr_app') state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
       state.isDebug = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_DEBUG')) ?? '')
       if (state.isDebug) $.clock.every(1000, () => void flushDebug($))
@@ -120,10 +121,12 @@ export const register: Register = on => {
       const isForwarded = state.inTmux && (await forwardPictures($))
       // The desktop app's Code tab draws no pictures (#18).
       const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
-      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName]) {
+      // Rex and the Herdr app draw nothing until Claude Code starts with FORCE.
+      const isOff = !state.inTmux && !!UNRECOGNISED[state.terminalName] && !state.isForced
+      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff) {
         state.canImage = false
         state.probed = true
-        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName)
+        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,

@@ -25,7 +25,9 @@ const WAV_HEADER = 44
 // ffplay takes ~0.5 s to open the audio device and report its first position.
 const SOUND_START_MS = 2500
 // A position older than this means ffplay stalled: stop it rather than guess.
-const SOUND_STALE_MS = 600
+// A busy machine delays its status lines by half a second and more, and
+// stopping for that was heard as the sound cutting out.
+const SOUND_STALE_MS = 1500
 // The play timer quiet this long means the picture stopped: so does the sound.
 const SOUND_ORPHAN_MS = 1000
 // Starts per play (the first and three after the frames fell behind) before

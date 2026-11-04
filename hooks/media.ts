@@ -413,11 +413,14 @@ export function isGone($: EngineInterface, file: string) {
 
 // A terminal that refuses a picture file draws an empty box, and nothing comes
 // back to say so. Ghostty and kitty read any file up to 400 MB (checked in
-// their source), inside tmux too. Others may not: Orca reads one only from a
+// their source), inside tmux too, and so does Rex (measured with a=t,t=f:
+// any folder, 120 MB read, 300 MB refused with ENOMEM, 10,000 px at most;
+// its a=q query alone refuses any real file with EINVAL, so don't probe with
+// it). Others may not: Orca reads one only from a
 // temp folder or the terminal's own worktree, and only up to 2 MiB (#16).
 // Elsewhere a still is drawn from a temp-folder copy under 2 MB (pngSource),
 // and a folder with a frame over it is decoded in 256 colours from there on.
-const READS_ANY_FILE = new Set(['ghostty', 'kitty'])
+const READS_ANY_FILE = new Set(['ghostty', 'kitty', 'rex'])
 export const readsAnyFile = () => READS_ANY_FILE.has(state.terminalName) || READS_ANY_FILE.has(state.outerTerminal)
 export const BYTES_MAX = 2_000_000
 // Over ssh every frame crosses as bytes: 256 colours, no dithering, halve

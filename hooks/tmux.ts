@@ -4,7 +4,7 @@
 // it (#15). A forwarder on the pane (pipe-pane) copies each picture command
 // back into the pane, wrapped: tmux unwraps it for the terminal around it,
 // which then paints the placeholders. Claude Code only draws placeholders in
-// tmux when started with FORCE set, and only Ghostty and kitty paint them.
+// tmux when started with FORCE set, and only Ghostty, kitty and Rex paint them.
 import type { EngineInterface } from 'claude-code'
 
 import { event } from './diagnostics'
@@ -60,7 +60,7 @@ export async function forwardPictures($: EngineInterface): Promise<boolean> {
   const facts = await tmux(['display', '-p', '-t', pane, '#{pane_tty}\t#{pane_pipe}\t#{client_termtype}'])
   const [tty, piped, outer] = (facts?.exitCode === 0 ? facts.stdout.trim() : '').split('\t')
   event('tmux', { tty, piped, outer })
-  state.outerTerminal = (/^(ghostty|kitty)\b/i.exec(outer ?? '')?.[1] ?? '').toLowerCase()
+  state.outerTerminal = (/^(ghostty|kitty|rex)\b/i.exec(outer ?? '')?.[1] ?? '').toLowerCase()
   if (outerOf(outer ?? '')) {
     state.terminalName = outerOf(outer ?? '')
     return false

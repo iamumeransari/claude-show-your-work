@@ -15,6 +15,8 @@ export const state = {
   home: '',
   ffmpeg: 'ffmpeg',
   ffprobe: 'ffprobe',
+  // A Chromium that can render an HTML page headless ('' when there is none).
+  chrome: '',
   // Claude Code's CLI, as the login shell finds it ('' when it doesn't).
   claudePath: '',
   // setUp's one run, shared by everything that waits on it.

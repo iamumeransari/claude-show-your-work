@@ -174,6 +174,40 @@ export function shiftTimes<T extends { at?: number }>(list: T[] | undefined, lea
   return list.map(c => (c.at === undefined ? c : { ...c, at: Math.max(0, +(c.at - lead).toFixed(2)) }))
 }
 
+// HTML is rendered as a fixed viewport, not an interactive browser. The
+// original stays the Open page target; only its screenshot enters history.
+export const isPage = (path: string) => /\.html?$/i.test(path)
+// The page's own window: the browser engine as a small standalone viewer, the
+// way an image opens in an image viewer — no tabs, no address bar, and none of
+// the desktop's file-handler surprises (a hijacked text/html default). Its own
+// profile: the person's running browser never takes the window over, and the
+// viewer carries none of their logins.
+export const htmlOpenArgv = (chrome: string, page: string) => [
+  chrome, `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  `--user-data-dir=${state.TMP}/page-viewer.profile`,
+]
+export const htmlArgv = (chrome: string, page: string, png: string) => [
+  chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
+  '--no-first-run', '--no-default-browser-check', '--mute-audio',
+  `--user-data-dir=${png}.profile`, '--window-size=1280,800',
+  '--virtual-time-budget=1000', `--screenshot=${png}`, `file://${page.split('/').map(encodeURIComponent).join('/')}`,
+]
+export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
+  if (!state.chrome) throw new Error('pages need Chrome or Chromium')
+  const folder = await $.process.run(['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
+  const dir = folder.stdout.trim()
+  if (folder.exitCode !== 0 || !dir.startsWith(`${state.TMP}/page-`)) throw new Error("the page couldn't be rendered: could not create its temporary folder")
+  const png = `${dir}/page-${key}.png`
+  try {
+    const result = await $.process.run(htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
+    if (result.exitCode !== 0 || !(await exists($, png))) throw new Error("the page couldn't be rendered by Chrome or Chromium")
+    return png
+  } finally {
+    // A fresh browser profile, never the person's login, cookies or extensions.
+    await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
+  }
+}
+
 // What to tell Claude and the person when a video can't be cut into frames.
 export const NO_FFMPEG =
   "videos need ffmpeg, and it isn't installed. Pictures still work. Install it with `brew install ffmpeg` " +
@@ -233,6 +267,12 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
     text: `There's no file at ${shown}.`,
     message: `There's no file at ${shown}. Check the path (it may have moved or not been saved yet), then show it again.`,
     prompt: `There's no file at ${shown}. Find the right file and show it to me again.`,
+  }
+  if (/pages need Chrome or Chromium/i.test(raw)) return {
+    kind: 'other', title: 'Pages need a browser',
+    text: `${name} is an HTML page, and no Chrome or Chromium was found to render it. Copy the prompt and paste it to Claude to install one, or install it yourself.`,
+    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Install Chrome or Chromium, then restart Claude Code and show it again.`,
+    prompt: `Install Google Chrome or Chromium for me, then restart Claude Code. After that, show ${shown} to me again.`,
   }
   const detail = (raw.split('\n')[0] ?? '').replace(/\/(?:private\/)?tmp\/\S+|\S*\/\.show-your-work\/\S+/g, name).slice(0, 160)
   return {
@@ -1100,7 +1140,11 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
   let png = real
-  if (!/\.png$/i.test(real)) {
+  if (isPage(real)) {
+    // An HTML page becomes one fixed-window picture; its own file stays the
+    // source, so the player's corner opens the page itself in the browser.
+    png = await renderPage($, real, (key ?? (await identityOf($, real)) ?? keyOf(real)).slice(0, 10))
+  } else if (!/\.png$/i.test(real)) {
     state.generation += 1
     png = `${state.TMP}/${real.split('/').pop()!.replace(/\.[^.]+$/, '')}-${state.generation}.png`
     await $.process.run(['mkdir', '-p', state.TMP])

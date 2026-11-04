@@ -78,6 +78,7 @@ Making an ad, an animation or a launch video? Each cut plays right in the chat, 
 
 show-your-work supports Ghostty and kitty, on macOS and Linux. Pictures work there straight away.
 
+- **Rex:** pictures and videos draw, but Claude Code only turns them on in Rex when it starts with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1`. Without it, the plugin shows a notice that copies a command to reopen the chat with it.
 - **Warp, WezTerm and Konsole:** these support the kitty graphics protocol, but not the Unicode placeholders Claude Code draws pictures with, so pictures can't show in them yet.
 - **tmux:** works inside Ghostty or kitty. Claude Code leaves pictures off in tmux unless it starts with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1`, so the first time, the plugin turns that on for new tmux panes and the notice copies a command that reopens the chat with it. The plugin also turns on `allow-passthrough` for its own pane and passes the pictures through. Nothing in your tmux config is changed.
 

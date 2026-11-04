@@ -583,6 +583,10 @@ test('tmux inside Ghostty or kitty reads files as they do', () => {
     expect(readsAnyFile()).toBe(false)
     Object.assign(state, { terminalName: 'orca', outerTerminal: '' })
     expect(readsAnyFile()).toBe(false)
+    Object.assign(state, { terminalName: 'rex', outerTerminal: '' })
+    expect(readsAnyFile()).toBe(true)
+    Object.assign(state, { terminalName: 'tmux', outerTerminal: 'rex' })
+    expect(readsAnyFile()).toBe(true)
   } finally {
     Object.assign(state, saved)
   }

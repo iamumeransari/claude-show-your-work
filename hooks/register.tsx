@@ -107,6 +107,7 @@ export const register: Register = on => {
       const term = (await $.env.get('TERM')) ?? ''
       const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '' })
       state.terminalName = terminal
+      state.isForced = /^(1|true|on|yes)$/i.test((await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) ?? '')
       // iTerm2 draws pictures from bytes only, never from a file it's named.
       if (terminal === 'iterm2') state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)

@@ -364,7 +364,7 @@ function probe($: EngineInterface, site: string, key: string, pic: Pic) {
     event('probe', { deny: r.deny ?? null, bytes: 'png' in pic.src })
     if (r.deny && /alt/i.test(r.deny)) {
       state.canImage = false
-      state.drawCause = causeOf(state.inTmux, state.terminalName)
+      state.drawCause = causeOf(state.inTmux, state.terminalName, state.isForced)
       track('cannot_draw', { cause: state.drawCause })
       $.ui.toast("Pictures can't show here: see the notice in the chat.")
       redraw($)
@@ -1223,14 +1223,16 @@ export const resumeCommand = (id: string) =>
 
 // Why pictures can't draw here: tmux, a terminal that can't draw Claude
 // Code's pictures, or a background session.
-export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'terminal' | 'background' | 'desktop'
+export type DrawCause = 'tmux' | 'herdr' | 'iterm' | 'rex' | 'terminal' | 'background' | 'desktop'
 
 // Claude Code draws every picture with kitty Unicode placeholders (a=T,U=1),
-// which only Ghostty and kitty paint. Warp, WezTerm and Konsole speak the
+// which Ghostty, kitty and Rex paint (Rex only once Claude Code is started
+// with CLAUDE_CODE_FORCE_TERMINAL_IMAGES: it doesn't know Rex by name, so it
+// leaves pictures off there otherwise). Warp, WezTerm and Konsole speak the
 // kitty graphics protocol but not placeholders: forced on with
 // CLAUDE_CODE_FORCE_TERMINAL_IMAGES, Warp draws a grid of boxes instead of
 // the picture (#10). So pictures stay off there, known before the first one.
-export const DRAWS_PICTURES = ['ghostty', 'kitty']
+export const DRAWS_PICTURES = ['ghostty', 'kitty', 'rex']
 export const NO_PLACEHOLDERS: Record<string, string> = { warp: 'Warp', wezterm: 'WezTerm', konsole: 'Konsole' }
 // 0.6.7 to 0.6.9 offered Turn on pictures in those terminals, which added this
 // marked line to the shell profile. It only made the boxes appear, so it's
@@ -1261,11 +1263,13 @@ export async function removePicturesLine($: EngineInterface) {
 
 // Herdr, like tmux, sits between Claude Code and the terminal: pictures get
 // through only with its kitty graphics pass-through on, to a terminal that
-// draws them.
-export const causeOf = (tmux: boolean, terminal: string): DrawCause =>
+// draws them. In Rex, a failed draw without FORCE is Claude Code leaving
+// pictures off; with it, a background session.
+export const causeOf = (tmux: boolean, terminal: string, isForced = false): DrawCause =>
   tmux ? 'tmux'
     : terminal === 'herdr' ? 'herdr'
     : terminal === 'iterm2' ? 'iterm'
+    : terminal === 'rex' && !isForced ? 'rex'
     : DRAWS_PICTURES.includes(terminal) ? 'background'
     : 'terminal'
 
@@ -1275,6 +1279,7 @@ export function terminalOf(env: { program: string; term: string; kitty: boolean;
   // LC_TERMINAL also crosses ssh.
   if (/iterm/i.test(program) || /^iTerm2$/i.test(env.lcTerminal ?? '')) return 'iterm2'
   if (/ghostty/i.test(program + term)) return 'ghostty'
+  if (/^rex$/i.test(program)) return 'rex'
   if (/kitty/i.test(term) || env.kitty) return 'kitty'
   if (/wezterm/i.test(program)) return 'wezterm'
   if (/warp/i.test(program)) return 'warp'
@@ -1309,6 +1314,14 @@ export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'vide
     text: `"${name}" is ready. Type /tui fullscreen to switch Claude Code to its fullscreen view (it restarts and resumes this chat), then ask Claude to show it again. Needs iTerm2 3.5 or later.`,
     command: '/tui fullscreen', label: 'Copy command', action: 'copy_tui_fullscreen',
     claude: `iTerm2 only draws pictures in Claude Code's fullscreen view, so the person saw a notice instead of ${name}. They can type /tui fullscreen and ask again.`,
+  }
+  // Rex paints Claude Code's pictures, but Claude Code only sends them there
+  // when started with FORCE (it reads it at launch only).
+  if (cause === 'rex') return {
+    title: `Restart Claude Code to show ${what} in Rex`,
+    text: `"${name}" is ready, but Claude Code keeps ${what} off in Rex until it's started with ${what} turned on. Press Copy command, type /exit, and paste it here to reopen this chat with them on.`,
+    command: `${FORCE}=1 claude --resume${id ? ` ${id}` : ''}`, label: 'Copy command', action: 'copy_resume_command',
+    claude: `Claude Code keeps pictures off in Rex unless it starts with ${FORCE}=1, so the person saw a notice instead of ${name}. They can restart Claude Code with ${FORCE}=1 to see it.`,
   }
   // The desktop app's Code tab draws the plugin's card but not its pictures
   // (#18): the file opens in the system viewer instead.

@@ -64,7 +64,9 @@ export const state = {
   // SHOW_YOUR_WORK_DEBUG=1 (see debug in telemetry.ts).
   isDebug: false,
   terminalName: '',
-  // Inside tmux, the terminal around it (`ghostty`, `kitty`, or '').
+  // CLAUDE_CODE_FORCE_TERMINAL_IMAGES was set when Claude Code started.
+  isForced: false,
+  // Inside tmux, the terminal around it (`ghostty`, `kitty`, `rex`, or '').
   outerTerminal: '',
   // Usage stats: whether they're on, and the events waiting to go out.
   isOn: false,

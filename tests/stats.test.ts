@@ -54,6 +54,12 @@ test('a picture that cannot draw says why, and tells Claude it was not seen', ()
   // Herdr, like tmux, gets its own setting to copy.
   expect(causeOf(false, 'herdr')).toBe('herdr')
   expect(cantDraw('herdr', 'a.png', 'picture', 'id1').command).toBe('[terminal]\nkitty_graphics = true')
+  // Rex paints the pictures, but Claude Code sends them only when forced.
+  expect(causeOf(false, 'rex')).toBe('rex')
+  expect(causeOf(false, 'rex', true)).toBe('background')
+  expect(causeOf(true, 'rex')).toBe('tmux')
+  expect(cantDraw('rex', 'a.png', 'picture', 'id1').command).toBe('CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1 claude --resume id1')
+  expect(cantDraw('rex', 'a.png', 'video', 'id1').title).toBe('Restart Claude Code to show videos in Rex')
   // Only Ghostty and kitty paint Claude Code's placeholders; Warp, WezTerm and Konsole can't.
   expect(causeOf(false, 'kitty')).toBe('background')
   for (const t of ['wezterm', 'warp', 'konsole']) expect(causeOf(false, t)).toBe('terminal')
@@ -70,7 +76,7 @@ test('a picture that cannot draw says why, and tells Claude it was not seen', ()
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').link?.href).toBe('https://github.com/iamumeransari/claude-show-your-work#terminals')
   expect(cantDraw('terminal', 'a.png', 'picture', 'id1').claude.includes('#terminals')).toBe(true)
   expect(cantDraw('background', 'a.png', 'video', 'id1').command.includes('--resume id1')).toBe(true)
-  for (const cause of ['tmux', 'herdr', 'terminal', 'background'] as const) expect(cantDraw(cause, 'a.png', 'picture', '').claude.includes('saw a notice')).toBe(true)
+  for (const cause of ['tmux', 'herdr', 'rex', 'terminal', 'background'] as const) expect(cantDraw(cause, 'a.png', 'picture', '').claude.includes('saw a notice')).toBe(true)
 })
 
 test('Linux gets its own ffmpeg notice, with a package manager instead of Homebrew', () => {
@@ -123,6 +129,7 @@ test('the terminal is recognised from what it sets in the environment', () => {
   expect(terminalOf(env({ program: 'Apple_Terminal' }))).toBe('apple_terminal')
   expect(terminalOf(env({}))).toBe('other')
   expect(terminalOf(env({ program: 'iTerm.app' }))).toBe('iterm2')
+  expect(terminalOf(env({ program: 'rex', term: 'xterm-256color' }))).toBe('rex')
   // Over ssh only LC_TERMINAL is left.
   expect(terminalOf(env({ lcTerminal: 'iTerm2' }))).toBe('iterm2')
   expect(causeOf(false, 'iterm2')).toBe('iterm')
@@ -140,6 +147,7 @@ test('Warp says it is Warp that cannot draw, and points to Ghostty and kitty', (
 test('the terminal around tmux is read from the version it told tmux', () => {
   expect(outerOf('ghostty 1.2.3')).toBe('')
   expect(outerOf('kitty(0.35.2)')).toBe('')
+  expect(outerOf('rex 0.0.1793645657-gd018d2')).toBe('')
   expect(outerOf('WezTerm 20240203-110809-5046fc22')).toBe('wezterm')
   expect(outerOf('Konsole 24.08')).toBe('konsole')
   expect(outerOf('')).toBe('')

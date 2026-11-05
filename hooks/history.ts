@@ -6,6 +6,7 @@ import type { KeyChange, Shown } from '../types'
 
 import { state } from './state'
 import { expand, keyOf, prepare, VIDEO } from './media'
+import { isDocument, prepareDocument } from './document'
 
 export const MARK = 'show-your-work:'
 
@@ -195,7 +196,9 @@ export const prepared = new Map<string, Shown>()
 export async function preparedOf($: EngineInterface, path: string): Promise<Shown> {
   const known = prepared.get(path)
   if (known) return known
-  const made = await prepare($, path, 'Original')
+  // A document's Original side is its own first page; the picture preparer
+  // cannot read a .pdf or .md at all.
+  const made = isDocument(path) ? await prepareDocument($, path, 'Original', path) : await prepare($, path, 'Original')
   remember(path, made)
   return made
 }

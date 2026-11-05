@@ -183,7 +183,7 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // profile: the person's running browser never takes the window over, and the
 // viewer carries none of their logins.
 export const htmlOpenArgv = (chrome: string, page: string) => [
-  chrome, `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  chrome, '--no-first-run', '--no-default-browser-check', `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
 ]
 export const htmlArgv = (chrome: string, page: string, png: string) => [

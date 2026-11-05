@@ -484,7 +484,7 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // profile: the person's running browser never takes the window over, and the
 // viewer carries none of their logins.
 export const htmlOpenArgv = (chrome: string, page: string) => [
-  chrome, `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  chrome, '--no-first-run', '--no-default-browser-check', `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
 ]
 export const htmlArgv = (chrome: string, page: string, png: string) => [
@@ -1606,6 +1606,309 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   return { kind: 'image', path: png, source: real, ...(await pngSize($, png)), sourceWidth: dims.width, sourceHeight: dims.height, title: name, generation: state.generation }
 }
 
+// ── document.ts ───────────────────────────────────────────────────────────
+// Documents shown as pages: a PDF rasterized a page at a time, and Markdown
+// or a Mermaid file printed to a PDF first, through the same pages. The
+// page's HTML is built here from escaped text only; the only script it runs
+// is the plugin's own pinned copy of Mermaid, offline.
+
+
+
+export const DOCUMENT = /\.(pdf|md|markdown|mmd|mermaid)$/i
+export const isDocument = (path: string) => DOCUMENT.test(path)
+export const isPrinted = (path: string) => /\.(md|markdown|mmd|mermaid)$/i.test(path)
+
+// A page's width in pixels: portrait paper fits any card, and the terminal
+// never enlarges a picture, so one size serves every window.
+export const PAGE_WIDTH = 1100
+export const DOC_TIMEOUT_MS = 30000
+export const POPPLER_TIMEOUT_MS = 60000
+export const MD_MAX_BYTES = 1_048_576
+export const DOC_MAX_PAGES = 100
+
+// ── Markdown to HTML, escaped first ───────────────────────────────────────
+
+// A path into a file URL, percent-encoded a segment at a time: nothing in the
+// name can close the attribute or inject markup.
+const encodeDir = (path: string) => path.split('/').map(encodeURIComponent).join('/')
+
+const escapeText = (s: string) =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
+const inline = (raw: string) => {
+  let t = escapeText(raw)
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>')
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+  t = t.replace(/\*([^*]+)\*/g, '<i>$1</i>')
+  // A link's target is a page or a file only: anything with a scheme another
+  // than http(s), and any scheme a browser might act on, is refused.
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, href: string) =>
+    /^https?:\/\//i.test(href) ? `<a href="${href}">${label}</a>` : label)
+  return t
+}
+
+export function markdownBody(text: string): string {
+  return parseMarkdown(text).body
+}
+
+function parseMarkdown(text: string): { body: string; diagrams: string[] } {
+  const diagrams: string[] = []
+  const body = text.replace(/\r\n/g, '\n')
+
+  const out: string[] = []
+  let codeLines: string[] | null = null
+  let codeKind = ''
+  let inQuote = false
+  let list: 'ul' | 'ol' | null = null
+  let listItems: string[] = []
+  const closeList = () => { if (list) { out.push(`<${list}>${listItems.join('')}</${list}>`); list = null; listItems = [] } }
+  const cells = (row: string) => row.replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+  const lines = body.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i]!.trim()
+    if (s.startsWith('```')) {
+      closeList()
+      if (inQuote) { out.push('</blockquote>'); inQuote = false }
+      if (codeLines !== null) {
+        if (codeKind === 'mermaid') { diagrams.push(codeLines.join('\n')); out.push(`<div class="mmd" data-i="${diagrams.length - 1}"></div>`) }
+        else out.push(`<pre><code>${codeLines.map(escapeText).join('\n')}</code></pre>`)
+        codeLines = null
+      } else { codeLines = []; codeKind = s.slice(3).trim().toLowerCase() }
+      continue
+    }
+    if (codeLines !== null) { codeLines.push(lines[i]!); continue }
+    const head = /^(#{1,6})\s+(.*)$/.exec(s)
+    if (head) { closeList(); if (inQuote) { out.push('</blockquote>'); inQuote = false } out.push(`<h${head[1]!.length}>${inline(head[2]!)}</h${head[1]!.length}>`); continue }
+    // A table: a header row, a --- row, at least one body row.
+    const isRow = (l: string) => /^\|.*\|$/.test(l)
+    if (isRow(s) && /^\|[\s:|-]+\|$/.test(lines[i + 1]?.trim() ?? '') && lines[i + 2] !== undefined && isRow(lines[i + 2]!.trim())) {
+      closeList()
+      const head = cells(s)
+      const rows: string[][] = []
+      let k = i + 2
+      while (k < lines.length && isRow(lines[k]!.trim())) { rows.push(cells(lines[k]!.trim())); k++ }
+      out.push(`<table><thead><tr>${head.map(c => `<th>${inline(c)}</th>`).join('')}</tr></thead><tbody>`)
+      for (const r of rows) out.push(`<tr>${r.map(c => `<td>${inline(c)}</td>`).join('')}</tr>`)
+      out.push('</tbody></table>')
+      i = k - 1
+      continue
+    }
+    const li = /^[-*]\s+(.*)$/.exec(s)
+    if (li) {
+      if (inQuote) { out.push('</blockquote>'); inQuote = false }
+      if (list !== 'ul') { closeList(); list = 'ul' }
+      listItems.push(`<li>${inline(li[1]!)}</li>`)
+      continue
+    }
+    const oi = /^\d+\.\s+(.*)$/.exec(s)
+    if (oi) {
+      if (inQuote) { out.push('</blockquote>'); inQuote = false }
+      if (list !== 'ol') { closeList(); list = 'ol' }
+      listItems.push(`<li>${inline(oi[1]!)}</li>`)
+      continue
+    }
+    if (s.startsWith('>')) {
+      closeList()
+      if (!inQuote) { out.push('<blockquote>'); inQuote = true }
+      out.push(`${inline(s.replace(/^>\s?/, ''))}<br>`)
+      continue
+    }
+    if (inQuote) { out.push('</blockquote>'); inQuote = false }
+    if (s === '---') { closeList(); out.push('<hr>'); continue }
+    if (!s) { closeList(); continue }
+    closeList()
+    out.push(`<p>${inline(s)}</p>`)
+  }
+  closeList()
+  if (inQuote) out.push('</blockquote>')
+  if (codeLines !== null) out.push(`<pre><code>${codeLines.map(escapeText).join('\n')}</code></pre>`)
+  return { body: out.join('\n'), diagrams }
+}
+
+// ── The printed page ──────────────────────────────────────────────────────
+
+const scriptJson = (xs: string[]) =>
+  JSON.stringify(xs).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+
+export function documentHtml(text: string, title: string, base: string, mermaidPath: string, bare = false): string {
+  const parsed = bare ? { body: '<div class="mmd wide" data-i="0"></div>', diagrams: [text] } : parseMarkdown(text)
+  const body = parsed.body
+  const graphs = scriptJson(parsed.diagrams)
+  const doc = `<!doctype html><meta charset="utf-8"><title>${escapeText(title)}</title>
+<base href="file://${encodeDir(base)}">
+<style>@page{margin:18mm 16mm}
+:root{--ink:#1a1d23;--dim:#5b6472;--line:#e3e6ea;--wash:#f5f6f8}
+html{-webkit-text-size-adjust:100%}
+body{font:15px/1.6 -apple-system,'Segoe UI',Helvetica,sans-serif;margin:0 auto;padding:28px 36px 40px;max-width:820px;box-sizing:border-box;color:var(--ink);${bare ? 'text-align:center' : ''}}
+@media print{body{padding:0;max-width:none;margin:0}}
+h1,h2,h3,h4{line-height:1.25;margin:1.6em 0 .55em;letter-spacing:-.01em}
+h1{font-size:1.9em;margin-top:.2em}h2{font-size:1.35em;border-bottom:1px solid var(--line);padding-bottom:.25em}h3{font-size:1.12em}h4{font-size:1em}
+p{margin:.7em 0}
+ul,ol{margin:.7em 0;padding-left:1.5em}li{margin:.25em 0}
+pre{background:var(--wash);border:1px solid var(--line);padding:12px 14px;border-radius:8px;font:12.5px/1.55 ui-monospace,'Cascadia Mono',monospace;white-space:pre-wrap;overflow-x:auto}
+code{font:0.92em ui-monospace,'Cascadia Mono',monospace;background:var(--wash);border:1px solid var(--line);border-radius:4px;padding:.08em .35em}
+pre code{border:0;background:none;padding:0;font-size:1em}
+blockquote{border-left:3px solid #b9bfc9;margin:1em 0;padding:.35em 1em;color:var(--dim)}
+table{border-collapse:collapse;margin:1em 0;font-size:.95em}th,td{border:1px solid var(--line);padding:6px 12px;text-align:left}th{background:var(--wash)}tr:nth-child(even) td{background:#fafbfc}
+a{color:#0b57d0;text-decoration:none}a:hover{text-decoration:underline}
+hr{border:0;border-top:1px solid var(--line);margin:1.8em 0}
+.mmd{margin:1.2em 0}.mmd.wide{margin:0}.mmd svg{max-width:100%}</style>
+${body}
+<script src="file://${encodeDir(mermaidPath)}"></script>
+<script>mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:'neutral'});
+const G=${graphs};const all=[...document.querySelectorAll('.mmd')];
+(async()=>{for(const el of all){try{el.innerHTML=(await mermaid.render('m'+el.dataset.i,G[+el.dataset.i])).svg}catch(e){el.innerHTML='<pre class="mmd-error"></pre>';el.dataset.error=String(e)}el.removeAttribute('data-i')}
+const ok=!document.querySelector('.mmd-error');document.documentElement.setAttribute('data-syw-document',ok?'ready':'error');document.title='R'+all.length+(ok?'':'E')})()</script>`
+  return doc
+}
+
+// ── The commands that make the pages ──────────────────────────────────────
+
+export const pdfInfoArgv = (pdfinfo: string, pdf: string) => [pdfinfo, pdf]
+export const pdfPageArgv = (pdftoppm: string, pdf: string, dir: string, page: number, width = PAGE_WIDTH) => [
+  pdftoppm, '-png', '-scale-to-x', String(width), '-scale-to-y', '-1',
+  '-f', String(page), '-l', String(page), '-singlefile', pdf,
+  `${dir}/p${String(page).padStart(5, '0')}`,
+]
+// The print run prints the page and returns its rendered DOM in the same
+// load, through a profile of the plugin's own: the person's profile is never
+// touched, and the readiness verdict is about the very page that printed.
+export const docPrintArgv = (chrome: string, html: string, pdf: string) => [
+  chrome, '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+  `--user-data-dir=${pdf}.profile`, '--virtual-time-budget=8000',
+  `--print-to-pdf=${pdf}`, '--no-pdf-header-footer', '--dump-dom', html,
+]
+
+// How a document's preparation failed, in words the person and Claude get.
+export const docErrorOf = (why: string, name: string) => {
+  if (why === 'poppler') return { kind: 'other' as const, message: `documents need poppler's pdftoppm and pdfinfo, which aren't installed. Install them (for example \`sudo apt install poppler-utils\` or \`brew install poppler\`), restart Claude Code, then show ${name} again.` }
+  if (why === 'chrome') return { kind: 'other' as const, message: `markdown documents need Chrome or Chromium, and none was found. Install one, restart Claude Code, then show ${name} again.` }
+  if (why === 'pages') return { kind: 'other' as const, message: `${name} has more than ${DOC_MAX_PAGES} pages, more than the player shows. Show a shorter extract of it instead.` }
+  if (why === 'mermaid') return { kind: 'other' as const, message: `${name} has a Mermaid diagram that could not be drawn, so the document was not shown. Fix the diagram's syntax and show it again.` }
+  return { kind: 'other' as const, message: `${name} couldn't be read as a document: ${why}` }
+}
+
+// Reads the page count out of pdfinfo's output.
+export function docPageCount(facts: string): number {
+  const m = /^Pages:\s+(\d+)/m.exec(facts)
+  return m ? Number(m[1]) : 0
+}
+
+// The page as text after printing. The page's own script marks the document
+// element 'ready' once every diagram holder has been drawn (or 'error' when
+// one failed); no marker means the script never ran. Reading loose text here
+// would let a person's own words fake a verdict.
+export const domIsReady = (dom: string) => dom.includes('data-syw-document="ready"')
+export const domHasError = (dom: string) => dom.includes('data-syw-document="error"')
+
+// ── Preparing a document ──────────────────────────────────────────────────
+
+
+// The rendered page's look. Bump this when documentHtml's output changes:
+// the cache folder's name carries it, so every file re-renders once with the
+// new look while the old folders wait for the week-old cleanup.
+const DOC_STYLE = 'v3'
+
+function mermaidAsset($: EngineInterface) { return `${$.plugin.root}/assets/vendor/mermaid.min.js` }
+
+// One document, prepared once per file: page one is rasterized now, the rest
+// when they are asked for (see pageAt). The printed PDF of a Markdown file is
+// built beside its pages and moved into place whole.
+let docAttempt = 0
+const docSession = Math.random().toString(36).slice(2)
+
+export async function prepareDocument($: EngineInterface, real: string, title: string, originOf?: string): Promise<Shown> {
+  const name = real.split('/').pop() || real
+  if (!(await exists($, state.pdftoppm)) || !(await exists($, state.pdfinfo))) throw new Error(docErrorOf('poppler', name).message)
+  const printed = isPrinted(real)
+  if (printed && !state.chrome) throw new Error(docErrorOf('chrome', name).message)
+
+  const id = ((await identityOf($, originOf ?? real).catch(() => undefined) ?? keyOf(originOf ?? real)).slice(0, 10))
+  const dir = `${state.TMP}/d-${DOC_STYLE}-${id}`
+  const html = `${dir}.html`
+  const pdf = printed ? `${dir}.pdf` : real
+  const first = `${dir}/f00001.png`
+  // This attempt's own names: two preparations of one file never write where
+  // the other writes (the attempt map in sound.ts is the same pattern).
+  const attempt = docSession + Date.now().toString(36) + (docAttempt += 1).toString(36)
+
+  const facts = await $.process.run(pdfInfoArgv(state.pdfinfo, printed ? `${pdf}` : real))
+  // A printed document has no PDF yet on its first show; the count comes after
+  // the print. A PDF file's count is known up front.
+  let count = 0
+  if (facts.exitCode === 0) count = docPageCount(facts.stdout)
+  if (!printed && (facts.exitCode !== 0 || count < 1)) throw new Error(docErrorOf('PDF is unreadable, empty or password protected', name).message)
+  if (count > DOC_MAX_PAGES) throw new Error(docErrorOf('pages', name).message)
+
+  if (await isGone($, first)) {
+    if (printed) {
+      const text = String(await $.fs.read(real).catch(() => {
+        throw new Error(docErrorOf('could not be read', name).message)
+      }))
+      if (text.length > MD_MAX_BYTES) throw new Error(docErrorOf(`is larger than the ${MD_MAX_BYTES >> 10} KiB the player prints`, name).message)
+      const base = real.slice(0, real.lastIndexOf('/'))
+      const partHtml = `${dir}.${attempt}.html`
+      const partPdf = `${dir}.${attempt}.part.pdf`
+      await $.fs.write(partHtml, documentHtml(text, title, base, mermaidAsset($), /\.(mmd|mermaid)$/i.test(real)))
+      const print = await $.process.run(docPrintArgv(state.chrome, partHtml, partPdf), { timeoutMs: DOC_TIMEOUT_MS })
+      await $.process.run(['rm', '-rf', '--', `${partPdf}.profile`]).catch(() => undefined)
+      if (print.exitCode !== 0) throw new Error(docErrorOf(`the browser could not print it (${print.stderr.trim().slice(0, 120)})`, name).message)
+      if (domHasError(print.stdout) || !domIsReady(print.stdout)) throw new Error(docErrorOf('mermaid', name).message)
+      if ((await $.process.run(['mv', '-f', partPdf, pdf])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
+      if ((await $.process.run(['mv', '-f', partHtml, html])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
+      const printedFacts = await $.process.run(pdfInfoArgv(state.pdfinfo, pdf))
+      const printedCount = docPageCount(printedFacts.stdout)
+      if (printedFacts.exitCode !== 0 || printedCount < 1) throw new Error(docErrorOf('was printed with no pages', name).message)
+      if (printedCount > DOC_MAX_PAGES) throw new Error(docErrorOf('pages', name).message)
+      count = printedCount
+    }
+    await $.process.run(['mkdir', '-p', dir])
+    const moved1 = await rasterPage($, pdf, dir, 1)
+    if (moved1 !== first) throw new Error(docErrorOf('poppler could not rasterize page 1', name).message)
+  }
+  const size = await pngSize($, first)
+  return {
+    kind: 'document', path: first, source: real, width: size.width, height: size.height,
+    title, generation: ++state.generation, pages: { dir, count, pdf },
+    ...(printed ? { documentOpen: html } : {}),
+  }
+}
+
+// The rendered page a document opens, refreshed using the current generator
+// even when the card itself was saved before the plugin was reloaded.
+export async function documentView($: EngineInterface, media: Shown): Promise<string | null> {
+  const source = media.origin ?? media.source
+  if (!source) return null
+  const fresh = await prepareDocument($, source, media.title)
+  return fresh.documentOpen ?? null
+}
+
+// The raster of one page, made when it is first asked for. A printed document
+// rasterizes from its own printed PDF, not from the Markdown or Mermaid file:
+// poppler cannot read those. Pages sit beside each other in the document's
+// own folder, so the week-old cleanup takes the whole document together.
+export async function docPage($: EngineInterface, media: Shown, page: number): Promise<string | null> {
+  const pages = media.pages
+  const pdf = pages?.pdf ?? media.source
+  if (!pages || !pdf) return null
+  const at = Math.max(0, Math.min(page, pages.count - 1))
+  const file = `${pages.dir}/f${String(at + 1).padStart(5, '0')}.png`
+  if (!(await exists($, file))) return await rasterPage($, pdf, pages.dir, at + 1) === file ? file : null
+  return file
+}
+
+// Renders one page to a side name and moves it into place whole: a render
+// that dies midway never leaves a half-written page behind as a cached page.
+async function rasterPage($: EngineInterface, pdf: string, dir: string, page: number): Promise<string | null> {
+  await $.process.run(['mkdir', '-p', dir]).catch(() => undefined)
+  const final = `${dir}/f${String(page).padStart(5, '0')}.png`
+  const part = `${dir}/p${String(page).padStart(5, '0')}`
+  const made = await $.process.run(pdfPageArgv(state.pdftoppm, pdf, dir, page), { timeoutMs: POPPLER_TIMEOUT_MS })
+  if (made.exitCode !== 0) return null
+  if ((await $.process.run(['mv', '-f', `${part}.png`, final])).exitCode !== 0) return null
+  return (await isGone($, final)) ? null : final
+}
+
 // ── history.ts ────────────────────────────────────────────────────────────
 // Version history: every shown file kept in .show-your-work/, linked to the
 // one before, and the shown item a result's marker points to.
@@ -1800,7 +2103,9 @@ export const prepared = new Map<string, Shown>()
 export async function preparedOf($: EngineInterface, path: string): Promise<Shown> {
   const known = prepared.get(path)
   if (known) return known
-  const made = await prepare($, path, 'Original')
+  // A document's Original side is its own first page; the picture preparer
+  // cannot read a .pdf or .md at all.
+  const made = isDocument(path) ? await prepareDocument($, path, 'Original', path) : await prepare($, path, 'Original')
   remember(path, made)
   return made
 }
@@ -2986,6 +3291,26 @@ function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: 
   return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{image}</Box>
 }
 
+// A document's pages: back and forward, with the count between them. Nothing
+// plays and nothing sounds; a page is a picture the reader turns to.
+function Pager(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number) {
+  const { Box, Text, Button } = ui
+  const one = player(site)
+  const pages = media.pages!
+  const at = Math.min(one.frame, pages.count - 1)
+  const go = (to: number) => {
+    one.frame = Math.max(0, Math.min(to, pages.count - 1))
+    redraw($, site)
+  }
+  return (
+    <Box flexDirection="row" flexWrap="nowrap" width={width} columnGap={2}>
+      {pages.count > 1 && <Button key="prev" plain dimColor={at === 0} label="‹ Prev" onPress={() => { act('page_prev'); go(at - 1) }} />}
+      <Text dimColor>{` Page ${at + 1} of ${pages.count} `}</Text>
+      {pages.count > 1 && <Button key="next" plain dimColor={at >= pages.count - 1} label="Next ›" onPress={() => { act('page_next'); go(at + 1) }} />}
+    </Box>
+  )
+}
+
 // The scrub row: the play control, elapsed, a clickable bar, total — exactly
 // as wide as the picture.
 function Scrub(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number, shown?: Shown) {
@@ -3539,8 +3864,8 @@ export function terminalOf(env: { program: string; term: string; kitty: boolean;
 // The README's list of terminals that draw pictures.
 const TERMINALS = 'https://github.com/iamumeransari/claude-show-your-work#terminals'
 
-export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video' | 'audio', id: string) {
-  const what = kind === 'video' ? 'videos' : kind === 'audio' ? 'audio' : 'pictures'
+export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video' | 'audio' | 'document', id: string) {
+  const what = kind === 'video' ? 'videos' : kind === 'audio' ? 'audio' : kind === 'document' ? 'documents' : 'pictures'
   // Claude Code keeps pictures off inside tmux unless FORCE is set at launch;
   // with it, the plugin passes them through (see tmux.ts).
   if (cause === 'tmux') return {
@@ -3684,7 +4009,13 @@ export async function Viewer(
   const ui = $.ui.resolve(e) as Ui
   const { Box, Text, Button, Link } = ui
   const one = player(site)
-  const media = sideOf(shown, site)
+  const baseMedia = sideOf(shown, site)
+  const docPages = baseMedia.pages
+  let media = baseMedia
+  if (docPages) {
+    const file = await docPage($, baseMedia, one.frame)
+    if (file) media = { ...baseMedia, path: file, source: file, origin: baseMedia.origin ?? baseMedia.source, ...(await pngSize($, file)), generation: baseMedia.generation + one.frame }
+  }
   const frames = media.frames
   const source = media.origin ?? media.source ?? media.path
   const columns = viewport?.columns ?? 100
@@ -3695,7 +4026,7 @@ export async function Viewer(
   // Each side is drawn from the copy that fits its box (see fitCopy).
   // iTerm2 scales a picture into its box itself, so it never needs a copy
   // fitted to the box (which also shrank the box after the first draw).
-  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side) fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
@@ -3779,28 +4110,39 @@ export async function Viewer(
   const hasSound = !!track && track.status !== 'none'
   if (soundUsable() && frames && !track) void $.clock.sleep(SHARPEN_DELAY_MS).then(() => probeSound($, media.source, frames)).then(t => { if (t && t.status !== 'none') redraw($, site) }, () => undefined)
   const actions = Actions(ui, $, media, source, isNarrow)
-  // The top corner opens it: the page it shows, else the file itself.
-  // Only a web address opens as a page: a model's url could name an app, a
-  // script or an option for `open`.
+  // The top corner opens it: the page it shows, a document its rendered page,
+  // else the file itself. Only a web address opens as a page: a model's url
+  // could name an app, a script or an option for `open`.
   const at = urlAt(media, frames ? one.frame / frames.fps : 0)
   const page = (at && /^https?:\/\/[^\s]+$/i.test(at) ? at : undefined) ?? (/\.html?$/i.test(source) ? source : undefined)
+  // A printed document's rendered page: the same preview the card shows, as
+  // its own small window — the raw Markdown would land in a text editor.
+  const rendered = media.kind === 'document' ? media.documentOpen : undefined
   const opener = (
     <Button
       key="page"
       plain
-      label={page ? '↗ Open page' : '↗ View'}
-      onPress={() => {
+      label={rendered ? '↗ Open document' : page ? '↗ Open page' : '↗ View'}
+      onPress={async () => {
         // Watched elsewhere now: the video here pauses.
         if (one.timer) stop($, site)
+        // Refresh an old card's printed preview after plugin updates. Never
+        // silently fall back to stale HTML if regeneration fails.
+        let target = rendered ?? page
+        if (rendered) {
+          try { target = await documentView($, baseMedia) ?? undefined }
+          catch (error) { $.ui.toast(`Could not open document: ${String(error).slice(0, 160)}`); return }
+          if (!target) { $.ui.toast('Could not prepare the document preview.'); return }
+        }
         // A local page opens in its own small window, the way an image opens
         // in an image viewer: the same engine that rendered the preview, as
         // a standalone viewer with no tabs and no desktop file-handler say.
-        const artifact = page && /\.html?$/i.test(source) && state.chrome && !state.isMac
+        const artifact = (rendered || (page && /\.html?$/i.test(source))) && state.chrome && !state.isMac
         const argv = artifact
-          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
-          : openArgv(page ?? source)
-        act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
-          $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', page ?? source)),
+          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, target!)]
+          : openArgv(target ?? source)
+        void $.process.run(argv).then(r =>
+          $.ui.toast(r.exitCode === 0 ? `Opened ${(target ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, target ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', target ?? source)),
         )
       }}
     />
@@ -3815,6 +4157,7 @@ export async function Viewer(
   const stage = (
     <Box flexDirection="column" width={rowWidth} alignItems="center">
       {Picture(ui, $, site, shown, media, own, pic, box)}
+      {docPages && Pager(ui, $, site, media, rowWidth)}
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
@@ -3942,9 +4285,9 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : tool.endsWith('audio') ? (isRunning ? 'Cutting audio' : 'Audio') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : tool.endsWith('audio') ? (isRunning ? 'Cutting audio' : 'Audio') : tool.endsWith('document') ? (isRunning ? 'Rasterizing document' : 'Document') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : tool.endsWith('audio') ? '♪' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : tool.endsWith('audio') ? '♪' : tool.endsWith('document') ? '▦' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }
 
 // ── state.ts ──────────────────────────────────────────────────────────────
@@ -4007,6 +4350,10 @@ export const state = {
   ffplay: '',
   isFarFromSpeakers: false,
   isSoundOn: true,
+  // Poppler's tools, found like ffmpeg: a PDF's pages and every document's
+  // page count come from them.
+  pdftoppm: '',
+  pdfinfo: '',
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',
@@ -4816,7 +5163,7 @@ export function setUp($: EngineInterface): Promise<void> {
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"; echo "pp=$(command -v pdftoppm)"; echo "pi=$(command -v pdfinfo)"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
@@ -4827,6 +5174,8 @@ export function setUp($: EngineInterface): Promise<void> {
     state.ffprobe = got('fp') || (state.isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
     state.claudePath = got('cl')
     state.chrome = got('ch') || (state.isMac ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '')
+    state.pdftoppm = got('pp') || (state.isMac ? '/opt/homebrew/bin/pdftoppm' : '')
+    state.pdfinfo = got('pi') || (state.isMac ? '/opt/homebrew/bin/pdfinfo' : '')
     state.hasVideoTools = false
     // Over ssh the terminal can't read this machine's files: pictures go as bytes.
     const sshConnection = await Promise.resolve().then(() => $.env.get('SSH_CONNECTION')).catch(() => undefined)
@@ -4851,7 +5200,7 @@ export function setUp($: EngineInterface): Promise<void> {
 
 const PANE = 'show-your-work'
 // The tools, and their names from before the rename, so old windows still draw.
-const TOOLS = ['show_image', 'show_video', 'show_html', 'show_audio'].map(t => `mcp__show-your-work__${t}`)
+const TOOLS = ['show_image', 'show_video', 'show_html', 'show_audio', 'show_document'].map(t => `mcp__show-your-work__${t}`)
 // Screenshots and recordings made only to be shown go to the temp folder, so
 // they don't pile up in the project; the history keeps its own copy.
 const SCRATCH_NOTE = 'Save screenshots and recordings you make to show here in a temporary folder, such as $TMPDIR or /tmp, not in the project. Save them in the project only when the user asks to keep them, or when the project already has a folder for them, such as one for test screenshots.'
@@ -5003,6 +5352,17 @@ export const register: Register = on => {
       description: 'Play an audio file in the chat: /audio <path>',
       argumentHint: '<path>',
     })
+    await $.command.register({
+      name: 'doc',
+      description: 'Show a PDF, Markdown or Mermaid document in the chat: /doc <path>',
+      argumentHint: '<path>',
+    })
+    await $.tool.register({
+      name: 'show_document',
+      description: `Shows a local document inline in the terminal, as pages the person can turn through. Accepts PDF, Markdown (.md or .markdown) and Mermaid (.mmd or .mermaid); Mermaid fenced blocks in Markdown become diagrams. Use it when the user asks to see or read a report, a PDF, a Markdown document or a diagram you wrote. The person sees the pages; you do not. Pass path and an optional title. There is no playback: Previous/Next turn pages. PDF needs poppler (pdftoppm, pdfinfo); Markdown and Mermaid also need Chrome or Chromium, with Mermaid shipped offline. ${SCRATCH_NOTE}`,
+      inputSchema: IMAGE_INPUT,
+      isDeferred: false,
+    })
     await $.tool.register({
       name: 'show_html',
       description: 'Shows a local HTML file as a static preview inline in the terminal, using Chrome or Chromium. Accepts .html and .htm files. The preview is a fixed 1280 by 800 viewport, not an interactive page: scrolling, forms and sound work only after the person chooses Open page in their browser. Use it for HTML reports, page designs and small artifacts you have made. Pass path and an optional title; changes, summary and previous work as for show_image. No URL navigation. The file may execute scripts while Chrome renders it; use only pages you intend to render. The person sees the preview; you do not.',
@@ -5139,7 +5499,27 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html|audio)$/ }, async ($, e) => {
+  on('command.run', { command: 'doc' }, async ($, invoked) => {
+    await setUp($)
+    const arg = expand(invoked.args.trim(), state.cwd, state.home)
+    if (!invoked.args.trim()) return { text: 'Usage: /doc <path to a local .pdf, .md or .mmd file>' }
+    if (!isDocument(arg)) return { text: 'Documents are .pdf, .md, .markdown, .mmd or .mermaid files. For images, videos and audio use /img <path>, for HTML pages /page <path>.' }
+    try {
+      const shown = await prepareDocument($, arg, arg.split('/').pop()!)
+      const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
+      shownById.set(id, shown)
+      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+
+      track('doc_command', { kind: 'document' })
+      return { text: `Showing ${shown.title} (${shown.pages?.count ?? 1} page${(shown.pages?.count ?? 1) === 1 ? '' : 's'}).\n${MARK}#${id}` }
+    } catch (err) {
+      const n = noticeOf(err, arg, state.home)
+      track('show_failed', { from: 'doc_command', reason: REASONS[n.kind] })
+      return { text: n.message }
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html|audio|document)$/ }, async ($, e) => {
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -5160,9 +5540,12 @@ export const register: Register = on => {
       // opens it.
       const page = isPage(input.path)
       const audio = isAudio(input.path)
+      const document = isDocument(input.path)
+      if (String((e as { tool?: string }).tool ?? '').endsWith('document') && !document)
+        throw new Error(`not a document: ${input.path}`)
       if (String((e as { tool?: string }).tool ?? '').endsWith('audio') && !audio)
         throw new Error(`not audio: ${input.path}`)
-      if (!MEDIA.test(input.path) && !page && !audio) throw new Error(`not an image: ${input.path}`)
+      if (!MEDIA.test(input.path) && !page && !audio && !document) throw new Error(`not an image: ${input.path}`)
       const pagePng = page ? await renderPage($, input.path, keyOf(`${input.path}|${await $.clock.now()}`).slice(0, 10)) : undefined
       const kept = await storeVersion($, pagePng ?? input.path!, note, input.title, parent)
         .catch(() => ({ real: pagePng ?? input.path!, copy: pagePng ?? input.path!, id: '', chain: [] as { path: string; note?: string; id: string }[], missing: undefined as string | undefined }))
@@ -5172,7 +5555,9 @@ export const register: Register = on => {
       const earlier = [...given, ...kept.chain.filter(k => !given.some(g => g.path === k.path))]
       const compare = input.compare ?? earlier.at(-1)?.path
       const shown: Shown = {
-        ...(await prepare($, kept.copy, input.title ?? (page ? `Artifact · ${input.path.split('/').pop()}` : input.path.split('/').pop()), await identityOf($, input.path))),
+        ...(document
+          ? await prepareDocument($, kept.copy, input.title ?? input.path.split('/').pop()!, input.path)
+          : await prepare($, kept.copy, input.title ?? (page ? `Artifact · ${input.path.split('/').pop()}` : input.path.split('/').pop()), await identityOf($, input.path))),
         origin: page ? input.path : kept.real,
         change: input.change,
         pr: input.pr,
@@ -5191,7 +5576,11 @@ export const register: Register = on => {
       if (compare) {
         const label = input.compare_label
         shown.compare = {
-          ...(input.compare ? await prepare($, compare, label ?? 'Original') : await preparedOf($, compare)),
+          ...(isDocument(compare)
+            ? await prepareDocument($, compare, label ?? 'Original', compare)
+            : input.compare
+              ? await prepare($, compare, label ?? 'Original')
+              : await preparedOf($, compare)),
           label,
           checks: input.compare_checks,
         }
@@ -5207,7 +5596,7 @@ export const register: Register = on => {
       }
       if (!shown.frames && kept.copy !== kept.real)
         remember(kept.copy, { kind: shown.kind, path: shown.path, source: shown.source, width: shown.width, height: shown.height, title: 'Original', generation: shown.generation })
-      const what = shown.kind === 'audio' ? `audio, ${clock(shown.frames!.duration)}` : shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
+      const what = shown.kind === 'audio' ? `audio, ${clock(shown.frames!.duration)}` : shown.kind === 'document' ? `document, ${shown.pages?.count ?? 1} pages` : shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
       const checks = [...(shown.checks ?? []), ...(shown.compare?.checks ?? [])]
       track(shown.frames ? 'video_shown' : 'image_shown', {
         format: (input.path.match(/\.([a-z0-9]+)$/i)?.[1] ?? 'none').toLowerCase().slice(0, 5),
@@ -5230,7 +5619,7 @@ export const register: Register = on => {
       const hint = (kept.missing ? ` #${kept.missing} wasn't found, so this has no history.` : '') + handle
       const opening = state.canImage
         ? `Shown: ${shown.title} (${what}).`
-        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.kind === 'audio' ? 'audio' : shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
+        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.kind === 'audio' ? 'audio' : shown.kind === 'document' ? 'document' : shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
@@ -5245,7 +5634,7 @@ export const register: Register = on => {
       if (copied) void $.process.run(['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
       const n = noticeOf(err, expand(input.path ?? '', state.cwd, state.home), state.home)
       notices.set(e.tool_use_id, n)
-      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : 'show_image', reason: REASONS[n.kind] })
+      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : String((e as { tool?: string }).tool ?? '').endsWith('document') ? 'show_document' : 'show_image', reason: REASONS[n.kind] })
       return { deny: `show-your-work: ${n.message}` }
     }
   }).catch(() => ({ deny: 'show-your-work: it could not be shown.' }))
@@ -5363,7 +5752,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const row = e.props as { command?: string; args?: string; text?: string; isErrored?: boolean; onScreen?: unknown }
     // /img and /page: the player, in the chat under the command.
-    if ((row.command === 'img' || row.command === 'page' || row.command === 'audio') && !row.isErrored && (row.text ?? '').includes(MARK)) {
+    if ((row.command === 'img' || row.command === 'page' || row.command === 'audio' || row.command === 'doc') && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
       await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
@@ -5409,7 +5798,7 @@ export const register: Register = on => {
 
 // What Claude is told about showing its work, for the state pictures are in now.
 function hintNow() {
-  if (state.canImage) return "This terminal shows pictures, videos, HTML pages and audio inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after. When the user asks to hear something, or you've made audio, play it with show_audio (MP3 or WAV)."
+  if (state.canImage) return "This terminal shows pictures, videos, HTML pages, audio and documents inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after. When the user asks to hear something, or you've made audio, play it with show_audio (MP3 or WAV). When the user asks to see or read a report, PDF, Markdown document or Mermaid diagram, show it with show_document (PDF, MD or MMD); the person can turn its pages."
   const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
-  return `show-your-work: pictures, videos, HTML pages and audio can't draw in this session (${why}) Anything shown with show_image, show_video, show_html or show_audio was not seen: the person saw a notice instead. Don't say they saw it.`
+  return `show-your-work: pictures, videos, HTML pages, audio and documents can't draw in this session (${why}) Anything shown with show_image, show_video, show_html, show_audio or show_document was not seen: the person saw a notice instead. Don't say they saw it.`
 }

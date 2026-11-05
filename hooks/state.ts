@@ -60,6 +60,10 @@ export const state = {
   ffplay: '',
   isFarFromSpeakers: false,
   isSoundOn: true,
+  // Poppler's tools, found like ffmpeg: a PDF's pages and every document's
+  // page count come from them.
+  pdftoppm: '',
+  pdfinfo: '',
   // The hint Claude was last given with a prompt (hintNow): sent again only
   // when it changes, or after a compaction.
   sentHint: '',

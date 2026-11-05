@@ -22,7 +22,7 @@ Run these two commands in Claude Code:
 /plugin install show-your-work@iamumeransari
 ```
 
-It supports Ghostty and kitty, on macOS and Linux, with Claude Code 2.1.286 or later. Videos also need ffmpeg: install it with your package manager (`brew install ffmpeg` on macOS), or ask Claude to install it.
+It supports Ghostty and kitty, on macOS and Linux, with Claude Code 2.1.286 or later. Videos and audio also need ffmpeg: install it with your package manager (`brew install ffmpeg` on macOS), or ask Claude to install it. HTML pages need Chrome, Chromium or Playwright's browser, and PDFs need poppler (`brew install poppler`).
 
 When the install finishes, a short onboarding shows you around. Run `/show-your-work` at any time to change your settings.
 
@@ -197,7 +197,7 @@ You choose whether to share anonymous usage data. You can make that choice durin
 
 Here's everything the plugin does on your computer, so you know exactly what you're installing. Your pictures and videos never leave your machine.
 
-To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). When you play a video with sound, `ffplay` (part of ffmpeg) plays its sound, and on macOS `osascript` reads how long your speakers or headphones take to play it, so the picture waits for the sound. When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted.
+To get pictures and videos ready, it uses `ffmpeg` and `ffprobe` (turning a video into frames and reading its length) and, on macOS, `sips` (converting a picture to PNG). When you play a video with sound, `ffplay` (part of ffmpeg) plays its sound, and on macOS `osascript` reads how long your speakers or headphones take to play it, so the picture waits for the sound. When you press View, Show in Finder or Save to Downloads, it opens the file with `open` on macOS or `xdg-open` on Linux. On macOS, `mdfind` helps `/img` find an image you pasted. To show an HTML page or a Markdown or Mermaid document, it renders it in a hidden Chrome or Chromium with a throwaway profile (never your logins); for PDFs it uses poppler's `pdftoppm` and `pdfinfo`.
 
 A few short scripts run with `sh` and `perl`. They find `ffmpeg` and your home folder, read the terminal's cell size so pictures fit, tidy the plugin's temp folder, open a viewer on Linux, and switch between the Stable and Latest channels. It also uses `cp`, `mkdir`, `rm`, `cat` and `touch` for its own temp files, and `claude plugin` to install its own updates from this repository, at most once a day. You can turn updates off. The updater will be turned off after the plugin moves to the Claude Code plugin directory, which keeps it up to date instead.
 
@@ -217,8 +217,8 @@ Inside Claude Code, it uses these hooks:
 
 - `prompt.submit` sends one short line with your message, telling Claude this terminal can show pictures (or why it can't). It sends it once a session, again after a compaction, and when that changes.
 - `prompt.submit` closes the settings when you send a message and remembers the names of images you paste, so `/img` can find them. Your message isn't changed.
-- `tool.call` handles the plugin's own `show_image` and `show_video` tools. It never touches other tools.
-- `command.run` runs `/img` and `/show-your-work`. Right after you install, it runs `/show-your-work tour` once to show you around.
+- `tool.call` handles the plugin's own `show_image`, `show_video`, `show_html`, `show_audio` and `show_document` tools. It never touches other tools.
+- `command.run` runs `/img`, `/page`, `/audio`, `/doc` and `/show-your-work`. Right after you install, it runs `/show-your-work tour` once to show you around.
 - `ui.render` draws the plugin's player, notices, settings and tour.
 - `session.start` and `session.end` set up the temp folder and terminal at the start, and send any waiting usage counts at the end. Inside tmux they also start and stop the picture pass-through for the plugin's pane (see [Terminals](#terminals)).
 
@@ -233,7 +233,7 @@ To report a bug or suggest a change, [open an issue](https://github.com/iamumera
 <details>
 <summary>Tools, settings and local development</summary>
 
-The plugin gives Claude two tools, `show_image` and `show_video`. A basic call needs only a path. For a before and after, Claude also passes the old file and the test results:
+The plugin gives Claude five tools: `show_image`, `show_video`, `show_html` (a snapshot of an HTML page), `show_audio` (MP3 and WAV, with a waveform) and `show_document` (PDF, Markdown and Mermaid, page by page). A basic call needs only a path. For a before and after, Claude also passes the old file and the test results:
 
 ```jsonc
 {

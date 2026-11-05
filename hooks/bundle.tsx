@@ -483,15 +483,18 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // the desktop's file-handler surprises (a hijacked text/html default). Its own
 // profile: the person's running browser never takes the window over, and the
 // viewer carries none of their logins.
+// Each path segment percent-encoded, so a name with spaces, `#`, `%` or `?`
+// names the right file.
+const fileUrl = (page: string) => `file://${page.split('/').map(encodeURIComponent).join('/')}`
 export const htmlOpenArgv = (chrome: string, page: string) => [
-  chrome, '--no-first-run', '--no-default-browser-check', `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  chrome, `--app=${fileUrl(page)}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
 ]
 export const htmlArgv = (chrome: string, page: string, png: string) => [
   chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
   '--no-first-run', '--no-default-browser-check', '--mute-audio',
   `--user-data-dir=${png}.profile`, '--window-size=1280,800',
-  '--virtual-time-budget=1000', `--screenshot=${png}`, `file://${page.split('/').map(encodeURIComponent).join('/')}`,
+  '--virtual-time-budget=1000', `--screenshot=${png}`, fileUrl(page),
 ]
 export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
   if (!state.chrome) throw new Error('pages need Chrome or Chromium')
@@ -507,109 +510,6 @@ export async function renderPage($: EngineInterface, page: string, key: string):
     // A fresh browser profile, never the person's login, cookies or extensions.
     await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
   }
-}
-
-// A sound file on its own: MP3 or WAV, nothing else promised.
-export const AUDIO = /\.(mp3|wav)$/i
-export const isAudio = (path: string) => AUDIO.test(path)
-
-// The waveform card: a wide, short picture like a player's progress strip.
-// The card's own background, the part already heard and the part to come:
-// gray reads clearly on the card (3.7:1) and the orange clearly against the
-// gray (2.5:1, beside the bar and the time, so never colour alone).
-export const WAVE_WIDTH = 1600
-export const WAVE_HEIGHT = 240
-export const WAVE_PLAYED = '#ff8c00'
-export const WAVE_UNPLAYED = '#6e7480'
-export const WAVE_CARD = '#181a1f'
-
-// One strip of the whole clip's waveform, one colour, on the card's background.
-// showwavespic draws the entire clip as one picture: no live spectrum, ever.
-export const waveStripArgv = (ffmpeg: string, source: string, png: string, color: string) => [
-  ffmpeg, '-v', 'error', '-y',
-  '-f', 'lavfi', '-i', `color=c=${WAVE_CARD}:s=${WAVE_WIDTH}x${WAVE_HEIGHT}`,
-  '-i', source,
-  '-filter_complex', `[1:a]showwavespic=s=${WAVE_WIDTH}x${WAVE_HEIGHT}:colors=${color}:scale=cbrt[wave];[0:v][wave]overlay=0:0:format=auto`,
-  '-frames:v', '1', png,
-]
-
-// The clip itself: the waveform stands still, and at each frame the part behind
-// the moment glows while a thin bar marks the moment itself — the position
-// stays readable whatever the colours around it. The original audio rides
-// along untouched (stream copy), so what is heard and what lights up are one
-// file, one clock; the clip never falls behind the frames' quantisation.
-export const WAVE_FPS = 12
-export const waveArgv = (ffmpeg: string, bright: string, dim: string, source: string, out: string, seconds: number) => [
-  ffmpeg, '-v', 'error', '-y',
-  '-loop', '1', '-framerate', String(WAVE_FPS), '-t', String(seconds), '-i', bright,
-  '-loop', '1', '-framerate', String(WAVE_FPS), '-t', String(seconds), '-i', dim,
-  '-i', source,
-  // Both sides planar RGB first: blended in their own space, the constant
-  // reaches the chroma planes too and the bar comes out magenta, not white.
-  '-filter_complex', `[0:v]format=gbrp[a];[1:v]format=gbrp[b];[a][b]blend=all_expr='if(lt(abs(X-W*T/${seconds}),3),255,if(lte(X,W*T/${seconds}),A,B))',format=yuv420p[v]`,
-  '-map', '[v]', '-map', '2:a:0', '-t', String(seconds),
-  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-g', '12',
-  '-c:a', 'copy', '-f', 'matroska', out,
-]
-
-// One encode of a clip at a time, shared by every call that lands while it
-// runs: two shows of one file in quick succession (or racing tool calls) cut
-// it once, not twice into the same temporary name (the `asking` map in sound.ts
-// is the same pattern). Cross-session races can still start two encodes; each
-// writes its own side name and each move is atomic, so only a whole clip ever
-// lands under the final name.
-const waving = new Map<string, Promise<string>>()
-let waveAttempt = 0
-const waveSession = Math.random().toString(36).slice(2)
-
-export function ensureWave($: EngineInterface, real: string, id: string): Promise<string> {
-  const out = `${state.TMP}/a-${id.slice(0, 10)}.mkv`
-  let job = waving.get(out)
-  if (!job) {
-    job = cutWave($, real, out).finally(() => { if (waving.get(out) === job) waving.delete(out) })
-    waving.set(out, job)
-  }
-  return job
-}
-
-async function cutWave($: EngineInterface, real: string, out: string): Promise<string> {
-  if (await isGone($, out)) {
-    const dur = await $.process.run([state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
-    const seconds = Number(dur.stdout.trim())
-    if (dur.exitCode !== 0 || !Number.isFinite(seconds) || seconds <= 0) throw new Error(`ffmpeg could not read ${real}: ${(dur.stderr || dur.stdout).trim().slice(0, 200)}`)
-    await $.process.run(['mkdir', '-p', state.TMP])
-    // This attempt's own names: a second run (another session, or one that
-    // slipped past the map) never writes where this one writes — the session
-    // prefix keeps two Claude processes from ever colliding on one name.
-    const attempt = waveSession + Date.now().toString(36) + (waveAttempt += 1).toString(36)
-    const bright = `${out.slice(0, -4)}.${attempt}.bright.png`
-    const dim = `${out.slice(0, -4)}.${attempt}.dim.png`
-    const part = `${out}.${attempt}.part`
-    try {
-      for (const [png, color] of [[bright, WAVE_PLAYED], [dim, WAVE_UNPLAYED]] as const) {
-        const strip = await $.process.run(waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
-        if (strip.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${strip.stderr.trim().slice(0, 200)}`)
-      }
-      const made = await $.process.run(waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
-      if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
-      if ((await $.process.run(['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
-    } finally {
-      await $.process.run(['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
-    }
-  }
-  return out
-}
-
-// An audio file becomes a clip of its own waveform and plays like any other:
-// the frames, the play timer, the scrub bar, the skips and the sound are the
-// player's own, and the person's file stays what Open and Save reach for.
-export async function prepareAudio($: EngineInterface, real: string, title: string, key?: string): Promise<Shown> {
-  if (!state.hasVideoTools) {
-    state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
-    if (!state.hasVideoTools) throw new Error(noFfmpeg(state.isMac))
-  }
-  const wave = await ensureWave($, real, key ?? (await identityOf($, real)) ?? keyOf(real))
-  return { ...(await prepareVideo($, wave, title, await identityOf($, wave).catch(() => undefined))), kind: 'audio', origin: real }
 }
 
 // What to tell Claude and the person when a video can't be cut into frames.
@@ -648,29 +548,13 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
     kind: 'no_ffmpeg', title: 'Videos need ffmpeg', message: NO_FFMPEG, prompt: FFMPEG_PROMPT,
     text: "ffmpeg isn't installed, so this video can't play here. Pictures still work. Copy the prompt and paste it to Claude to install it, or run `brew install ffmpeg` yourself. No Homebrew? Get it from brew.sh first.",
   }
-  if (/^not audio:/i.test(raw)) return {
-    kind: 'not_image', title: "This isn't an audio file",
-    text: `${name} isn't MP3 or WAV, so it can't play here. Convert it to WAV and show it again.`,
-    message: `${shown} isn't an audio file (show_audio opens MP3 and WAV). Convert it, for example to WAV with ffmpeg, then show it again; use show_video for a video with sound.`,
-    prompt: `Convert ${shown} to WAV (or MP3) for me, then show it to me again.`,
-  }
-  if (/does not contain any stream|matches no streams|no frames in|Output file is empty/i.test(raw)) return AUDIO.test(path) ? {
-    kind: 'no_picture', title: "This audio can't be read",
-    text: `${name} is too short or empty to draw, so there's nothing to play.`,
-    message: `${shown} is too short or empty to play. Don't retry it; show a real audio file instead.`,
-    prompt: `${shown} is too short to play. Find a real audio file and show it to me again.`,
-  } : {
+  if (/does not contain any stream|matches no streams|no frames in|Output file is empty/i.test(raw)) return {
     kind: 'no_picture', title: 'This video has no picture',
     text: `${name} has sound but no picture, so there's nothing to play.`,
     message: `${shown} has no video track (sound only), so there's nothing to play. Don't retry it; show a file with a picture instead.`,
     prompt: `${shown} has no picture, only sound. Find the right video and show it to me again.`,
   }
-  if (/ffmpeg could not read|Invalid data|moov atom|could not find codec|Error opening input/i.test(raw)) return AUDIO.test(path) ? {
-    kind: 'broken_video', title: "This audio can't be read",
-    text: `${name} couldn't be opened as audio. It may be cut off, still being written, or not really an audio file.`,
-    message: `${shown} couldn't be read as audio: it's damaged, unfinished (still being recorded or cut off), or not an audio file. Re-export it, then show it again.`,
-    prompt: `${shown} couldn't be read as audio. Check it, re-export it if it's broken, then show it to me again.`,
-  } : {
+  if (/ffmpeg could not read|Invalid data|moov atom|could not find codec|Error opening input/i.test(raw)) return {
     kind: 'broken_video', title: "This video can't be read",
     text: `${name} couldn't be opened as a video. It may be cut off, still being written, or not really a video.`,
     message: `${shown} couldn't be read as a video: it's damaged, unfinished (still recording or cut off), or not a video. Re-export or re-record it, then show it again.`,
@@ -691,8 +575,15 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
   if (/pages need Chrome or Chromium/i.test(raw)) return {
     kind: 'other', title: 'Pages need a browser',
     text: `${name} is an HTML page, and no Chrome or Chromium was found to render it. Copy the prompt and paste it to Claude to install one, or install it yourself.`,
-    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Install Chrome or Chromium, then restart Claude Code and show it again.`,
+    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Screenshot it with headless Playwright instead and show that with show_image.`,
     prompt: `Install Google Chrome or Chromium for me, then restart Claude Code. After that, show ${shown} to me again.`,
+  }
+  // A page Chrome couldn't render still reaches the person as a picture.
+  if (/the page couldn't be rendered/i.test(raw)) return {
+    kind: 'other', title: "Couldn't render the page",
+    text: `${name} couldn't be rendered as a page. Claude can screenshot it another way and show that.`,
+    message: `${shown} couldn't be rendered as a page. Screenshot it with headless Playwright instead and show that with show_image.`,
+    prompt: `${shown} couldn't be rendered as a page. Screenshot it with headless Playwright and show it to me with show_image.`,
   }
   const detail = (raw.split('\n')[0] ?? '').replace(/\/(?:private\/)?tmp\/\S+|\S*\/\.show-your-work\/\S+/g, name).slice(0, 160)
   return {
@@ -1559,7 +1450,6 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   const real = stat.realPath ?? path
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
-  if (isAudio(real)) return prepareAudio($, real, name, key ?? (await identityOf($, real)))
   let png = real
   if (isPage(real)) {
     // An HTML page becomes one fixed-window picture; its own file stays the
@@ -3133,7 +3023,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       return one.frame === startFrame && at - waitSince < SOUND_WAIT_MS ? 'hold' : 'silent'
     }
     const from = one.frame / frames.fps
-    if (!soundLeft(track, from, media.kind === 'audio' ? 0 : SOUND_TAIL_S)) return 'silent'
+    if (!soundLeft(track, from)) return 'silent'
     // A second of frames ahead first, so the sound doesn't stop again at once.
     const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
     if (!isRunCut(media, one.frame, ahead)) {
@@ -3289,26 +3179,6 @@ function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: 
   if (frame.columns === box.columns && frame.rows === box.rows) return image
   // A side smaller than the frame it shares sits centred in it, unfilled.
   return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{image}</Box>
-}
-
-// A document's pages: back and forward, with the count between them. Nothing
-// plays and nothing sounds; a page is a picture the reader turns to.
-function Pager(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number) {
-  const { Box, Text, Button } = ui
-  const one = player(site)
-  const pages = media.pages!
-  const at = Math.min(one.frame, pages.count - 1)
-  const go = (to: number) => {
-    one.frame = Math.max(0, Math.min(to, pages.count - 1))
-    redraw($, site)
-  }
-  return (
-    <Box flexDirection="row" flexWrap="nowrap" width={width} columnGap={2}>
-      {pages.count > 1 && <Button key="prev" plain dimColor={at === 0} label="‹ Prev" onPress={() => { act('page_prev'); go(at - 1) }} />}
-      <Text dimColor>{` Page ${at + 1} of ${pages.count} `}</Text>
-      {pages.count > 1 && <Button key="next" plain dimColor={at >= pages.count - 1} label="Next ›" onPress={() => { act('page_next'); go(at + 1) }} />}
-    </Box>
-  )
 }
 
 // The scrub row: the play control, elapsed, a clickable bar, total — exactly
@@ -3864,8 +3734,8 @@ export function terminalOf(env: { program: string; term: string; kitty: boolean;
 // The README's list of terminals that draw pictures.
 const TERMINALS = 'https://github.com/iamumeransari/claude-show-your-work#terminals'
 
-export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video' | 'audio' | 'document', id: string) {
-  const what = kind === 'video' ? 'videos' : kind === 'audio' ? 'audio' : kind === 'document' ? 'documents' : 'pictures'
+export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video', id: string) {
+  const what = kind === 'video' ? 'videos' : 'pictures'
   // Claude Code keeps pictures off inside tmux unless FORCE is set at launch;
   // with it, the plugin passes them through (see tmux.ts).
   if (cause === 'tmux') return {
@@ -3957,7 +3827,7 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
 // original moved): say so in place of a blank box, with a prompt to paste.
 export function expiredPrompt(shown: Shown): string {
   const file = shown.origin ?? shown.source ?? shown.path
-  const kind = shown.kind === 'audio' ? 'audio' : shown.frames ? 'video' : 'image'
+  const kind = shown.frames ? 'video' : 'image'
   return `The ${kind} preview "${shown.title}" expired (${file} is gone). Please regenerate it and show it to me again with show_${kind}${shown.compare ? ', with the same compare' : ''}${shown.changes?.length ? ' and the same list of changes' : ''}.`
 }
 function Expired(ui: Ui, $: EngineInterface, shown: Shown, width: number) {
@@ -4009,13 +3879,7 @@ export async function Viewer(
   const ui = $.ui.resolve(e) as Ui
   const { Box, Text, Button, Link } = ui
   const one = player(site)
-  const baseMedia = sideOf(shown, site)
-  const docPages = baseMedia.pages
-  let media = baseMedia
-  if (docPages) {
-    const file = await docPage($, baseMedia, one.frame)
-    if (file) media = { ...baseMedia, path: file, source: file, origin: baseMedia.origin ?? baseMedia.source, ...(await pngSize($, file)), generation: baseMedia.generation + one.frame }
-  }
+  const media = sideOf(shown, site)
   const frames = media.frames
   const source = media.origin ?? media.source ?? media.path
   const columns = viewport?.columns ?? 100
@@ -4026,7 +3890,7 @@ export async function Viewer(
   // Each side is drawn from the copy that fits its box (see fitCopy).
   // iTerm2 scales a picture into its box itself, so it never needs a copy
   // fitted to the box (which also shrank the box after the first draw).
-  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side) fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
@@ -4110,39 +3974,29 @@ export async function Viewer(
   const hasSound = !!track && track.status !== 'none'
   if (soundUsable() && frames && !track) void $.clock.sleep(SHARPEN_DELAY_MS).then(() => probeSound($, media.source, frames)).then(t => { if (t && t.status !== 'none') redraw($, site) }, () => undefined)
   const actions = Actions(ui, $, media, source, isNarrow)
-  // The top corner opens it: the page it shows, a document its rendered page,
-  // else the file itself. Only a web address opens as a page: a model's url
-  // could name an app, a script or an option for `open`.
+  // The top corner opens it: the page it shows, else the file itself.
+  // Only a web address opens as a page: a model's url could name an app, a
+  // script or an option for `open`.
   const at = urlAt(media, frames ? one.frame / frames.fps : 0)
   const page = (at && /^https?:\/\/[^\s]+$/i.test(at) ? at : undefined) ?? (/\.html?$/i.test(source) ? source : undefined)
-  // A printed document's rendered page: the same preview the card shows, as
-  // its own small window — the raw Markdown would land in a text editor.
-  const rendered = media.kind === 'document' ? media.documentOpen : undefined
   const opener = (
     <Button
       key="page"
       plain
-      label={rendered ? '↗ Open document' : page ? '↗ Open page' : '↗ View'}
-      onPress={async () => {
+      label={page ? '↗ Open page' : '↗ View'}
+      onPress={() => {
         // Watched elsewhere now: the video here pauses.
         if (one.timer) stop($, site)
-        // Refresh an old card's printed preview after plugin updates. Never
-        // silently fall back to stale HTML if regeneration fails.
-        let target = rendered ?? page
-        if (rendered) {
-          try { target = await documentView($, baseMedia) ?? undefined }
-          catch (error) { $.ui.toast(`Could not open document: ${String(error).slice(0, 160)}`); return }
-          if (!target) { $.ui.toast('Could not prepare the document preview.'); return }
-        }
         // A local page opens in its own small window, the way an image opens
         // in an image viewer: the same engine that rendered the preview, as
         // a standalone viewer with no tabs and no desktop file-handler say.
-        const artifact = (rendered || (page && /\.html?$/i.test(source))) && state.chrome && !state.isMac
+        // A headless shell has no window: the default browser opens it then.
+        const artifact = page && /\.html?$/i.test(source) && state.chrome && !state.isMac && !/headless[_-]?shell$/i.test(state.chrome)
         const argv = artifact
-          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, target!)]
-          : openArgv(target ?? source)
-        void $.process.run(argv).then(r =>
-          $.ui.toast(r.exitCode === 0 ? `Opened ${(target ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, target ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', target ?? source)),
+          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
+          : openArgv(page ?? source)
+        act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
+          $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
         )
       }}
     />
@@ -4157,13 +4011,9 @@ export async function Viewer(
   const stage = (
     <Box flexDirection="column" width={rowWidth} alignItems="center">
       {Picture(ui, $, site, shown, media, own, pic, box)}
-      {docPages && Pager(ui, $, site, media, rowWidth)}
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
-          {/* Audio with no way to be heard (no ffplay, or the session's speakers
-              are another room's) plays silently; that must be said, not silent. */}
-          {frames && media.kind === 'audio' && !soundUsable() && <Text dimColor>♪ no sound in this session</Text>}
           {frames && <Button key="back" plain dimColor label={`« ${SKIP_SECONDS}s`} onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - SKIP_SECONDS, shown, true)} />}
           {frames && <Button key="forward" plain dimColor label={`${SKIP_SECONDS}s »`} onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + SKIP_SECONDS, shown, true)} />}
           {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? '♪ Mute' : '♪ Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
@@ -4265,8 +4115,7 @@ async function SplitView(
         ) : null}
       </Box>
       {Scrub(ui, $, site, shown, width, shown)}
-      {/* The person's file, not the generated waveform clip behind it. */}
-      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.origin ?? shown.source ?? shown.path, width < 60)}</Box>
+      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.source ?? shown.path, width < 60)}</Box>
       {(fixed.length > 0 || broken.length > 0) && (
         <Box flexDirection="column" marginTop={1}>
           <Text dimColor>{fixed.length} fixed · {broken.length} broke · click one to jump there</Text>
@@ -4285,9 +4134,9 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : tool.endsWith('audio') ? (isRunning ? 'Cutting audio' : 'Audio') : tool.endsWith('document') ? (isRunning ? 'Rasterizing document' : 'Document') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : tool.endsWith('audio') ? '♪' : tool.endsWith('document') ? '▦' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }
 
 // ── state.ts ──────────────────────────────────────────────────────────────
@@ -5163,7 +5012,7 @@ export function setUp($: EngineInterface): Promise<void> {
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"; echo "pp=$(command -v pdftoppm)"; echo "pi=$(command -v pdfinfo)"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || { p=; for a in "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/* "/Applications/Chromium.app/Contents/MacOS/Chromium" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"; do [ -f "$a" ] && [ -x "$a" ] && p=$a; done; echo "$p"; })"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
@@ -5173,9 +5022,11 @@ export function setUp($: EngineInterface): Promise<void> {
     state.ffmpeg = got('ff') || (state.isMac ? '/opt/homebrew/bin/ffmpeg' : '/usr/bin/ffmpeg')
     state.ffprobe = got('fp') || (state.isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
     state.claudePath = got('cl')
-    state.chrome = got('ch') || (state.isMac ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '')
-    state.pdftoppm = got('pp') || (state.isMac ? '/opt/homebrew/bin/pdftoppm' : '')
-    state.pdfinfo = got('pi') || (state.isMac ? '/opt/homebrew/bin/pdfinfo' : '')
+    // Else the last one there of: Playwright's headless shells, its Chromium
+    // builds (Claude screenshots with them; newest last), then Chromium and
+    // Chrome in /Applications. A headless shell renders pages but opens no
+    // window. With none, the install notice shows, not a failed render.
+    state.chrome = got('ch')
     state.hasVideoTools = false
     // Over ssh the terminal can't read this machine's files: pictures go as bytes.
     const sshConnection = await Promise.resolve().then(() => $.env.get('SSH_CONNECTION')).catch(() => undefined)
@@ -5200,7 +5051,7 @@ export function setUp($: EngineInterface): Promise<void> {
 
 const PANE = 'show-your-work'
 // The tools, and their names from before the rename, so old windows still draw.
-const TOOLS = ['show_image', 'show_video', 'show_html', 'show_audio', 'show_document'].map(t => `mcp__show-your-work__${t}`)
+const TOOLS = ['show_image', 'show_video', 'show_html'].map(t => `mcp__show-your-work__${t}`)
 // Screenshots and recordings made only to be shown go to the temp folder, so
 // they don't pile up in the project; the history keeps its own copy.
 const SCRATCH_NOTE = 'Save screenshots and recordings you make to show here in a temporary folder, such as $TMPDIR or /tmp, not in the project. Save them in the project only when the user asks to keep them, or when the project already has a folder for them, such as one for test screenshots.'
@@ -5344,36 +5195,15 @@ export const register: Register = on => {
     })
     await $.command.register({
       name: 'page',
-      description: 'Preview a local HTML file in the chat: /page <path>. Open page opens the live page in your browser.',
+      description: 'Show a local HTML page in your terminal: /page <path>. Open page opens the live page.',
       argumentHint: '<path>',
     })
-    await $.command.register({
-      name: 'audio',
-      description: 'Play an audio file in the chat: /audio <path>',
-      argumentHint: '<path>',
-    })
-    await $.command.register({
-      name: 'doc',
-      description: 'Show a PDF, Markdown or Mermaid document in the chat: /doc <path>',
-      argumentHint: '<path>',
-    })
-    await $.tool.register({
-      name: 'show_document',
-      description: `Shows a local document inline in the terminal, as pages the person can turn through. Accepts PDF, Markdown (.md or .markdown) and Mermaid (.mmd or .mermaid); Mermaid fenced blocks in Markdown become diagrams. Use it when the user asks to see or read a report, a PDF, a Markdown document or a diagram you wrote. The person sees the pages; you do not. Pass path and an optional title. There is no playback: Previous/Next turn pages. PDF needs poppler (pdftoppm, pdfinfo); Markdown and Mermaid also need Chrome or Chromium, with Mermaid shipped offline. ${SCRATCH_NOTE}`,
-      inputSchema: IMAGE_INPUT,
-      isDeferred: false,
-    })
-    await $.tool.register({
+    // Only with a browser to render pages: without one, Claude screenshots
+    // with Playwright and uses show_image.
+    if (state.chrome) await $.tool.register({
       name: 'show_html',
       description: 'Shows a local HTML file as a static preview inline in the terminal, using Chrome or Chromium. Accepts .html and .htm files. The preview is a fixed 1280 by 800 viewport, not an interactive page: scrolling, forms and sound work only after the person chooses Open page in their browser. Use it for HTML reports, page designs and small artifacts you have made. Pass path and an optional title; changes, summary and previous work as for show_image. No URL navigation. The file may execute scripts while Chrome renders it; use only pages you intend to render. The person sees the preview; you do not.',
       inputSchema: IMAGE_INPUT,
-      isDeferred: false,
-    })
-    await $.tool.register({
-      name: 'show_audio',
-      description:
-        `Plays an audio file to the user, inline in their terminal: the whole clip's waveform with a playhead that follows playback, and Play, scrubbing and skips like the video player. Accepts MP3 and WAV.\n\nUse it without being asked whenever the user asks to hear something: a sound effect, a voice memo, music, a generated track or a text-to-speech clip you have made. Sound plays once the person presses Play, on the machine's speakers.\n\nPass \`path\` and an optional \`title\`; \`changes\` with \`at\` (the second it appears) and \`checks\` mark moments in the clip like in a video. The person hears it; you do not.\n\n${SCRATCH_NOTE}`,
-      inputSchema: TOOL_INPUT,
       isDeferred: false,
     })
     await $.tool.register({
@@ -5465,7 +5295,7 @@ export const register: Register = on => {
     if (!invoked.args.trim()) return { text: 'Usage: /page <path to a local .html file>' }
     if (!isPage(arg)) return { text: 'Pages are .html or .htm files. For images and videos use /img <path>.' }
     try {
-      const shown = await prepare($, arg, `Artifact · ${arg.split('/').pop()}`)
+      const shown = await prepare($, arg, `Page · ${arg.split('/').pop()}`)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
       await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
@@ -5479,47 +5309,7 @@ export const register: Register = on => {
     }
   })
 
-  on('command.run', { command: 'audio' }, async ($, invoked) => {
-    await setUp($)
-    const arg = expand(invoked.args.trim(), state.cwd, state.home)
-    if (!invoked.args.trim()) return { text: 'Usage: /audio <path to a local .mp3 or .wav file>' }
-    if (!isAudio(arg)) return { text: 'Audio is .mp3 or .wav files. For images and videos use /img <path>, for HTML pages /page <path>.' }
-    try {
-      const shown = await prepare($, arg)
-      const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
-      shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
-
-      track('audio_command', { kind: shown.frames ? 'audio' : 'image' })
-      return { text: `Showing ${shown.title}.${soundUsable() ? ' Press Play to hear it.' : ''}\n${MARK}#${id}` }
-    } catch (err) {
-      const n = noticeOf(err, arg, state.home)
-      track('show_failed', { from: 'audio_command', reason: REASONS[n.kind] })
-      return { text: n.message }
-    }
-  })
-
-  on('command.run', { command: 'doc' }, async ($, invoked) => {
-    await setUp($)
-    const arg = expand(invoked.args.trim(), state.cwd, state.home)
-    if (!invoked.args.trim()) return { text: 'Usage: /doc <path to a local .pdf, .md or .mmd file>' }
-    if (!isDocument(arg)) return { text: 'Documents are .pdf, .md, .markdown, .mmd or .mermaid files. For images, videos and audio use /img <path>, for HTML pages /page <path>.' }
-    try {
-      const shown = await prepareDocument($, arg, arg.split('/').pop()!)
-      const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
-      shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
-
-      track('doc_command', { kind: 'document' })
-      return { text: `Showing ${shown.title} (${shown.pages?.count ?? 1} page${(shown.pages?.count ?? 1) === 1 ? '' : 's'}).\n${MARK}#${id}` }
-    } catch (err) {
-      const n = noticeOf(err, arg, state.home)
-      track('show_failed', { from: 'doc_command', reason: REASONS[n.kind] })
-      return { text: n.message }
-    }
-  })
-
-  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html|audio|document)$/ }, async ($, e) => {
+  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html)$/ }, async ($, e) => {
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -5539,13 +5329,7 @@ export const register: Register = on => {
       // picture, and the card's source stays the page itself, so Open page
       // opens it.
       const page = isPage(input.path)
-      const audio = isAudio(input.path)
-      const document = isDocument(input.path)
-      if (String((e as { tool?: string }).tool ?? '').endsWith('document') && !document)
-        throw new Error(`not a document: ${input.path}`)
-      if (String((e as { tool?: string }).tool ?? '').endsWith('audio') && !audio)
-        throw new Error(`not audio: ${input.path}`)
-      if (!MEDIA.test(input.path) && !page && !audio && !document) throw new Error(`not an image: ${input.path}`)
+      if (!MEDIA.test(input.path) && !page) throw new Error(`not an image: ${input.path}`)
       const pagePng = page ? await renderPage($, input.path, keyOf(`${input.path}|${await $.clock.now()}`).slice(0, 10)) : undefined
       const kept = await storeVersion($, pagePng ?? input.path!, note, input.title, parent)
         .catch(() => ({ real: pagePng ?? input.path!, copy: pagePng ?? input.path!, id: '', chain: [] as { path: string; note?: string; id: string }[], missing: undefined as string | undefined }))
@@ -5555,15 +5339,13 @@ export const register: Register = on => {
       const earlier = [...given, ...kept.chain.filter(k => !given.some(g => g.path === k.path))]
       const compare = input.compare ?? earlier.at(-1)?.path
       const shown: Shown = {
-        ...(document
-          ? await prepareDocument($, kept.copy, input.title ?? input.path.split('/').pop()!, input.path)
-          : await prepare($, kept.copy, input.title ?? (page ? `Artifact · ${input.path.split('/').pop()}` : input.path.split('/').pop()), await identityOf($, input.path))),
+        ...(await prepare($, kept.copy, input.title ?? (page ? `Page · ${input.path.split('/').pop()}` : input.path.split('/').pop()), await identityOf($, input.path))),
         origin: page ? input.path : kept.real,
         change: input.change,
         pr: input.pr,
         url: input.url,
         checks: input.checks,
-        changes: timesThatMean(input.changes, VIDEO.test(input.path) || audio),
+        changes: timesThatMean(input.changes, VIDEO.test(input.path)),
         summary: input.summary,
         label: input.label,
         overlay: input.overlay,
@@ -5576,11 +5358,7 @@ export const register: Register = on => {
       if (compare) {
         const label = input.compare_label
         shown.compare = {
-          ...(isDocument(compare)
-            ? await prepareDocument($, compare, label ?? 'Original', compare)
-            : input.compare
-              ? await prepare($, compare, label ?? 'Original')
-              : await preparedOf($, compare)),
+          ...(input.compare ? await prepare($, compare, label ?? 'Original') : await preparedOf($, compare)),
           label,
           checks: input.compare_checks,
         }
@@ -5596,7 +5374,7 @@ export const register: Register = on => {
       }
       if (!shown.frames && kept.copy !== kept.real)
         remember(kept.copy, { kind: shown.kind, path: shown.path, source: shown.source, width: shown.width, height: shown.height, title: 'Original', generation: shown.generation })
-      const what = shown.kind === 'audio' ? `audio, ${clock(shown.frames!.duration)}` : shown.kind === 'document' ? `document, ${shown.pages?.count ?? 1} pages` : shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
+      const what = shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
       const checks = [...(shown.checks ?? []), ...(shown.compare?.checks ?? [])]
       track(shown.frames ? 'video_shown' : 'image_shown', {
         format: (input.path.match(/\.([a-z0-9]+)$/i)?.[1] ?? 'none').toLowerCase().slice(0, 5),
@@ -5619,7 +5397,7 @@ export const register: Register = on => {
       const hint = (kept.missing ? ` #${kept.missing} wasn't found, so this has no history.` : '') + handle
       const opening = state.canImage
         ? `Shown: ${shown.title} (${what}).`
-        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.kind === 'audio' ? 'audio' : shown.kind === 'document' ? 'document' : shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
+        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
@@ -5634,7 +5412,7 @@ export const register: Register = on => {
       if (copied) void $.process.run(['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
       const n = noticeOf(err, expand(input.path ?? '', state.cwd, state.home), state.home)
       notices.set(e.tool_use_id, n)
-      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : String((e as { tool?: string }).tool ?? '').endsWith('document') ? 'show_document' : 'show_image', reason: REASONS[n.kind] })
+      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : 'show_image', reason: REASONS[n.kind] })
       return { deny: `show-your-work: ${n.message}` }
     }
   }).catch(() => ({ deny: 'show-your-work: it could not be shown.' }))
@@ -5752,7 +5530,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const row = e.props as { command?: string; args?: string; text?: string; isErrored?: boolean; onScreen?: unknown }
     // /img and /page: the player, in the chat under the command.
-    if ((row.command === 'img' || row.command === 'page' || row.command === 'audio' || row.command === 'doc') && !row.isErrored && (row.text ?? '').includes(MARK)) {
+    if ((row.command === 'img' || row.command === 'page') && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
       await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
@@ -5798,7 +5576,9 @@ export const register: Register = on => {
 
 // What Claude is told about showing its work, for the state pictures are in now.
 function hintNow() {
-  if (state.canImage) return "This terminal shows pictures, videos, HTML pages, audio and documents inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after. When the user asks to hear something, or you've made audio, play it with show_audio (MP3 or WAV). When the user asks to see or read a report, PDF, Markdown document or Mermaid diagram, show it with show_document (PDF, MD or MMD); the person can turn its pages."
+  // HTML pages are named only when a browser to render them was found.
+  if (state.canImage && !state.chrome) return "This terminal shows pictures and videos inline. After visual work, screenshot or record it and show it with show_image or show_video before you say you're done, instead of telling the user to open a file or localhost. For a UI fix, show before and after."
+  if (state.canImage) return "This terminal shows pictures, videos and HTML pages inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after."
   const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
-  return `show-your-work: pictures, videos, HTML pages, audio and documents can't draw in this session (${why}) Anything shown with show_image, show_video, show_html, show_audio or show_document was not seen: the person saw a notice instead. Don't say they saw it.`
+  return `show-your-work: pictures, videos and HTML pages can't draw in this session (${why}) Anything shown with show_image, show_video or show_html was not seen: the person saw a notice instead. Don't say they saw it.`
 }

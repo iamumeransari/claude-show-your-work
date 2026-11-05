@@ -182,15 +182,18 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // the desktop's file-handler surprises (a hijacked text/html default). Its own
 // profile: the person's running browser never takes the window over, and the
 // viewer carries none of their logins.
+// Each path segment percent-encoded, so a name with spaces, `#`, `%` or `?`
+// names the right file.
+const fileUrl = (page: string) => `file://${page.split('/').map(encodeURIComponent).join('/')}`
 export const htmlOpenArgv = (chrome: string, page: string) => [
-  chrome, '--no-first-run', '--no-default-browser-check', `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  chrome, `--app=${fileUrl(page)}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
 ]
 export const htmlArgv = (chrome: string, page: string, png: string) => [
   chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
   '--no-first-run', '--no-default-browser-check', '--mute-audio',
   `--user-data-dir=${png}.profile`, '--window-size=1280,800',
-  '--virtual-time-budget=1000', `--screenshot=${png}`, `file://${page.split('/').map(encodeURIComponent).join('/')}`,
+  '--virtual-time-budget=1000', `--screenshot=${png}`, fileUrl(page),
 ]
 export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
   if (!state.chrome) throw new Error('pages need Chrome or Chromium')
@@ -206,109 +209,6 @@ export async function renderPage($: EngineInterface, page: string, key: string):
     // A fresh browser profile, never the person's login, cookies or extensions.
     await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
   }
-}
-
-// A sound file on its own: MP3 or WAV, nothing else promised.
-export const AUDIO = /\.(mp3|wav)$/i
-export const isAudio = (path: string) => AUDIO.test(path)
-
-// The waveform card: a wide, short picture like a player's progress strip.
-// The card's own background, the part already heard and the part to come:
-// gray reads clearly on the card (3.7:1) and the orange clearly against the
-// gray (2.5:1, beside the bar and the time, so never colour alone).
-export const WAVE_WIDTH = 1600
-export const WAVE_HEIGHT = 240
-export const WAVE_PLAYED = '#ff8c00'
-export const WAVE_UNPLAYED = '#6e7480'
-export const WAVE_CARD = '#181a1f'
-
-// One strip of the whole clip's waveform, one colour, on the card's background.
-// showwavespic draws the entire clip as one picture: no live spectrum, ever.
-export const waveStripArgv = (ffmpeg: string, source: string, png: string, color: string) => [
-  ffmpeg, '-v', 'error', '-y',
-  '-f', 'lavfi', '-i', `color=c=${WAVE_CARD}:s=${WAVE_WIDTH}x${WAVE_HEIGHT}`,
-  '-i', source,
-  '-filter_complex', `[1:a]showwavespic=s=${WAVE_WIDTH}x${WAVE_HEIGHT}:colors=${color}:scale=cbrt[wave];[0:v][wave]overlay=0:0:format=auto`,
-  '-frames:v', '1', png,
-]
-
-// The clip itself: the waveform stands still, and at each frame the part behind
-// the moment glows while a thin bar marks the moment itself — the position
-// stays readable whatever the colours around it. The original audio rides
-// along untouched (stream copy), so what is heard and what lights up are one
-// file, one clock; the clip never falls behind the frames' quantisation.
-export const WAVE_FPS = 12
-export const waveArgv = (ffmpeg: string, bright: string, dim: string, source: string, out: string, seconds: number) => [
-  ffmpeg, '-v', 'error', '-y',
-  '-loop', '1', '-framerate', String(WAVE_FPS), '-t', String(seconds), '-i', bright,
-  '-loop', '1', '-framerate', String(WAVE_FPS), '-t', String(seconds), '-i', dim,
-  '-i', source,
-  // Both sides planar RGB first: blended in their own space, the constant
-  // reaches the chroma planes too and the bar comes out magenta, not white.
-  '-filter_complex', `[0:v]format=gbrp[a];[1:v]format=gbrp[b];[a][b]blend=all_expr='if(lt(abs(X-W*T/${seconds}),3),255,if(lte(X,W*T/${seconds}),A,B))',format=yuv420p[v]`,
-  '-map', '[v]', '-map', '2:a:0', '-t', String(seconds),
-  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-g', '12',
-  '-c:a', 'copy', '-f', 'matroska', out,
-]
-
-// One encode of a clip at a time, shared by every call that lands while it
-// runs: two shows of one file in quick succession (or racing tool calls) cut
-// it once, not twice into the same temporary name (the `asking` map in sound.ts
-// is the same pattern). Cross-session races can still start two encodes; each
-// writes its own side name and each move is atomic, so only a whole clip ever
-// lands under the final name.
-const waving = new Map<string, Promise<string>>()
-let waveAttempt = 0
-const waveSession = Math.random().toString(36).slice(2)
-
-export function ensureWave($: EngineInterface, real: string, id: string): Promise<string> {
-  const out = `${state.TMP}/a-${id.slice(0, 10)}.mkv`
-  let job = waving.get(out)
-  if (!job) {
-    job = cutWave($, real, out).finally(() => { if (waving.get(out) === job) waving.delete(out) })
-    waving.set(out, job)
-  }
-  return job
-}
-
-async function cutWave($: EngineInterface, real: string, out: string): Promise<string> {
-  if (await isGone($, out)) {
-    const dur = await $.process.run([state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
-    const seconds = Number(dur.stdout.trim())
-    if (dur.exitCode !== 0 || !Number.isFinite(seconds) || seconds <= 0) throw new Error(`ffmpeg could not read ${real}: ${(dur.stderr || dur.stdout).trim().slice(0, 200)}`)
-    await $.process.run(['mkdir', '-p', state.TMP])
-    // This attempt's own names: a second run (another session, or one that
-    // slipped past the map) never writes where this one writes — the session
-    // prefix keeps two Claude processes from ever colliding on one name.
-    const attempt = waveSession + Date.now().toString(36) + (waveAttempt += 1).toString(36)
-    const bright = `${out.slice(0, -4)}.${attempt}.bright.png`
-    const dim = `${out.slice(0, -4)}.${attempt}.dim.png`
-    const part = `${out}.${attempt}.part`
-    try {
-      for (const [png, color] of [[bright, WAVE_PLAYED], [dim, WAVE_UNPLAYED]] as const) {
-        const strip = await $.process.run(waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
-        if (strip.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${strip.stderr.trim().slice(0, 200)}`)
-      }
-      const made = await $.process.run(waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
-      if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
-      if ((await $.process.run(['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
-    } finally {
-      await $.process.run(['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
-    }
-  }
-  return out
-}
-
-// An audio file becomes a clip of its own waveform and plays like any other:
-// the frames, the play timer, the scrub bar, the skips and the sound are the
-// player's own, and the person's file stays what Open and Save reach for.
-export async function prepareAudio($: EngineInterface, real: string, title: string, key?: string): Promise<Shown> {
-  if (!state.hasVideoTools) {
-    state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
-    if (!state.hasVideoTools) throw new Error(noFfmpeg(state.isMac))
-  }
-  const wave = await ensureWave($, real, key ?? (await identityOf($, real)) ?? keyOf(real))
-  return { ...(await prepareVideo($, wave, title, await identityOf($, wave).catch(() => undefined))), kind: 'audio', origin: real }
 }
 
 // What to tell Claude and the person when a video can't be cut into frames.
@@ -347,29 +247,13 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
     kind: 'no_ffmpeg', title: 'Videos need ffmpeg', message: NO_FFMPEG, prompt: FFMPEG_PROMPT,
     text: "ffmpeg isn't installed, so this video can't play here. Pictures still work. Copy the prompt and paste it to Claude to install it, or run `brew install ffmpeg` yourself. No Homebrew? Get it from brew.sh first.",
   }
-  if (/^not audio:/i.test(raw)) return {
-    kind: 'not_image', title: "This isn't an audio file",
-    text: `${name} isn't MP3 or WAV, so it can't play here. Convert it to WAV and show it again.`,
-    message: `${shown} isn't an audio file (show_audio opens MP3 and WAV). Convert it, for example to WAV with ffmpeg, then show it again; use show_video for a video with sound.`,
-    prompt: `Convert ${shown} to WAV (or MP3) for me, then show it to me again.`,
-  }
-  if (/does not contain any stream|matches no streams|no frames in|Output file is empty/i.test(raw)) return AUDIO.test(path) ? {
-    kind: 'no_picture', title: "This audio can't be read",
-    text: `${name} is too short or empty to draw, so there's nothing to play.`,
-    message: `${shown} is too short or empty to play. Don't retry it; show a real audio file instead.`,
-    prompt: `${shown} is too short to play. Find a real audio file and show it to me again.`,
-  } : {
+  if (/does not contain any stream|matches no streams|no frames in|Output file is empty/i.test(raw)) return {
     kind: 'no_picture', title: 'This video has no picture',
     text: `${name} has sound but no picture, so there's nothing to play.`,
     message: `${shown} has no video track (sound only), so there's nothing to play. Don't retry it; show a file with a picture instead.`,
     prompt: `${shown} has no picture, only sound. Find the right video and show it to me again.`,
   }
-  if (/ffmpeg could not read|Invalid data|moov atom|could not find codec|Error opening input/i.test(raw)) return AUDIO.test(path) ? {
-    kind: 'broken_video', title: "This audio can't be read",
-    text: `${name} couldn't be opened as audio. It may be cut off, still being written, or not really an audio file.`,
-    message: `${shown} couldn't be read as audio: it's damaged, unfinished (still being recorded or cut off), or not an audio file. Re-export it, then show it again.`,
-    prompt: `${shown} couldn't be read as audio. Check it, re-export it if it's broken, then show it to me again.`,
-  } : {
+  if (/ffmpeg could not read|Invalid data|moov atom|could not find codec|Error opening input/i.test(raw)) return {
     kind: 'broken_video', title: "This video can't be read",
     text: `${name} couldn't be opened as a video. It may be cut off, still being written, or not really a video.`,
     message: `${shown} couldn't be read as a video: it's damaged, unfinished (still recording or cut off), or not a video. Re-export or re-record it, then show it again.`,
@@ -390,8 +274,15 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
   if (/pages need Chrome or Chromium/i.test(raw)) return {
     kind: 'other', title: 'Pages need a browser',
     text: `${name} is an HTML page, and no Chrome or Chromium was found to render it. Copy the prompt and paste it to Claude to install one, or install it yourself.`,
-    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Install Chrome or Chromium, then restart Claude Code and show it again.`,
+    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Screenshot it with headless Playwright instead and show that with show_image.`,
     prompt: `Install Google Chrome or Chromium for me, then restart Claude Code. After that, show ${shown} to me again.`,
+  }
+  // A page Chrome couldn't render still reaches the person as a picture.
+  if (/the page couldn't be rendered/i.test(raw)) return {
+    kind: 'other', title: "Couldn't render the page",
+    text: `${name} couldn't be rendered as a page. Claude can screenshot it another way and show that.`,
+    message: `${shown} couldn't be rendered as a page. Screenshot it with headless Playwright instead and show that with show_image.`,
+    prompt: `${shown} couldn't be rendered as a page. Screenshot it with headless Playwright and show it to me with show_image.`,
   }
   const detail = (raw.split('\n')[0] ?? '').replace(/\/(?:private\/)?tmp\/\S+|\S*\/\.show-your-work\/\S+/g, name).slice(0, 160)
   return {
@@ -1258,7 +1149,6 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   const real = stat.realPath ?? path
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
-  if (isAudio(real)) return prepareAudio($, real, name, key ?? (await identityOf($, real)))
   let png = real
   if (isPage(real)) {
     // An HTML page becomes one fixed-window picture; its own file stays the

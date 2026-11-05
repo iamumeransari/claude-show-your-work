@@ -58,3 +58,11 @@ test('with no Chrome there is a plain prompt to install one', async () => {
   const n = noticeOf(new Error('pages need Chrome or Chromium'), '/tmp/x/report.html', '/home/u')
   expect(n.prompt.toLowerCase()).toContain('chrome')
 })
+
+test('a page that cannot be rendered falls back to a screenshot shown with show_image', () => {
+  for (const raw of ['pages need Chrome or Chromium', "the page couldn't be rendered by Chrome or Chromium"]) {
+    const n = noticeOf(new Error(raw), '/tmp/x/report.html', '/home/u')
+    expect(n.message).toContain('Playwright')
+    expect(n.message).toContain('show_image')
+  }
+})

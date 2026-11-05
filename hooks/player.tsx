@@ -10,10 +10,9 @@ import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
 import { compareFrame, frameFile, frameReady, htmlOpenArgv, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, isRunCut, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
-import { docPage, documentView } from './document'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
-import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_TAIL_S, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
+import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
 
 // Playback per drawn site (a transcript row's tool_use_id, or the pane).
 type Player = {
@@ -646,7 +645,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       return one.frame === startFrame && at - waitSince < SOUND_WAIT_MS ? 'hold' : 'silent'
     }
     const from = one.frame / frames.fps
-    if (!soundLeft(track, from, media.kind === 'audio' ? 0 : SOUND_TAIL_S)) return 'silent'
+    if (!soundLeft(track, from)) return 'silent'
     // A second of frames ahead first, so the sound doesn't stop again at once.
     const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
     if (!isRunCut(media, one.frame, ahead)) {
@@ -802,26 +801,6 @@ function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: 
   if (frame.columns === box.columns && frame.rows === box.rows) return image
   // A side smaller than the frame it shares sits centred in it, unfilled.
   return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{image}</Box>
-}
-
-// A document's pages: back and forward, with the count between them. Nothing
-// plays and nothing sounds; a page is a picture the reader turns to.
-function Pager(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number) {
-  const { Box, Text, Button } = ui
-  const one = player(site)
-  const pages = media.pages!
-  const at = Math.min(one.frame, pages.count - 1)
-  const go = (to: number) => {
-    one.frame = Math.max(0, Math.min(to, pages.count - 1))
-    redraw($, site)
-  }
-  return (
-    <Box flexDirection="row" flexWrap="nowrap" width={width} columnGap={2}>
-      {pages.count > 1 && <Button key="prev" plain dimColor={at === 0} label="‹ Prev" onPress={() => { act('page_prev'); go(at - 1) }} />}
-      <Text dimColor>{` Page ${at + 1} of ${pages.count} `}</Text>
-      {pages.count > 1 && <Button key="next" plain dimColor={at >= pages.count - 1} label="Next ›" onPress={() => { act('page_next'); go(at + 1) }} />}
-    </Box>
-  )
 }
 
 // The scrub row: the play control, elapsed, a clickable bar, total — exactly
@@ -1377,8 +1356,8 @@ export function terminalOf(env: { program: string; term: string; kitty: boolean;
 // The README's list of terminals that draw pictures.
 const TERMINALS = 'https://github.com/iamumeransari/claude-show-your-work#terminals'
 
-export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video' | 'audio' | 'document', id: string) {
-  const what = kind === 'video' ? 'videos' : kind === 'audio' ? 'audio' : kind === 'document' ? 'documents' : 'pictures'
+export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video', id: string) {
+  const what = kind === 'video' ? 'videos' : 'pictures'
   // Claude Code keeps pictures off inside tmux unless FORCE is set at launch;
   // with it, the plugin passes them through (see tmux.ts).
   if (cause === 'tmux') return {
@@ -1470,7 +1449,7 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
 // original moved): say so in place of a blank box, with a prompt to paste.
 export function expiredPrompt(shown: Shown): string {
   const file = shown.origin ?? shown.source ?? shown.path
-  const kind = shown.kind === 'audio' ? 'audio' : shown.frames ? 'video' : 'image'
+  const kind = shown.frames ? 'video' : 'image'
   return `The ${kind} preview "${shown.title}" expired (${file} is gone). Please regenerate it and show it to me again with show_${kind}${shown.compare ? ', with the same compare' : ''}${shown.changes?.length ? ' and the same list of changes' : ''}.`
 }
 function Expired(ui: Ui, $: EngineInterface, shown: Shown, width: number) {
@@ -1522,13 +1501,7 @@ export async function Viewer(
   const ui = $.ui.resolve(e) as Ui
   const { Box, Text, Button, Link } = ui
   const one = player(site)
-  const baseMedia = sideOf(shown, site)
-  const docPages = baseMedia.pages
-  let media = baseMedia
-  if (docPages) {
-    const file = await docPage($, baseMedia, one.frame)
-    if (file) media = { ...baseMedia, path: file, source: file, origin: baseMedia.origin ?? baseMedia.source, ...(await pngSize($, file)), generation: baseMedia.generation + one.frame }
-  }
+  const media = sideOf(shown, site)
   const frames = media.frames
   const source = media.origin ?? media.source ?? media.path
   const columns = viewport?.columns ?? 100
@@ -1539,7 +1512,7 @@ export async function Viewer(
   // Each side is drawn from the copy that fits its box (see fitCopy).
   // iTerm2 scales a picture into its box itself, so it never needs a copy
   // fitted to the box (which also shrank the box after the first draw).
-  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side) fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
@@ -1623,39 +1596,29 @@ export async function Viewer(
   const hasSound = !!track && track.status !== 'none'
   if (soundUsable() && frames && !track) void $.clock.sleep(SHARPEN_DELAY_MS).then(() => probeSound($, media.source, frames)).then(t => { if (t && t.status !== 'none') redraw($, site) }, () => undefined)
   const actions = Actions(ui, $, media, source, isNarrow)
-  // The top corner opens it: the page it shows, a document its rendered page,
-  // else the file itself. Only a web address opens as a page: a model's url
-  // could name an app, a script or an option for `open`.
+  // The top corner opens it: the page it shows, else the file itself.
+  // Only a web address opens as a page: a model's url could name an app, a
+  // script or an option for `open`.
   const at = urlAt(media, frames ? one.frame / frames.fps : 0)
   const page = (at && /^https?:\/\/[^\s]+$/i.test(at) ? at : undefined) ?? (/\.html?$/i.test(source) ? source : undefined)
-  // A printed document's rendered page: the same preview the card shows, as
-  // its own small window — the raw Markdown would land in a text editor.
-  const rendered = media.kind === 'document' ? media.documentOpen : undefined
   const opener = (
     <Button
       key="page"
       plain
-      label={rendered ? '↗ Open document' : page ? '↗ Open page' : '↗ View'}
-      onPress={async () => {
+      label={page ? '↗ Open page' : '↗ View'}
+      onPress={() => {
         // Watched elsewhere now: the video here pauses.
         if (one.timer) stop($, site)
-        // Refresh an old card's printed preview after plugin updates. Never
-        // silently fall back to stale HTML if regeneration fails.
-        let target = rendered ?? page
-        if (rendered) {
-          try { target = await documentView($, baseMedia) ?? undefined }
-          catch (error) { $.ui.toast(`Could not open document: ${String(error).slice(0, 160)}`); return }
-          if (!target) { $.ui.toast('Could not prepare the document preview.'); return }
-        }
         // A local page opens in its own small window, the way an image opens
         // in an image viewer: the same engine that rendered the preview, as
         // a standalone viewer with no tabs and no desktop file-handler say.
-        const artifact = (rendered || (page && /\.html?$/i.test(source))) && state.chrome && !state.isMac
+        // A headless shell has no window: the default browser opens it then.
+        const artifact = page && /\.html?$/i.test(source) && state.chrome && !state.isMac && !/headless[_-]?shell$/i.test(state.chrome)
         const argv = artifact
-          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, target!)]
-          : openArgv(target ?? source)
-        void $.process.run(argv).then(r =>
-          $.ui.toast(r.exitCode === 0 ? `Opened ${(target ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, target ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', target ?? source)),
+          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
+          : openArgv(page ?? source)
+        act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
+          $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
         )
       }}
     />
@@ -1670,13 +1633,9 @@ export async function Viewer(
   const stage = (
     <Box flexDirection="column" width={rowWidth} alignItems="center">
       {Picture(ui, $, site, shown, media, own, pic, box)}
-      {docPages && Pager(ui, $, site, media, rowWidth)}
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
-          {/* Audio with no way to be heard (no ffplay, or the session's speakers
-              are another room's) plays silently; that must be said, not silent. */}
-          {frames && media.kind === 'audio' && !soundUsable() && <Text dimColor>♪ no sound in this session</Text>}
           {frames && <Button key="back" plain dimColor label={`« ${SKIP_SECONDS}s`} onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - SKIP_SECONDS, shown, true)} />}
           {frames && <Button key="forward" plain dimColor label={`${SKIP_SECONDS}s »`} onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + SKIP_SECONDS, shown, true)} />}
           {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? '♪ Mute' : '♪ Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
@@ -1778,8 +1737,7 @@ async function SplitView(
         ) : null}
       </Box>
       {Scrub(ui, $, site, shown, width, shown)}
-      {/* The person's file, not the generated waveform clip behind it. */}
-      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.origin ?? shown.source ?? shown.path, width < 60)}</Box>
+      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.source ?? shown.path, width < 60)}</Box>
       {(fixed.length > 0 || broken.length > 0) && (
         <Box flexDirection="column" marginTop={1}>
           <Text dimColor>{fixed.length} fixed · {broken.length} broke · click one to jump there</Text>
@@ -1798,7 +1756,7 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : tool.endsWith('audio') ? (isRunning ? 'Cutting audio' : 'Audio') : tool.endsWith('document') ? (isRunning ? 'Rasterizing document' : 'Document') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : tool.endsWith('audio') ? '♪' : tool.endsWith('document') ? '▦' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }

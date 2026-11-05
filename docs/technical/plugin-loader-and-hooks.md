@@ -29,3 +29,15 @@ Things the Claude Code hooks loader and runtime enforce. Breaking one of the loa
 - An `Image` source that equals the last one drawn is not sent again. That's why sources carry a `generation` (see `showing-images.md`).
 - A process that must outlive the session (the channel move) is started through `DETACH` (`updater.ts`), which forks it into a session of its own with perl's POSIX module.
 - **On Team and Enterprise logins, Claude Code's `cc-plugin-sec-default` guard runs ahead of every mod and skips their `prompt.compose` hooks** (each session prints "its prompt.compose hook was skipped"). Anything Claude must read goes as `prompt.submit` context instead, which the guard leaves alone (#13).
+
+## Interactive pages: tried and dropped (2026-11)
+
+A live page inside a transcript row was prototyped (a hidden browser over CDP, its frames swapped into an `Image`) and dropped: in the terminal it can't match using the real app, which Open page already opens. What it established about the engine:
+
+- A `Client` can't draw pictures (`ClientElements` has no `Image` or `Raster`), but an empty `Client` in a `position: "absolute"` Box laid exactly over an `Image` leaves the picture drawn and receives every pointer event over it, in cells (and `fine` sub-cell positions where the terminal reports pixels).
+- After a `down` in a `Client`'s region it holds the pointer until the `up`: the transcript neither selects text nor scrolls meanwhile.
+- `surface.post` delivers at most one post per frame (a later one replaces an undelivered one), so a press and release in one frame arrive as the release alone. Queue events in the instance's state until the hooks module acknowledges them through `{ props }`.
+- Keys reach a `Client` only after a click gives it the focus; Escape returns it. A burst typed at once can arrive as one multi-character `key`.
+- The mouse wheel can't be caught over a transcript row: `ui.scroll` only fires for a `Pane` body or the `AbovePrompt` band.
+- A hook that passes `$` to a helper needs that helper declared at the top of its file, or the loader refuses the module.
+- Headless Chrome: `Page.setWebLifecycleState` frozen never draws again after `active`, and headless tabs are always visible. Playwright's Chrome for Testing 1234 hung on `--screenshot` on macOS; its headless shell renders in ~0.3–1.5 s.

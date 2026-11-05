@@ -108,6 +108,8 @@ export function openFailure(r: { exitCode: number; stderr: string }, what: strin
 // The narrowest the scrub and button rows get, in columns: room for the play
 // button, both times, a usable bar and the action buttons on one line.
 const CONTROLS_MIN = 64
+// Page buttons, the count and the actions on one line: about 78 columns.
+const DOC_CONTROLS_MIN = 80
 
 // A picture is drawn from a copy that fits its box. Ghostty crops a picture
 // bigger than its box instead of shrinking it (a Large video made for a wide
@@ -806,10 +808,11 @@ function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: 
   return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{image}</Box>
 }
 
-// A document's pages: back and forward, with the count between them. Nothing
+// A document's pages: back and forward, with the count between them, on
+// the left of the row under the page, where a video's skips sit. Nothing
 // plays and nothing sounds; a page is a picture the reader turns to.
-function Pager(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number) {
-  const { Box, Text, Button } = ui
+function PageButtons(ui: Ui, $: EngineInterface, site: string, media: Shown) {
+  const { Text, Button } = ui
   const one = player(site)
   const pages = media.pages!
   const at = Math.min(one.frame, pages.count - 1)
@@ -817,17 +820,13 @@ function Pager(ui: Ui, $: EngineInterface, site: string, media: Shown, width: nu
     one.frame = Math.max(0, Math.min(to, pages.count - 1))
     redraw($, site)
   }
-  return (
-    <Box flexDirection="row" flexWrap="nowrap" width={width} columnGap={2}>
-      {pages.count > 1 && <Button key="prev" plain dimColor={at === 0} label="‹ Prev" onPress={() => { act('page_prev'); go(at - 1) }} />}
-      <Text dimColor>{` Page ${at + 1} of ${pages.count} `}</Text>
-      {pages.count > 1 && <Button key="next" plain dimColor={at >= pages.count - 1} label="Next ›" onPress={() => { act('page_next'); go(at + 1) }} />}
-    </Box>
-  )
+  return [
+    pages.count > 1 && <Button key="prev" plain dimColor={at === 0} label="‹ Prev" onPress={() => { act('page_prev'); go(at - 1) }} />,
+    <Text key="page-count" dimColor>{`Page ${at + 1} of ${pages.count}`}</Text>,
+    pages.count > 1 && <Button key="next" plain dimColor={at >= pages.count - 1} label="Next ›" onPress={() => { act('page_next'); go(at + 1) }} />,
+  ]
 }
 
-// The scrub row: the play control, elapsed, a clickable bar, total — exactly
-// as wide as the picture.
 function Scrub(ui: Ui, $: EngineInterface, site: string, media: Shown, width: number, shown?: Shown) {
   const { Box, Text, Button } = ui
   const one = player(site)
@@ -1697,15 +1696,16 @@ export async function Viewer(
   // line each; the picture sits centred above them.
   // ...but never wider than the window has room for.
   // At least the controls' width, and the title bar's tabs with a little title.
-  const controlsMin = Math.min(Math.max(CONTROLS_MIN, tabsWidth(shown) + 14), columns - 8)
+  // A document's row holds the page buttons and the actions side by side.
+  const controlsMin = Math.min(Math.max(docPages ? DOC_CONTROLS_MIN : CONTROLS_MIN, tabsWidth(shown) + 14), columns - 8)
   const rowWidth = Math.max(box.columns, controlsMin)
   const stage = (
     <Box flexDirection="column" width={rowWidth} alignItems="center">
       {Picture(ui, $, site, shown, media, own, pic, box)}
-      {docPages && Pager(ui, $, site, media, rowWidth)}
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
+          {docPages && PageButtons(ui, $, site, media)}
           {/* Audio with no way to be heard (no ffplay, or the session's speakers
               are another room's) plays silently; that must be said, not silent. */}
           {frames && media.kind === 'audio' && !soundUsable() && <Text dimColor>♪ no sound in this session</Text>}

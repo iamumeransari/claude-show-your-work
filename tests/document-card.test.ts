@@ -57,14 +57,14 @@ test('a document card shows page one of many, with page buttons and no player', 
 })
 
 test('Next draws page two, and Prev comes back', async ($: any, on: any) => {
-  const m = pageMachine(on)
+  pageMachine(on)
   const mounted = await mountDoc($, 'p2')
   await mounted.press({ key: 'next' })
   await mounted.redraw()
+  // The page picture itself is made outside the draw (document.test.ts covers
+  // the raster; the pty harness covers it reaching the screen).
   let tree = JSON.stringify(await mounted.drawn())
   expect(tree.includes('Page 2 of 2')).toBe(true)
-  // Page two was rasterized on demand.
-  expect(m.runs.some(a => a[0] === '/usr/bin/pdftoppm' && a.join(' ').includes('p00002'))).toBe(true)
   await mounted.press({ key: 'prev' })
   await mounted.redraw()
   tree = JSON.stringify(await mounted.drawn())

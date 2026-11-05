@@ -27,22 +27,27 @@ test('a waveform strip is the whole clip, one colour, on the card', () => {
 test('the clip command keeps the waveform still and moves only the colour and the bar', () => {
   const argv = waveArgv('/usr/bin/ffmpeg', '/tmp/bright.png', '/tmp/dim.png', '/tmp/tone.mp3', '/tmp/wave.part', 12.04)
   const graph = argv.join(' ')
-  // The position picks what shows: the played part glows, the rest stays dim.
-  expect(graph).toContain('blend=all_expr=')
-  expect(graph).toContain('lte(X,W*T/12.04')
-  // A thin bar marks the moment itself, either side of it, in true white:
-  // blending in the input's own space paints the chroma planes too, and the
-  // bar comes out magenta. Both sides go to planar RGB first.
-  expect(graph).toContain('lt(abs(X-W*T/12.04')
-  expect(graph).toContain('format=gbrp')
-  expect(graph).toContain('),255,if(')
+  // The played part sweeps in by ffmpeg's own wipe, dim first, bright behind it.
+  expect(graph).toContain('xfade=transition=wiperight:duration=12.04')
+  expect(argv.indexOf('/tmp/dim.png')).toBeLessThan(argv.indexOf('/tmp/bright.png'))
+  // A thin white bar marks the moment itself.
+  expect(graph).toContain('color=c=white:s=3x')
+  expect(graph).toContain("overlay=x='W*t/12.04'")
   // The original audio rides along untouched, and the whole clip is covered.
-  expect(graph).toContain('-c:a')
-  expect(graph).toContain('copy')
-  expect(graph).toContain('-map')
-  expect(graph).toContain('2:a:0')
+  expect(graph).toContain('-c:a copy')
+  expect(graph).toContain('-map 2:a:0')
   expect(graph).toContain('-t 12.04')
   expect(graph).toContain('-f matroska')
+})
+
+test('a long clip is wiped on a shorter timeline and capped in frames', () => {
+  // ffmpeg's wipe lasts 60 s at most: three minutes is wiped over 60 s, stretched 3x.
+  const song = waveArgv('/usr/bin/ffmpeg', '/b.png', '/d.png', '/s.mp3', '/o', 180).join(' ')
+  expect(song).toContain('duration=60:offset=0,setpts=3*PTS,fps=12')
+  // An hour-long podcast keeps to 3,600 frames: one a second.
+  const podcast = waveArgv('/usr/bin/ffmpeg', '/b.png', '/d.png', '/s.mp3', '/o', 3600).join(' ')
+  expect(podcast).toContain('-framerate 1')
+  expect(podcast).toContain('setpts=60*PTS,fps=1')
 })
 
 test('a waveform clip is cut once and reused for the same file', async () => {

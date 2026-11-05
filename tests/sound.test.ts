@@ -45,6 +45,14 @@ test('sound never starts near the end, past the sound, or without a file', () =>
   expect(soundLeft(undefined, 0)).toBe(false)
 })
 
+test('standalone audio starts even when the whole clip is shorter than the video tail guard', () => {
+  const ready = { status: 'ready' as const, wav: '/t/blip.wav', seconds: 0.3 }
+  expect(soundLeft(ready, 0, 0)).toBe(true)
+  // The video default keeps guarding its half-second tail.
+  expect(soundLeft(ready, 0)).toBe(false)
+  expect(soundLeft(ready, 0.3, 0)).toBe(false)
+})
+
 test('a player with no sound running reads as off', () => {
   expect(soundNow('nowhere')).toStrictEqual({ kind: 'off' })
 })

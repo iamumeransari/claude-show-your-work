@@ -17,7 +17,7 @@ export type Summary = { label: string; ok: boolean; passed?: number; total?: num
 export type Overlay = 'center' | 'none'
 
 export type Shown = {
-  kind?: 'image' | 'video'
+  kind?: 'image' | 'video' | 'audio'
   // the PNG the terminal draws (a video's first frame)
   path: string
   // the file the user gave, for Open and Reveal

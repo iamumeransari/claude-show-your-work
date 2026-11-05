@@ -186,7 +186,7 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // names the right file.
 const fileUrl = (page: string) => `file://${page.split('/').map(encodeURIComponent).join('/')}`
 export const htmlOpenArgv = (chrome: string, page: string) => [
-  chrome, `--app=${fileUrl(page)}`, '--window-size=960,720',
+  chrome, '--no-first-run', '--no-default-browser-check', `--app=${fileUrl(page)}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
 ]
 export const htmlArgv = (chrome: string, page: string, png: string) => [

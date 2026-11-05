@@ -29,7 +29,7 @@ export function setUp($: EngineInterface): Promise<void> {
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || { p=; for a in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/* "/Applications/Chromium.app/Contents/MacOS/Chromium" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell; do [ -f "$a" ] && [ -x "$a" ] && p=$a; done; echo "$p"; })"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || { p=; for a in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/* "/Applications/Chromium.app/Contents/MacOS/Chromium" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell; do [ -f "$a" ] && [ -x "$a" ] && p=$a; done; echo "$p"; })"; echo "pp=$(command -v pdftoppm)"; echo "pi=$(command -v pdfinfo)"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
@@ -46,6 +46,8 @@ export function setUp($: EngineInterface): Promise<void> {
     // so Open page uses the default browser. With none, the install notice
     // shows instead of a failed render.
     state.chrome = got('ch')
+    state.pdftoppm = got('pp') || (state.isMac ? '/opt/homebrew/bin/pdftoppm' : '')
+    state.pdfinfo = got('pi') || (state.isMac ? '/opt/homebrew/bin/pdfinfo' : '')
     state.hasVideoTools = false
     // Over ssh the terminal can't read this machine's files: pictures go as bytes.
     const sshConnection = await Promise.resolve().then(() => $.env.get('SSH_CONNECTION')).catch(() => undefined)

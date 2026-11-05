@@ -13,7 +13,7 @@ test('a page is an html file, and only that', () => {
 
 test('Open page uses a small app window, not the system HTML handler', () => {
   const argv = htmlOpenArgv('/usr/bin/google-chrome', '/tmp/a b.html')
-  expect(argv).toStrictEqual(['/usr/bin/google-chrome', '--app=file:///tmp/a%20b.html', '--window-size=960,720', `--user-data-dir=${state.TMP}/page-viewer.profile`])
+  expect(argv).toStrictEqual(['/usr/bin/google-chrome', '--no-first-run', '--no-default-browser-check', '--app=file:///tmp/a%20b.html', '--window-size=960,720', `--user-data-dir=${state.TMP}/page-viewer.profile`])
   expect(argv).not.toContain('xdg-open')
 })
 

@@ -17,7 +17,7 @@ export type Summary = { label: string; ok: boolean; passed?: number; total?: num
 export type Overlay = 'center' | 'none'
 
 export type Shown = {
-  kind?: 'image' | 'video' | 'audio'
+  kind?: 'image' | 'video' | 'audio' | 'document'
   // the PNG the terminal draws (a video's first frame)
   path: string
   // the file the user gave, for Open and Reveal
@@ -60,6 +60,10 @@ export type Shown = {
   sync?: [number, number][]
   label?: string
   overlay?: Overlay
+  /** A document's pages: where they rasterize, how many there are, and the PDF each one comes from. */
+  pages?: { dir: string; count: number; pdf: string }
+  /** The printed page of a Markdown or Mermaid document, to open live. */
+  documentOpen?: string
 }
 
 declare module 'claude-code' {

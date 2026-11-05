@@ -38,7 +38,9 @@ export const SOUND_WAIT_MS = 3000
 // How long the picture may hold for the sound before playing on without it.
 export const SOUND_HOLD_MAX_MS = 6000
 // Too close to the end to be worth the start-up delay: finish silently.
-const SOUND_TAIL_S = 0.5
+// Standalone audio passes a zero tail: a short sound effect is still worth
+// hearing, even below half a second.
+export const SOUND_TAIL_S = 0.5
 
 // How long the output device takes to play what ffplay hands it: ~0.16 s for
 // AirPods, a few ms for built-in speakers. ffplay's position allows for its
@@ -198,8 +200,10 @@ export function soundNow(site: string, now = Date.now()): { kind: 'off' } | { ki
   return { kind: 'on', seconds: heardAt(run.clock, now - run.clockAt, outputLatency) }
 }
 
-// Whether a sound worth starting is left from this moment.
-export const soundLeft = (track: Track | undefined, from: number) => track?.status === 'ready' && from < track.seconds - SOUND_TAIL_S
+// Video skips starting too near its end. Standalone audio passes a zero tail:
+// a short sound effect is still worth hearing, even below half a second.
+export const soundLeft = (track: Track | undefined, from: number, tail = SOUND_TAIL_S) =>
+  track?.status === 'ready' && from < track.seconds - tail
 
 export function haltSound(site: string, why: string) {
   const run = runs.get(site)

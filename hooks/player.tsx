@@ -12,7 +12,7 @@ import { compareFrame, frameFile, frameReady, htmlOpenArgv, rawSizeOf, SKIP_SECO
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
-import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
+import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_TAIL_S, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
 
 // Playback per drawn site (a transcript row's tool_use_id, or the pane).
 type Player = {
@@ -645,7 +645,7 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
       return one.frame === startFrame && at - waitSince < SOUND_WAIT_MS ? 'hold' : 'silent'
     }
     const from = one.frame / frames.fps
-    if (!soundLeft(track, from)) return 'silent'
+    if (!soundLeft(track, from, media.kind === 'audio' ? 0 : SOUND_TAIL_S)) return 'silent'
     // A second of frames ahead first, so the sound doesn't stop again at once.
     const ahead = Math.min(frames.count - 1, one.frame + Math.round(frames.fps) - 1)
     if (!isRunCut(media, one.frame, ahead)) {
@@ -1356,8 +1356,8 @@ export function terminalOf(env: { program: string; term: string; kitty: boolean;
 // The README's list of terminals that draw pictures.
 const TERMINALS = 'https://github.com/iamumeransari/claude-show-your-work#terminals'
 
-export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video', id: string) {
-  const what = kind === 'video' ? 'videos' : 'pictures'
+export function cantDraw(cause: DrawCause, name: string, kind: 'picture' | 'video' | 'audio', id: string) {
+  const what = kind === 'video' ? 'videos' : kind === 'audio' ? 'audio' : 'pictures'
   // Claude Code keeps pictures off inside tmux unless FORCE is set at launch;
   // with it, the plugin passes them through (see tmux.ts).
   if (cause === 'tmux') return {
@@ -1449,7 +1449,7 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
 // original moved): say so in place of a blank box, with a prompt to paste.
 export function expiredPrompt(shown: Shown): string {
   const file = shown.origin ?? shown.source ?? shown.path
-  const kind = shown.frames ? 'video' : 'image'
+  const kind = shown.kind === 'audio' ? 'audio' : shown.frames ? 'video' : 'image'
   return `The ${kind} preview "${shown.title}" expired (${file} is gone). Please regenerate it and show it to me again with show_${kind}${shown.compare ? ', with the same compare' : ''}${shown.changes?.length ? ' and the same list of changes' : ''}.`
 }
 function Expired(ui: Ui, $: EngineInterface, shown: Shown, width: number) {
@@ -1617,7 +1617,7 @@ export async function Viewer(
           ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
           : openArgv(page ?? source)
         act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
-          $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
+          $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', page ?? source)),
         )
       }}
     />
@@ -1635,6 +1635,9 @@ export async function Viewer(
       {frames && Scrub(ui, $, site, media, rowWidth, shown)}
       <Box flexDirection="row" justifyContent="space-between" columnGap={2} flexWrap="wrap" width={rowWidth}>
         <Box flexDirection="row" columnGap={2}>
+          {/* Audio with no way to be heard (no ffplay, or the session's speakers
+              are another room's) plays silently; that must be said, not silent. */}
+          {frames && media.kind === 'audio' && !soundUsable() && <Text dimColor>♪ no sound in this session</Text>}
           {frames && <Button key="back" plain dimColor label={`« ${SKIP_SECONDS}s`} onPress={() => act('skip_back') || seek($, site, media, one.frame / frames.fps - SKIP_SECONDS, shown, true)} />}
           {frames && <Button key="forward" plain dimColor label={`${SKIP_SECONDS}s »`} onPress={() => act('skip_forward') || seek($, site, media, one.frame / frames.fps + SKIP_SECONDS, shown, true)} />}
           {hasSound && <Button key="sound" plain dimColor={!state.isSoundOn} label={state.isSoundOn ? '♪ Mute' : '♪ Unmute'} onPress={() => { act(state.isSoundOn ? 'mute' : 'unmute'); toggleSound($, site, media) }} />}
@@ -1736,7 +1739,8 @@ async function SplitView(
         ) : null}
       </Box>
       {Scrub(ui, $, site, shown, width, shown)}
-      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.source ?? shown.path, width < 60)}</Box>
+      {/* The person's file, not the generated waveform clip behind it. */}
+      <Box width={width} justifyContent="flex-end">{Actions(ui, $, shown, shown.origin ?? shown.source ?? shown.path, width < 60)}</Box>
       {(fixed.length > 0 || broken.length > 0) && (
         <Box flexDirection="column" marginTop={1}>
           <Text dimColor>{fixed.length} fixed · {broken.length} broke · click one to jump there</Text>
@@ -1755,7 +1759,7 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : tool.endsWith('audio') ? (isRunning ? 'Cutting audio' : 'Audio') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : tool.endsWith('audio') ? '♪' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }

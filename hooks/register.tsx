@@ -11,9 +11,9 @@ import type { PaneProps } from './layout'
 import { debug, diagnosis, flushDebug } from './diagnostics'
 import { flush, track } from './telemetry'
 import { setUp } from './setup'
-import { haltAllSound } from './sound'
+import { haltAllSound, soundUsable } from './sound'
 import { forwardPictures, stopForwarding } from './tmux'
-import { CLEAN_SH, exists, expand, findPasted, identityOf, isPage, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, renderPage, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
+import { CLEAN_SH, exists, expand, findPasted, identityOf, isAudio, isPage, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, renderPage, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
 import { hadVersionBefore06, PLUGIN } from './updater'
@@ -23,7 +23,7 @@ import { ensureSettings, goToStop, loadSettings, Opening, openSettings, openUpda
 
 const PANE = 'show-your-work'
 // The tools, and their names from before the rename, so old windows still draw.
-const TOOLS = ['show_image', 'show_video', 'show_html'].map(t => `mcp__show-your-work__${t}`)
+const TOOLS = ['show_image', 'show_video', 'show_html', 'show_audio'].map(t => `mcp__show-your-work__${t}`)
 // Screenshots and recordings made only to be shown go to the temp folder, so
 // they don't pile up in the project; the history keeps its own copy.
 const SCRATCH_NOTE = 'Save screenshots and recordings you make to show here in a temporary folder, such as $TMPDIR or /tmp, not in the project. Save them in the project only when the user asks to keep them, or when the project already has a folder for them, such as one for test screenshots.'
@@ -172,10 +172,22 @@ export const register: Register = on => {
       description: 'Preview a local HTML file in the chat: /page <path>. Open page opens the live page in your browser.',
       argumentHint: '<path>',
     })
+    await $.command.register({
+      name: 'audio',
+      description: 'Play an audio file in the chat: /audio <path>',
+      argumentHint: '<path>',
+    })
     await $.tool.register({
       name: 'show_html',
       description: 'Shows a local HTML file as a static preview inline in the terminal, using Chrome or Chromium. Accepts .html and .htm files. The preview is a fixed 1280 by 800 viewport, not an interactive page: scrolling, forms and sound work only after the person chooses Open page in their browser. Use it for HTML reports, page designs and small artifacts you have made. Pass path and an optional title; changes, summary and previous work as for show_image. No URL navigation. The file may execute scripts while Chrome renders it; use only pages you intend to render. The person sees the preview; you do not.',
       inputSchema: IMAGE_INPUT,
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'show_audio',
+      description:
+        `Plays an audio file to the user, inline in their terminal: the whole clip's waveform with a playhead that follows playback, and Play, scrubbing and skips like the video player. Accepts MP3 and WAV.\n\nUse it without being asked whenever the user asks to hear something: a sound effect, a voice memo, music, a generated track or a text-to-speech clip you have made. Sound plays once the person presses Play, on the machine's speakers.\n\nPass \`path\` and an optional \`title\`; \`changes\` with \`at\` (the second it appears) and \`checks\` mark moments in the clip like in a video. The person hears it; you do not.\n\n${SCRATCH_NOTE}`,
+      inputSchema: TOOL_INPUT,
       isDeferred: false,
     })
     await $.tool.register({
@@ -281,7 +293,27 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html)$/ }, async ($, e) => {
+  on('command.run', { command: 'audio' }, async ($, invoked) => {
+    await setUp($)
+    const arg = expand(invoked.args.trim(), state.cwd, state.home)
+    if (!invoked.args.trim()) return { text: 'Usage: /audio <path to a local .mp3 or .wav file>' }
+    if (!isAudio(arg)) return { text: 'Audio is .mp3 or .wav files. For images and videos use /img <path>, for HTML pages /page <path>.' }
+    try {
+      const shown = await prepare($, arg)
+      const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
+      shownById.set(id, shown)
+      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+
+      track('audio_command', { kind: shown.frames ? 'audio' : 'image' })
+      return { text: `Showing ${shown.title}.${soundUsable() ? ' Press Play to hear it.' : ''}\n${MARK}#${id}` }
+    } catch (err) {
+      const n = noticeOf(err, arg, state.home)
+      track('show_failed', { from: 'audio_command', reason: REASONS[n.kind] })
+      return { text: n.message }
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html|audio)$/ }, async ($, e) => {
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -301,7 +333,10 @@ export const register: Register = on => {
       // picture, and the card's source stays the page itself, so Open page
       // opens it.
       const page = isPage(input.path)
-      if (!MEDIA.test(input.path) && !page) throw new Error(`not an image: ${input.path}`)
+      const audio = isAudio(input.path)
+      if (String((e as { tool?: string }).tool ?? '').endsWith('audio') && !audio)
+        throw new Error(`not audio: ${input.path}`)
+      if (!MEDIA.test(input.path) && !page && !audio) throw new Error(`not an image: ${input.path}`)
       const pagePng = page ? await renderPage($, input.path, keyOf(`${input.path}|${await $.clock.now()}`).slice(0, 10)) : undefined
       const kept = await storeVersion($, pagePng ?? input.path!, note, input.title, parent)
         .catch(() => ({ real: pagePng ?? input.path!, copy: pagePng ?? input.path!, id: '', chain: [] as { path: string; note?: string; id: string }[], missing: undefined as string | undefined }))
@@ -317,7 +352,7 @@ export const register: Register = on => {
         pr: input.pr,
         url: input.url,
         checks: input.checks,
-        changes: timesThatMean(input.changes, VIDEO.test(input.path)),
+        changes: timesThatMean(input.changes, VIDEO.test(input.path) || audio),
         summary: input.summary,
         label: input.label,
         overlay: input.overlay,
@@ -346,7 +381,7 @@ export const register: Register = on => {
       }
       if (!shown.frames && kept.copy !== kept.real)
         remember(kept.copy, { kind: shown.kind, path: shown.path, source: shown.source, width: shown.width, height: shown.height, title: 'Original', generation: shown.generation })
-      const what = shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
+      const what = shown.kind === 'audio' ? `audio, ${clock(shown.frames!.duration)}` : shown.frames ? `video, ${clock(shown.frames.duration)}` : `${shown.sourceWidth ?? shown.width}×${shown.sourceHeight ?? shown.height}`
       const checks = [...(shown.checks ?? []), ...(shown.compare?.checks ?? [])]
       track(shown.frames ? 'video_shown' : 'image_shown', {
         format: (input.path.match(/\.([a-z0-9]+)$/i)?.[1] ?? 'none').toLowerCase().slice(0, 5),
@@ -369,7 +404,7 @@ export const register: Register = on => {
       const hint = (kept.missing ? ` #${kept.missing} wasn't found, so this has no history.` : '') + handle
       const opening = state.canImage
         ? `Shown: ${shown.title} (${what}).`
-        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
+        : `Not shown: ${cantDraw(state.drawCause, shown.title, shown.kind === 'audio' ? 'audio' : shown.frames ? 'video' : 'picture', state.sessionId).claude} Don't say it was shown.`
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
@@ -384,7 +419,7 @@ export const register: Register = on => {
       if (copied) void $.process.run(['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
       const n = noticeOf(err, expand(input.path ?? '', state.cwd, state.home), state.home)
       notices.set(e.tool_use_id, n)
-      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : 'show_image', reason: REASONS[n.kind] })
+      track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : 'show_image', reason: REASONS[n.kind] })
       return { deny: `show-your-work: ${n.message}` }
     }
   }).catch(() => ({ deny: 'show-your-work: it could not be shown.' }))
@@ -502,7 +537,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const row = e.props as { command?: string; args?: string; text?: string; isErrored?: boolean; onScreen?: unknown }
     // /img and /page: the player, in the chat under the command.
-    if ((row.command === 'img' || row.command === 'page') && !row.isErrored && (row.text ?? '').includes(MARK)) {
+    if ((row.command === 'img' || row.command === 'page' || row.command === 'audio') && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
       await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
@@ -548,7 +583,7 @@ export const register: Register = on => {
 
 // What Claude is told about showing its work, for the state pictures are in now.
 function hintNow() {
-  if (state.canImage) return "This terminal shows pictures, videos and HTML pages inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after."
+  if (state.canImage) return "This terminal shows pictures, videos, HTML pages and audio inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after. When the user asks to hear something, or you've made audio, play it with show_audio (MP3 or WAV)."
   const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
-  return `show-your-work: pictures, videos and HTML pages can't draw in this session (${why}) Anything shown with show_image, show_video or show_html was not seen: the person saw a notice instead. Don't say they saw it.`
+  return `show-your-work: pictures, videos, HTML pages and audio can't draw in this session (${why}) Anything shown with show_image, show_video, show_html or show_audio was not seen: the person saw a notice instead. Don't say they saw it.`
 }

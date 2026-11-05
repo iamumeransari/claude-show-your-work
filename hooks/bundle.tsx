@@ -475,6 +475,40 @@ export function shiftTimes<T extends { at?: number }>(list: T[] | undefined, lea
   return list.map(c => (c.at === undefined ? c : { ...c, at: Math.max(0, +(c.at - lead).toFixed(2)) }))
 }
 
+// HTML is rendered as a fixed viewport, not an interactive browser. The
+// original stays the Open page target; only its screenshot enters history.
+export const isPage = (path: string) => /\.html?$/i.test(path)
+// The page's own window: the browser engine as a small standalone viewer, the
+// way an image opens in an image viewer — no tabs, no address bar, and none of
+// the desktop's file-handler surprises (a hijacked text/html default). Its own
+// profile: the person's running browser never takes the window over, and the
+// viewer carries none of their logins.
+export const htmlOpenArgv = (chrome: string, page: string) => [
+  chrome, `--app=file://${page.split('/').map(encodeURIComponent).join('/')}`, '--window-size=960,720',
+  `--user-data-dir=${state.TMP}/page-viewer.profile`,
+]
+export const htmlArgv = (chrome: string, page: string, png: string) => [
+  chrome, '--headless=new', '--disable-gpu', '--hide-scrollbars',
+  '--no-first-run', '--no-default-browser-check', '--mute-audio',
+  `--user-data-dir=${png}.profile`, '--window-size=1280,800',
+  '--virtual-time-budget=1000', `--screenshot=${png}`, `file://${page.split('/').map(encodeURIComponent).join('/')}`,
+]
+export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
+  if (!state.chrome) throw new Error('pages need Chrome or Chromium')
+  const folder = await $.process.run(['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
+  const dir = folder.stdout.trim()
+  if (folder.exitCode !== 0 || !dir.startsWith(`${state.TMP}/page-`)) throw new Error("the page couldn't be rendered: could not create its temporary folder")
+  const png = `${dir}/page-${key}.png`
+  try {
+    const result = await $.process.run(htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
+    if (result.exitCode !== 0 || !(await exists($, png))) throw new Error("the page couldn't be rendered by Chrome or Chromium")
+    return png
+  } finally {
+    // A fresh browser profile, never the person's login, cookies or extensions.
+    await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
+  }
+}
+
 // What to tell Claude and the person when a video can't be cut into frames.
 export const NO_FFMPEG =
   "videos need ffmpeg, and it isn't installed. Pictures still work. Install it with `brew install ffmpeg` " +
@@ -534,6 +568,12 @@ export function noticeOf(err: unknown, path: string, homeDir = ''): Notice {
     text: `There's no file at ${shown}.`,
     message: `There's no file at ${shown}. Check the path (it may have moved or not been saved yet), then show it again.`,
     prompt: `There's no file at ${shown}. Find the right file and show it to me again.`,
+  }
+  if (/pages need Chrome or Chromium/i.test(raw)) return {
+    kind: 'other', title: 'Pages need a browser',
+    text: `${name} is an HTML page, and no Chrome or Chromium was found to render it. Copy the prompt and paste it to Claude to install one, or install it yourself.`,
+    message: `${shown} is an HTML page, and no Chrome or Chromium was found to render it. Install Chrome or Chromium, then restart Claude Code and show it again.`,
+    prompt: `Install Google Chrome or Chromium for me, then restart Claude Code. After that, show ${shown} to me again.`,
   }
   const detail = (raw.split('\n')[0] ?? '').replace(/\/(?:private\/)?tmp\/\S+|\S*\/\.show-your-work\/\S+/g, name).slice(0, 160)
   return {
@@ -1401,7 +1441,11 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
   let png = real
-  if (!/\.png$/i.test(real)) {
+  if (isPage(real)) {
+    // An HTML page becomes one fixed-window picture; its own file stays the
+    // source, so the player's corner opens the page itself in the browser.
+    png = await renderPage($, real, (key ?? (await identityOf($, real)) ?? keyOf(real)).slice(0, 10))
+  } else if (!/\.png$/i.test(real)) {
     state.generation += 1
     png = `${state.TMP}/${real.split('/').pop()!.replace(/\.[^.]+$/, '')}-${state.generation}.png`
     await $.process.run(['mkdir', '-p', state.TMP])
@@ -3624,7 +3668,14 @@ export async function Viewer(
       onPress={() => {
         // Watched elsewhere now: the video here pauses.
         if (one.timer) stop($, site)
-        act(page ? 'open_page' : 'open_file') || void $.process.run(openArgv(page ?? source)).then(r =>
+        // A local page opens in its own small window, the way an image opens
+        // in an image viewer: the same engine that rendered the preview, as
+        // a standalone viewer with no tabs and no desktop file-handler say.
+        const artifact = page && /\.html?$/i.test(source) && state.chrome && !state.isMac
+        const argv = artifact
+          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
+          : openArgv(page ?? source)
+        act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
         )
       }}
@@ -3763,9 +3814,9 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }
 
 // ── state.ts ──────────────────────────────────────────────────────────────
@@ -3783,6 +3834,8 @@ export const state = {
   home: '',
   ffmpeg: 'ffmpeg',
   ffprobe: 'ffprobe',
+  // A Chromium that can render an HTML page headless ('' when there is none).
+  chrome: '',
   // Claude Code's CLI, as the login shell finds it ('' when it doesn't).
   claudePath: '',
   // setUp's one run, shared by everything that waits on it.
@@ -4635,7 +4688,7 @@ export function setUp($: EngineInterface): Promise<void> {
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
@@ -4645,6 +4698,7 @@ export function setUp($: EngineInterface): Promise<void> {
     state.ffmpeg = got('ff') || (state.isMac ? '/opt/homebrew/bin/ffmpeg' : '/usr/bin/ffmpeg')
     state.ffprobe = got('fp') || (state.isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
     state.claudePath = got('cl')
+    state.chrome = got('ch') || (state.isMac ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '')
     state.hasVideoTools = false
     // Over ssh the terminal can't read this machine's files: pictures go as bytes.
     const sshConnection = await Promise.resolve().then(() => $.env.get('SSH_CONNECTION')).catch(() => undefined)
@@ -4669,7 +4723,7 @@ export function setUp($: EngineInterface): Promise<void> {
 
 const PANE = 'show-your-work'
 // The tools, and their names from before the rename, so old windows still draw.
-const TOOLS = ['show_image', 'show_video'].map(t => `mcp__show-your-work__${t}`)
+const TOOLS = ['show_image', 'show_video', 'show_html'].map(t => `mcp__show-your-work__${t}`)
 // Screenshots and recordings made only to be shown go to the temp folder, so
 // they don't pile up in the project; the history keeps its own copy.
 const SCRATCH_NOTE = 'Save screenshots and recordings you make to show here in a temporary folder, such as $TMPDIR or /tmp, not in the project. Save them in the project only when the user asks to keep them, or when the project already has a folder for them, such as one for test screenshots.'
@@ -4811,6 +4865,17 @@ export const register: Register = on => {
       description: 'Show an image or video in the chat: /img <path>',
       argumentHint: '<path>',
     })
+    await $.command.register({
+      name: 'page',
+      description: 'Preview a local HTML file in the chat: /page <path>. Open page opens the live page in your browser.',
+      argumentHint: '<path>',
+    })
+    await $.tool.register({
+      name: 'show_html',
+      description: 'Shows a local HTML file as a static preview inline in the terminal, using Chrome or Chromium. Accepts .html and .htm files. The preview is a fixed 1280 by 800 viewport, not an interactive page: scrolling, forms and sound work only after the person chooses Open page in their browser. Use it for HTML reports, page designs and small artifacts you have made. Pass path and an optional title; changes, summary and previous work as for show_image. No URL navigation. The file may execute scripts while Chrome renders it; use only pages you intend to render. The person sees the preview; you do not.',
+      inputSchema: IMAGE_INPUT,
+      isDeferred: false,
+    })
     await $.tool.register({
       name: 'show_image',
       description:
@@ -4894,7 +4959,27 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video)$/ }, async ($, e) => {
+  on('command.run', { command: 'page' }, async ($, invoked) => {
+    await setUp($)
+    const arg = expand(invoked.args.trim(), state.cwd, state.home)
+    if (!invoked.args.trim()) return { text: 'Usage: /page <path to a local .html file>' }
+    if (!isPage(arg)) return { text: 'Pages are .html or .htm files. For images and videos use /img <path>.' }
+    try {
+      const shown = await prepare($, arg, `Artifact · ${arg.split('/').pop()}`)
+      const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
+      shownById.set(id, shown)
+      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+
+      track('page_command', { kind: 'image' })
+      return { text: `Previewing ${shown.title}. Open page opens it in your browser.\n${MARK}#${id}` }
+    } catch (err) {
+      const n = noticeOf(err, arg, state.home)
+      track('show_failed', { from: 'page_command', reason: REASONS[n.kind] })
+      return { text: n.message }
+    }
+  })
+
+  on('tool.call', { tool: /^mcp__show-your-work__show_(image|video|html)$/ }, async ($, e) => {
     const input = { ...e } as unknown as {
       path?: string; title?: string; change?: string; pr?: string; changes?: KeyChange[]; summary?: Summary[]; url?: string; checks?: Check[]
       compare?: string; compare_checks?: Check[]; label?: string; compare_label?: string; overlay?: Overlay; versions?: unknown; previous?: string; changes_title?: string
@@ -4909,18 +4994,23 @@ export const register: Register = on => {
       const note = noteOf(input.changes, input.change, input.title)
       const parent = handleOf(input.previous)
       // Only pictures and videos are copied into the history: never a key or
-      // a config file a model was talked into naming.
-      if (!MEDIA.test(input.path)) throw new Error(`not an image: ${input.path}`)
-      const kept = await storeVersion($, input.path, note, input.title, parent)
-        .catch(() => ({ real: input.path!, copy: input.path!, id: '', chain: [] as { path: string; note?: string; id: string }[], missing: undefined as string | undefined }))
+      // a config file a model was talked into naming. A page is rendered from
+      // where it lies, so its relative assets resolve; history keeps the
+      // picture, and the card's source stays the page itself, so Open page
+      // opens it.
+      const page = isPage(input.path)
+      if (!MEDIA.test(input.path) && !page) throw new Error(`not an image: ${input.path}`)
+      const pagePng = page ? await renderPage($, input.path, keyOf(`${input.path}|${await $.clock.now()}`).slice(0, 10)) : undefined
+      const kept = await storeVersion($, pagePng ?? input.path!, note, input.title, parent)
+        .catch(() => ({ real: pagePng ?? input.path!, copy: pagePng ?? input.path!, id: '', chain: [] as { path: string; note?: string; id: string }[], missing: undefined as string | undefined }))
       if (kept.copy !== kept.real) copied = kept.copy
       // Every earlier version: the ones handed in, then the ones shown before.
       const given = await Promise.all(versionsOf(input.versions).map(async v => ({ ...v, path: await locate($, v.path) })))
       const earlier = [...given, ...kept.chain.filter(k => !given.some(g => g.path === k.path))]
       const compare = input.compare ?? earlier.at(-1)?.path
       const shown: Shown = {
-        ...(await prepare($, kept.copy, input.title ?? input.path.split('/').pop(), await identityOf($, input.path))),
-        origin: kept.real,
+        ...(await prepare($, kept.copy, input.title ?? (page ? `Artifact · ${input.path.split('/').pop()}` : input.path.split('/').pop()), await identityOf($, input.path))),
+        origin: page ? input.path : kept.real,
         change: input.change,
         pr: input.pr,
         url: input.url,
@@ -5109,8 +5199,8 @@ export const register: Register = on => {
   const tourRows = new Set<string>()
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const row = e.props as { command?: string; args?: string; text?: string; isErrored?: boolean; onScreen?: unknown }
-    // /img: the player, in the chat under the command.
-    if (row.command === 'img' && !row.isErrored && (row.text ?? '').includes(MARK)) {
+    // /img and /page: the player, in the chat under the command.
+    if ((row.command === 'img' || row.command === 'page') && !row.isErrored && (row.text ?? '').includes(MARK)) {
       await setUp($)
       await ensureSettings($)
       const shown = await shownOf($, row.text ?? '')
@@ -5156,7 +5246,7 @@ export const register: Register = on => {
 
 // What Claude is told about showing its work, for the state pictures are in now.
 function hintNow() {
-  if (state.canImage) return "This terminal shows pictures and videos inline. After visual work, screenshot or record it and show it with show_image or show_video before you say you're done, instead of telling the user to open a file or localhost. For a UI fix, show before and after."
+  if (state.canImage) return "This terminal shows pictures, videos and HTML pages inline. After visual work, show it instead of telling the user to open a file or localhost: an image or screenshot with show_image, a recording with show_video, an HTML file with show_html, each before you say you're done. For a UI fix, show before and after."
   const why = cantDraw(state.drawCause, 'it', 'picture', state.sessionId).claude.replace(/, so the person saw a notice instead of it\./, '.')
-  return `show-your-work: pictures and videos can't draw in this session (${why}) Anything shown with show_image or show_video was not seen: the person saw a notice instead. Don't say they saw it.`
+  return `show-your-work: pictures, videos and HTML pages can't draw in this session (${why}) Anything shown with show_image, show_video or show_html was not seen: the person saw a notice instead. Don't say they saw it.`
 }

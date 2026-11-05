@@ -8,7 +8,7 @@ import { settings, state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
 import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
-import { compareFrame, frameFile, frameReady, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, isRunCut, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
+import { compareFrame, frameFile, frameReady, htmlOpenArgv, rawSizeOf, SKIP_SECONDS, identityOf, isFrameCut, isGone, isRunCut, keyOf, MAX_STILL, PAIR_GAP, pairReady, pngSize, prepareVideo, readsAnyFile, BYTES_MAX, recutFrame, rescaleVideo, toOriginal, toUpdated } from './media'
 import { prepared, preparedOf } from './history'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
@@ -1609,7 +1609,14 @@ export async function Viewer(
       onPress={() => {
         // Watched elsewhere now: the video here pauses.
         if (one.timer) stop($, site)
-        act(page ? 'open_page' : 'open_file') || void $.process.run(openArgv(page ?? source)).then(r =>
+        // A local page opens in its own small window, the way an image opens
+        // in an image viewer: the same engine that rendered the preview, as
+        // a standalone viewer with no tabs and no desktop file-handler say.
+        const artifact = page && /\.html?$/i.test(source) && state.chrome && !state.isMac
+        const argv = artifact
+          ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, page)]
+          : openArgv(page ?? source)
+        act(page ? 'open_page' : 'open_file') || void $.process.run(argv).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(page ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, page ? 'web pages' : media.kind === 'video' ? 'videos' : 'pictures', page ?? source)),
         )
       }}
@@ -1748,7 +1755,7 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
     i.compare ? `vs ${i.compare_label ?? i.compare.split('/').pop()}` : '',
     i.checks?.length ? `${i.checks.length} checks` : '',
   ].filter(Boolean)
-  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : isRunning ? 'Loading image' : 'Image'
+  const verb = tool.endsWith('video') ? (isRunning ? 'Cutting video' : 'Video') : tool.endsWith('html') ? (isRunning ? 'Rendering page' : 'Page') : isRunning ? 'Loading image' : 'Image'
 
-  return `${tool.endsWith('video') ? '▶' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
+  return `${tool.endsWith('video') ? '▶' : tool.endsWith('html') ? '▤' : '▣'} ${verb} · ${what}${extra.length ? ` · ${extra.join(' · ')}` : ''}`
 }

@@ -356,6 +356,22 @@ test('video frames are cut as wide as the window shows them, up to 2400 px', () 
   expect(frameWidth(1280, 720, null, null)).toBe(1280)
 })
 
+test('the Herdr app cuts unmeasured frames smaller, and plays at 30 fps', () => {
+  const was = state.terminalName
+  state.terminalName = 'herdr_app'
+  try {
+    // No cell size there: 1600 px takes about a second to land and the clip blinks.
+    expect(frameWidth(3000, 1500, null, null)).toBe(960)
+    expect(frameWidth(800, 450, null, null)).toBe(800)
+    expect(pixelsFor({ columns: 80 }, null)).toBe(960)
+    expect(sampleRate(10)).toBe(30)
+  } finally {
+    state.terminalName = was
+  }
+  expect(frameWidth(3000, 1500, null, null)).toBe(1600)
+  expect(sampleRate(10)).toBe(12)
+})
+
 test('versions compare by number, not by text', () => {
   expect(isAtLeast('2.1.296', '2.1.295')).toBe(true)
   expect(isAtLeast('2.1.295', '2.1.295')).toBe(true)

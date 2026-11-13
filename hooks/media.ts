@@ -5,7 +5,7 @@ import type { EngineInterface } from 'claude-code'
 import type { Check, Frames, Shown } from '../types'
 
 import { state } from './state'
-import { frameWidth, PX_MAX, SIDEBAR } from './layout'
+import { frameWidth, PX_MAX, SIDEBAR, unmeasuredWidth } from './layout'
 import { debug } from './diagnostics'
 
 // Deletes the oldest frame folders until the cache is under $1 KB, keeping the
@@ -41,6 +41,9 @@ export const VIDEO = /\.(mp4|mov|m4v|webm|mkv|avi|gif)$/i
 const MAX_FRAMES = 900
 const MAX_STREAMED = 3600
 const MAX_FPS = 12
+// The Herdr app can show 30. Other terminals stay at 12: a higher cap sends
+// more frames than a slow link can show.
+const maxFps = () => (state.terminalName === 'herdr_app' ? 30 : MAX_FPS)
 
 // A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
 export function expand(path: string, base: string, homeDir: string): string {
@@ -99,7 +102,7 @@ async function rawSize($: EngineInterface, file: string, width: number) {
 
 // How fast to sample a clip of known length so it stays under MAX_STREAMED.
 export const sampleRate = (duration: number) =>
-  Math.max(1, Math.min(MAX_FPS, Math.floor(MAX_STREAMED / Math.max(duration, 0.1))))
+  Math.max(1, Math.min(maxFps(), Math.floor(MAX_STREAMED / Math.max(duration, 0.1))))
 
 // A PNG's size from its header (bytes 16 to 24), without any tool.
 export function pngDims(base64: string): { width: number; height: number } | null {
@@ -610,7 +613,7 @@ export const BYTES_MAX = 2_000_000
 // for the whole clip would wait for its end). Frames on this machine go by
 // path in full colour.
 const PALETTE = ',split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=none'
-const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : "scale='min(1600,iw)':-2") + (isFew ? PALETTE : '')
+const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : `scale='min(${unmeasuredWidth()},iw)':-2`) + (isFew ? PALETTE : '')
 const fewColours = new Set<string>()
 // H.264 and HEVC decode on the Mac's media engine: the same frames, and it
 // leaves the CPU free, which matters when the machine is busy (a render

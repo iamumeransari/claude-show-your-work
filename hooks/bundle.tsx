@@ -58,8 +58,12 @@ export const drawBox = (width: number, height: number, layout: Layout, px: Cell 
 // Large (Picture size) scales every size limit by this one factor.
 export const SIZE_STEP = 1.5
 export const sizeStep = () => (settings.standard_size ? 1 : SIZE_STEP)
+// The Herdr app reports no cell size, so this fallback is the width every
+// frame is cut at. 1600 px takes about a second to land there and the clip
+// blinks black between frames. 960 is still sharp in the box and arrives in time.
+export const unmeasuredWidth = () => (state.terminalName === 'herdr_app' ? 960 : 1600)
 export const pixelsFor = (box: { columns: number; rows?: number }, px: Cell | null, aspect = 0) =>
-  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
+  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : unmeasuredWidth()
 
 // Fits a picture in a box of cells, its own shape. With the cell's size in
 // pixels known and `isCapped`, never past the picture's own pixels; unknown,
@@ -84,9 +88,10 @@ export function fit(width: number, height: number, maxCols: number, maxRows: num
 }
 
 // The width a picture or clip is made at when it's prepared: what an inline
-// player in this terminal needs (see layoutOf). 1600 px at most while unmeasured.
+// player in this terminal needs (see layoutOf). 1600 px at most while
+// unmeasured, 960 in the Herdr app (see unmeasuredWidth).
 export function frameWidth(width: number, height: number, term: { columns: number; rows: number } | null, px: Cell | null) {
-  if (!term || !px || !width || !height) return Math.min(1600, width)
+  if (!term || !px || !width || !height) return Math.min(unmeasuredWidth(), width)
   const layout = layoutOf({ columns: term.columns, rows: term.rows, isPane: false, hasReport: false })
   return pixelsFor(targetBox(width, height, layout, px), px, width / height)
 }
@@ -342,6 +347,9 @@ export const VIDEO = /\.(mp4|mov|m4v|webm|mkv|avi|gif)$/i
 const MAX_FRAMES = 900
 const MAX_STREAMED = 3600
 const MAX_FPS = 12
+// The Herdr app can show 30. Other terminals stay at 12: a higher cap sends
+// more frames than a slow link can show.
+const maxFps = () => (state.terminalName === 'herdr_app' ? 30 : MAX_FPS)
 
 // A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
 export function expand(path: string, base: string, homeDir: string): string {
@@ -400,7 +408,7 @@ async function rawSize($: EngineInterface, file: string, width: number) {
 
 // How fast to sample a clip of known length so it stays under MAX_STREAMED.
 export const sampleRate = (duration: number) =>
-  Math.max(1, Math.min(MAX_FPS, Math.floor(MAX_STREAMED / Math.max(duration, 0.1))))
+  Math.max(1, Math.min(maxFps(), Math.floor(MAX_STREAMED / Math.max(duration, 0.1))))
 
 // A PNG's size from its header (bytes 16 to 24), without any tool.
 export function pngDims(base64: string): { width: number; height: number } | null {
@@ -911,7 +919,7 @@ export const BYTES_MAX = 2_000_000
 // for the whole clip would wait for its end). Frames on this machine go by
 // path in full colour.
 const PALETTE = ',split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=none'
-const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : "scale='min(1600,iw)':-2") + (isFew ? PALETTE : '')
+const scaleFor = (cut: number | undefined, isFew: boolean) => (cut ? `scale=${cut}:-2` : `scale='min(${unmeasuredWidth()},iw)':-2`) + (isFew ? PALETTE : '')
 const fewColours = new Set<string>()
 // H.264 and HEVC decode on the Mac's media engine: the same frames, and it
 // leaves the CPU free, which matters when the machine is busy (a render
@@ -2557,6 +2565,9 @@ type Player = {
   boxGeneration?: number
   // the latest resize, so only the last of a burst sends the frame again
   resizeTicket?: number
+  // bumped when the picture on screen changes side, so a frame already in
+  // flight cannot land after the click and put the old picture back
+  sideEpoch?: number
 }
 export const players = new Map<string, Player>()
 // Each window's own repaint count, beside state.version for all of them.
@@ -2750,7 +2761,19 @@ export const sideOf = (shown: Shown, site: string): Shown =>
   player(site).isCompare && shown.compare ? shown.compare : shown
 // Each side draws in a picture of its own: a frame of one side swapped into
 // the other's picture would keep that one's size and place.
-const viewKey = (site: string) => (player(site).isCompare ? 'view-original' : 'view')
+// The Herdr app blanks a picture's cells when its id is deleted, and a new id
+// does not fill cells that still name the old one, so both sides share one id
+// there. A click drops frames already in flight (see forgetPicture), or the
+// side just left would land in that id and the click would look like it did nothing.
+const viewKey = (site: string) => {
+  if (state.terminalName === 'herdr_app') return 'view'
+  return player(site).isCompare ? 'view-original' : 'view'
+}
+function forgetPicture(site: string) {
+  const one = player(site)
+  one.sideEpoch = (one.sideEpoch ?? 0) + 1
+  one.resizeTicket = 0
+}
 
 const plainAt = (media: Shown, frame: number) =>
   media.frames ? frameFile(media.frames, Math.min(frame, media.frames.count - 1)) : media.path
@@ -2935,7 +2958,9 @@ function resized($: EngineInterface, site: string, media: Shown, shown: Shown, b
   const resend = (isAgain: boolean) => {
     if (!isLatest()) return
     event('resend', { site, generation: ticket, isAgain })
-    draw($, site, media, shown)
+    // The side may have changed while this waited. Send what is on screen now,
+    // not the side that was on screen when the box changed.
+    draw($, site, sideOf(shown, site), shown)
   }
   void $.clock
     .sleep(SETTLE_MS)
@@ -3001,23 +3026,25 @@ export function mayBeDropped(site: string) {
 
 export function draw($: EngineInterface, site: string, media: Shown, shown?: Shown) {
   const one = player(site)
+  const epoch = one.sideEpoch ?? 0
+  const still = () => (player(site).sideEpoch ?? 0) === epoch
   for (const side of [media, shown, shown?.compare]) syncCopy(site, side)
   if (one.isSplit && shown?.pair) {
     const at = Math.min(one.frame, shown.pair.count - 1), pair = shown.pair
     const ticket = ++tickets
-    void pairReady($, shown, at, site, !!one.timer).then(() => blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket)).catch(() => undefined)
+    void pairReady($, shown, at, site, !!one.timer).then(() => { if (still()) blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket) }).catch(() => undefined)
     return
   }
   if (one.isSplit && shown?.compare) {
     const at = compareFrame(shown, one.frame), compare = shown.compare, frame = one.frame
     const ticket = ++tickets
-    void frameReady($, compare, at, site, true, !!one.timer).then(() => blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket)).catch(() => undefined)
-    void frameReady($, shown, frame, site, true, !!one.timer).then(() => blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket)).catch(() => undefined)
+    void frameReady($, compare, at, site, true, !!one.timer).then(() => { if (still()) blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket) }).catch(() => undefined)
+    void frameReady($, shown, frame, site, true, !!one.timer).then(() => { if (still()) blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket) }).catch(() => undefined)
     return
   }
   const frame = one.frame
   const ticket = ++tickets
-  void frameReady($, media, frame, site, true, !!one.timer).then(() => blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket)).catch(() => undefined)
+  void frameReady($, media, frame, site, true, !!one.timer).then(() => { if (still()) blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket) }).catch(() => undefined)
 }
 
 // A side's checks in words: "4 checks fail" or "all 11 checks pass".
@@ -3223,8 +3250,14 @@ export function play($: EngineInterface, site: string, media: Shown, shown?: Sho
     const now = marks()
     if (now !== last) {
       last = now
-      debug('redraw')
-      redraw($, site)
+      // A full redraw deletes the picture and sends it again. On the Herdr app
+      // that is a black flash, once a second, for as long as the new frame
+      // takes to arrive. The frame swap already moves the picture; leave the
+      // bar until playback stops. Other terminals still redraw, so the bar moves.
+      if (state.terminalName !== 'herdr_app') {
+        debug('redraw')
+        redraw($, site)
+      }
     }
   })
   redraw($, site)
@@ -3256,6 +3289,9 @@ function flip($: EngineInterface, site: string, shown: Shown, toCompare: boolean
   const from = sideOf(shown, site)
   const wasPlaying = !!one.timer
   halt(site, 'flip')
+  // A resize resend of this side is still in flight for a second. Drop it, or
+  // it paints this picture again after the click and the new one never shows.
+  forgetPicture(site)
   one.isCompare = toCompare
   const to = sideOf(shown, site)
   // Same moment on the other side, lined up on the steps both runs share.
@@ -3281,6 +3317,7 @@ function split($: EngineInterface, site: string, shown: Shown, isOn: boolean) {
   if (!shown.compare || (isOn && !shown.pair) || !!one.isSplit === isOn) return
   const wasPlaying = !!one.timer
   halt(site, 'split')
+  forgetPicture(site)
   if (one.isCompare && shown.compare.frames && shown.frames)
     one.frame = Math.max(0, Math.min(shown.frames.count - 1, Math.round(toUpdated(shown, one.frame / shown.compare.frames.fps) * shown.frames.fps)))
   one.isCompare = false
@@ -3405,6 +3442,7 @@ function pickVersion($: EngineInterface, site: string, shown: Shown, to: number)
   const picked = history[to]
   if (!picked) return flip($, site, shown, false)
   void preparedOf($, picked.path).then(version => {
+    forgetPicture(site)
     one.step = to
     if (!one.isCompare) flip($, site, { ...shown, compare: version }, true)
     else draw($, site, version)

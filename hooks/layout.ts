@@ -53,8 +53,12 @@ export const drawBox = (width: number, height: number, layout: Layout, px: Cell 
 // Large (Picture size) scales every size limit by this one factor.
 export const SIZE_STEP = 1.5
 export const sizeStep = () => (settings.standard_size ? 1 : SIZE_STEP)
+// The Herdr app reports no cell size, so this fallback is the width every
+// frame is cut at. 1600 px takes about a second to land there and the clip
+// blinks black between frames. 960 is still sharp in the box and arrives in time.
+export const unmeasuredWidth = () => (state.terminalName === 'herdr_app' ? 960 : 1600)
 export const pixelsFor = (box: { columns: number; rows?: number }, px: Cell | null, aspect = 0) =>
-  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : 1600
+  px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : unmeasuredWidth()
 
 // Fits a picture in a box of cells, its own shape. With the cell's size in
 // pixels known and `isCapped`, never past the picture's own pixels; unknown,
@@ -79,9 +83,10 @@ export function fit(width: number, height: number, maxCols: number, maxRows: num
 }
 
 // The width a picture or clip is made at when it's prepared: what an inline
-// player in this terminal needs (see layoutOf). 1600 px at most while unmeasured.
+// player in this terminal needs (see layoutOf). 1600 px at most while
+// unmeasured, 960 in the Herdr app (see unmeasuredWidth).
 export function frameWidth(width: number, height: number, term: { columns: number; rows: number } | null, px: Cell | null) {
-  if (!term || !px || !width || !height) return Math.min(1600, width)
+  if (!term || !px || !width || !height) return Math.min(unmeasuredWidth(), width)
   const layout = layoutOf({ columns: term.columns, rows: term.rows, isPane: false, hasReport: false })
   return pixelsFor(targetBox(width, height, layout, px), px, width / height)
 }

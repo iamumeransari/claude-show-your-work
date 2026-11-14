@@ -3,7 +3,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { event } from './diagnostics'
-import { settings, state } from './state'
+import { runTool, settings, state } from './state'
 
 // The window's fill: a step lighter than a dark terminal, so it reads as one panel.
 const PANEL = '#2c2e35'
@@ -81,7 +81,9 @@ export function fit(width: number, height: number, maxCols: number, maxRows: num
 // The width a picture or clip is made at when it's prepared: what an inline
 // player in this terminal needs (see layoutOf). 1600 px at most while unmeasured.
 export function frameWidth(width: number, height: number, term: { columns: number; rows: number } | null, px: Cell | null) {
-  if (!term || !px || !width || !height) return Math.min(1600, width)
+  // Windows reports no cell size (no tty ioctl): frames are capped at 640 px
+  // there, not cut at the clip's full width.
+  if (!term || !px || !width || !height) return Math.min(state.isWindows ? 640 : 1600, width)
   const layout = layoutOf({ columns: term.columns, rows: term.rows, isPane: false, hasReport: false })
   return pixelsFor(targetBox(width, height, layout, px), px, width / height)
 }
@@ -112,8 +114,8 @@ export function cellOf(stdout: string, scale = 1): Cell | null {
 const SCALE_SH = `osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSScreen.mainScreen.backingScaleFactor'`
 export async function measureCells($: EngineInterface) {
   const [r, s] = await Promise.all([
-    $.process.run(['sh', '-c', CELL_SH]).catch(() => null),
-    state.isMac ? $.process.run(['sh', '-c', SCALE_SH]).catch(() => null) : null,
+    runTool($, ['sh', '-c', CELL_SH]).catch(() => null),
+    state.isMac ? runTool($, ['sh', '-c', SCALE_SH]).catch(() => null) : null,
   ])
   // A measure Claude Code cancelled (a newer draw replaced the one that asked,
   // as happens many times while a window edge is dragged) says nothing about
@@ -121,7 +123,7 @@ export async function measureCells($: EngineInterface) {
   // cells, a picture of the wrong shape until the next resize.
   if (!r) return void event('measure', { state: 'cancelled', kept: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
   const scale = Number(s?.stdout.trim()) || 1
-  state.cell = r.exitCode === 0 ? cellOf(r.stdout, scale) : null
+  state.cell = (r.exitCode === 0 ? cellOf(r.stdout, scale) : null) ?? state.cellGiven
   const [rows, columns] = (r.exitCode === 0 ? r.stdout : '').trim().split(/\s+/).map(Number)
   state.termSize = rows && columns ? { columns, rows } : null
   event('measure', { state: 'measured', tty: r.stdout.trim(), scale, cell: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })

@@ -4,7 +4,7 @@ import type { EngineInterface } from 'claude-code'
 
 import type { Check, Frames, Shown } from '../types'
 
-import { state } from './state'
+import { fileUrl, runTool, state } from './state'
 import { frameWidth, PX_MAX, SIDEBAR } from './layout'
 import { debug } from './diagnostics'
 
@@ -42,13 +42,22 @@ const MAX_FRAMES = 900
 const MAX_STREAMED = 3600
 const MAX_FPS = 12
 
-// A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
-export function expand(path: string, base: string, homeDir: string): string {
-  let p = path.trim().replace(/^(['"])(.*)\1$/, '$2').replace(/\\(.)/g, '$1')
-  if (p === '~' || p.startsWith('~/')) p = homeDir + p.slice(1)
-  if (p.startsWith('/')) return p
+// A Windows path (C:\x, C:/x or \\server\share): its backslashes are
+// separators, not escapes, and it is whole on its own.
+const WINDOWS_PATH = /^([A-Za-z]:[\\/]|\\\\)/
+export const isAbsolutePath = (p: string) => p.startsWith('/') || WINDOWS_PATH.test(p)
+// Windows hands a resolved path back with backslashes; they become C:/x/y.
+export const slashed = (p: string) => (WINDOWS_PATH.test(p) ? p.replace(/\\/g, '/') : p)
 
-  return `${base.replace(/\/$/, '')}/${p}`
+// A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
+// On Windows it comes back in the mixed form C:/x/y.
+export function expand(path: string, base: string, homeDir: string): string {
+  const bare = path.trim().replace(/^(['"])(.*)\1$/, '$2')
+  let p = WINDOWS_PATH.test(bare) || state.isWindows ? bare.replace(/\\/g, '/') : bare.replace(/\\(.)/g, '$1')
+  if (p === '~' || p.startsWith('~/')) p = homeDir + p.slice(1)
+  if (isAbsolutePath(p)) return p
+
+  return `${base.replace(/\\/g, '/').replace(/\/$/, '')}/${p}`
 }
 
 // A name with its look-alike spaces made plain: macOS writes a narrow
@@ -112,9 +121,9 @@ export function pngDims(base64: string): { width: number; height: number } | nul
 
 // Finds a pasted image's original file by name with Spotlight (macOS).
 export async function findPasted($: EngineInterface, name: string): Promise<string | null> {
-  if (name.startsWith('/')) return name
+  if (isAbsolutePath(name)) return name
   if (!state.isMac) return null
-  const found = await $.process.run(['mdfind', '-name', name])
+  const found = await runTool($, ['mdfind', '-name', name])
 
   return found.stdout.split('\n').find(line => line.endsWith(`/${name}`)) ?? null
 }
@@ -125,7 +134,7 @@ export async function pngSize($: EngineInterface, png: string) {
     if (!d || !d.width || !d.height) throw new Error(`not an image: ${png}`)
     return d
   }
-  const dims = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', png])
+  const dims = await runTool($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', png])
   const width = Number(/pixelWidth:\s*(\d+)/.exec(dims.stdout)?.[1] ?? 0)
   const height = Number(/pixelHeight:\s*(\d+)/.exec(dims.stdout)?.[1] ?? 0)
   if (!width || !height) throw new Error(`not an image: ${png}`)
@@ -139,7 +148,7 @@ const FRAMES_CAP_KB = 500_000
 // Folders this session is playing are never trimmed.
 export function trimFrames($: EngineInterface) {
   const inUse = [...watching.keys()].map(d => d.split('/').pop()!).join(' ')
-  return $.process.run(['sh', '-c', TRIM_SH, state.TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
+  return runTool($, ['sh', '-c', TRIM_SH, state.TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
 }
 
 // A screen recording's blank opening (a page loading: one flat tone, maybe a
@@ -184,7 +193,6 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // viewer carries none of their logins.
 // Each path segment percent-encoded, so a name with spaces, `#`, `%` or `?`
 // names the right file.
-const fileUrl = (page: string) => `file://${page.split('/').map(encodeURIComponent).join('/')}`
 export const htmlOpenArgv = (chrome: string, page: string) => [
   chrome, '--no-first-run', '--no-default-browser-check', `--app=${fileUrl(page)}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
@@ -197,17 +205,17 @@ export const htmlArgv = (chrome: string, page: string, png: string) => [
 ]
 export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
   if (!state.chrome) throw new Error('pages need Chrome or Chromium')
-  const folder = await $.process.run(['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
+  const folder = await runTool($, ['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
   const dir = folder.stdout.trim()
   if (folder.exitCode !== 0 || !dir.startsWith(`${state.TMP}/page-`)) throw new Error("the page couldn't be rendered: could not create its temporary folder")
   const png = `${dir}/page-${key}.png`
   try {
-    const result = await $.process.run(htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
+    const result = await runTool($, htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
     if (result.exitCode !== 0 || !(await exists($, png))) throw new Error("the page couldn't be rendered by Chrome or Chromium")
     return png
   } finally {
     // A fresh browser profile, never the person's login, cookies or extensions.
-    await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
+    await runTool($, ['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
   }
 }
 
@@ -289,10 +297,10 @@ export function ensureWave($: EngineInterface, real: string, id: string): Promis
 
 async function cutWave($: EngineInterface, real: string, out: string): Promise<string> {
   if (await isGone($, out)) {
-    const dur = await $.process.run([state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
+    const dur = await runTool($, [state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
     const seconds = Number(dur.stdout.trim())
     if (dur.exitCode !== 0 || !Number.isFinite(seconds) || seconds <= 0) throw new Error(`ffmpeg could not read ${real}: ${(dur.stderr || dur.stdout).trim().slice(0, 200)}`)
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     // This attempt's own names: a second run (another session, or one that
     // slipped past the map) never writes where this one writes — the session
     // prefix keeps two Claude processes from ever colliding on one name.
@@ -302,14 +310,14 @@ async function cutWave($: EngineInterface, real: string, out: string): Promise<s
     const part = `${out}.${attempt}.part`
     try {
       for (const [png, color] of [[bright, WAVE_PLAYED], [dim, WAVE_UNPLAYED]] as const) {
-        const strip = await $.process.run(waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
+        const strip = await runTool($, waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
         if (strip.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${strip.stderr.trim().slice(0, 200)}`)
       }
-      const made = await $.process.run(waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
+      const made = await runTool($, waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
       if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
-      if ((await $.process.run(['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
+      if ((await runTool($, ['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
     } finally {
-      await $.process.run(['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
+      await runTool($, ['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
     }
   }
   return out
@@ -446,12 +454,12 @@ export async function identityOf($: EngineInterface, raw: string): Promise<strin
 // What a folder's meta.json holds, unchecked: the caller says what it expects.
 // (No type argument at the call: the directory review reads only fn($, ...).)
 async function readMeta($: EngineInterface, dir: string): Promise<unknown> {
-  const r = await $.process.run(['cat', `${dir}/meta.json`]).catch(() => null)
+  const r = await runTool($, ['cat', `${dir}/meta.json`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   try { return JSON.parse(r.stdout) as unknown } catch { return null }
 }
 function writeMeta($: EngineInterface, dir: string, meta: unknown) {
-  return $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
+  return runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
 }
 
 export async function prepareVideo($: EngineInterface, real: string, title: string, key?: string, cutAt?: number): Promise<Shown> {
@@ -459,7 +467,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
     if (!state.hasVideoTools) throw new Error(noFfmpeg(state.isMac))
   }
-  const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name:format=duration', '-of', 'default=nw=1', real])
+  const facts = await runTool($, [state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name:format=duration', '-of', 'default=nw=1', real])
   const field = (name: string) => Number(new RegExp(`^${name}=([0-9.]+)`, 'm').exec(facts.stdout)?.[1] ?? Number.NaN)
   hwDecode.set(real, state.isMac && /^codec_name=(h264|hevc)$/m.test(facts.stdout))
   // Frames stay within PX_MAX in every Picture size (see sharpen).
@@ -474,7 +482,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     const meta = (await readMeta($, dir)) as { frames: Omit<Frames, 'dir'>; width: number; height: number } | null
     if (meta) {
       const frames = { ...meta.frames, dir }
-      await $.process.run(['touch', dir]).catch(() => undefined)
+      await runTool($, ['touch', dir]).catch(() => undefined)
       await learn($, dir)
       if (!disk(dir).has(0)) await until($, dir, 0, ensure($, frames, real, 0, false))
       return { kind: 'video', path: frameFile(frames, 0), source: real, width: meta.width, height: meta.height, ...own, title, generation: ++state.generation, frames }
@@ -486,7 +494,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   const fps = sampleRate(Number.isFinite(probed) && probed > 0 ? probed : 1)
   state.generation += 1
   const dir = folder ? `${state.TMP}/${folder}` : `${state.TMP}/v${state.generation}-${Math.floor(await $.clock.now())}`
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   // The blank-opening skip is off: every clip plays from its start (see
   // leadFrom, and known-issues.md for how it would be turned on).
   const lead = 0
@@ -537,7 +545,7 @@ export async function rescaleVideo($: EngineInterface, m: Shown, width: number, 
   // The new size keeps the frames' aspect (after any rotation), even rows.
   const frames: Frames = { ...f, dir, cut: width, raw: raw && m.width > 0 ? { width, height: Math.max(2, Math.round((width * m.height) / m.width / 2) * 2) } : undefined }
   const i = Math.max(0, Math.min(at, f.count - 1))
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   await learn($, dir)
   if (!disk(dir).has(i)) await until($, dir, i, ensure($, frames, source, i, false))
   const shown = frameFile(frames, i)
@@ -628,18 +636,18 @@ let canPace = true
 // kitty, a frame over BYTES_MAX may not draw, so a clip with one is cut again
 // in 256 colours.
 async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], files: () => Promise<string[]>) {
-  let made = await $.process.run(cut(state.sendBytes))
+  let made = await runTool($, cut(state.sendBytes))
   if (made.exitCode !== 0 && cut(state.sendBytes).includes('-hwaccel')) {
     debug(`hw decode failed, cut again without it: ${made.stderr.trim().slice(0, 80)}`)
     const plain = cut
     cut = isFew => withoutHw(plain(isFew))
-    made = await $.process.run(cut(state.sendBytes))
+    made = await runTool($, cut(state.sendBytes))
   }
   if (made.exitCode !== 0 || state.sendBytes || readsAnyFile()) return made
   const sizes = await Promise.all((await files()).map(f => Promise.resolve().then(() => $.fs.stat(f)).then(st => st.size, () => 0)))
   if (!sizes.some(size => size > BYTES_MAX)) return made
   debug('cut again in 256 colours: a frame is over 2 MB')
-  return $.process.run(cut(true))
+  return runTool($, cut(true))
 }
 
 // The frames each folder holds, as far as this session knows: what its
@@ -892,7 +900,7 @@ export async function recutFrame($: EngineInterface, media: Shown, i: number): P
   // There after all (a draw that looked while the frame was being written):
   // stopping the decoder for it would only stall playback.
   if (!(await isGone($, frameFile(f, i)))) return true
-  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
+  await runTool($, ['mkdir', '-p', f.dir]).catch(() => undefined)
   disk(f.dir).delete(i)
   decoders.get(f.dir)?.stop()
   await until($, f.dir, i, ensure($, f, media.source, i, false))
@@ -939,7 +947,7 @@ function prune($: EngineInterface, dir: string, fps: number) {
       gone.push(`${dir}/${name}`)
       disk(dir).delete(i)
     }
-    if (gone.length) await $.process.run(['rm', '-f', ...gone]).catch(() => undefined)
+    if (gone.length) await runTool($, ['rm', '-f', ...gone]).catch(() => undefined)
   })()
 }
 
@@ -1044,7 +1052,7 @@ export const compareFrame = (shown: Shown, frame: number) => {
 // runs by eye. Small and sparse on purpose: matching costs frames × frames.
 async function thumbs($: EngineInterface, media: Shown, stride: number): Promise<number[][]> {
   const f = media.frames!
-  const r = await $.process.run([
+  const r = await runTool($, [
     'sh', '-c',
     `"$0" -v error ${f.lead ? `-ss ${f.lead} ` : ''}-i "$1" -vf "fps=${f.fps},select=not(mod(n\\,${stride})),scale=32:18,format=gray" -fps_mode passthrough -frames:v ${Math.ceil(f.count / stride)} -f rawvideo - | od -An -tu1 -v`,
     state.ffmpeg, media.source ?? '',
@@ -1163,7 +1171,7 @@ export async function preparePair($: EngineInterface, original: Shown, updated: 
   const known = (await readMeta($, dir)) as PairMeta | null
   if (known) {
     const pair = { ...known.pair, dir }
-    await $.process.run(['touch', dir]).catch(() => undefined)
+    await runTool($, ['touch', dir]).catch(() => undefined)
     await pairReady($, { ...updated, compare: original, pair, sync: known.sync }, 0)
     return { pair, pairWidth: known.pairWidth, pairHeight: known.pairHeight, sync: known.sync }
   }
@@ -1177,7 +1185,7 @@ export async function preparePair($: EngineInterface, original: Shown, updated: 
   const match = ta.length && tb.length
     ? spreadMatch(matchOf(align(ta, tb, 0.01, Math.max(2, Math.round((0.6 * f.fps) / stride)), 0.02), ta.length), stride, f.count, g.count - 1)
     : byTime()
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   // Each side scaled to the merged height, at an even width. The merged
   // frames are PNGs (two clips, rarely played: simpler than raw for little
   // cost), made from the sides' frames, raw or not.
@@ -1221,25 +1229,25 @@ function merge($: EngineInterface, shown: Shown, i: number, isPlay: boolean): Pr
     while (first + n < want && disk(f.dir).has(first + n) && disk(g.dir).has(jOf(first + n))) n++
     if (!n) return
     const tmp = `${pair.dir}/m${first}`
-    await $.process.run(['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
+    await runTool($, ['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
     const ext = (side: Frames) => (side.raw ? 'rgb' : 'png')
     const links = Array.from({ length: n }, (_, k) => {
       const name = String(k + 1).padStart(5, '0')
       return `ln -sf "${frameFile(g, jOf(first + k))}" "$0/o/f${name}.${ext(g)}"; ln -sf "${frameFile(f, first + k)}" "$0/u/f${name}.${ext(f)}"`
     }).join('\n')
-    await $.process.run(['sh', '-c', links, tmp])
+    await runTool($, ['sh', '-c', links, tmp])
     // Raw frames have no header: ffmpeg is told their format and size.
     const input = (side: Frames, sub: string) => [
       ...(side.raw ? ['-f', 'image2', '-c:v', 'rawvideo', '-pixel_format', 'rgb24', '-video_size', `${side.raw.width}x${side.raw.height}`] : []),
       '-framerate', String(pair.fps), '-i', `${tmp}/${sub}/f%05d.${ext(side)}`,
     ]
     const height = pairHeightOf(shown, original)
-    const made = await $.process.run([
+    const made = await runTool($, [
       state.ffmpeg, '-v', 'error', '-nostdin', ...ONE_THREAD, ...input(g, 'o'), ...input(f, 'u'),
       '-filter_complex', `[0:v]scale=${sideWidth(original, height)}:${height},pad=iw+${PAIR_GAP}:ih:0:0:color=${SIDEBAR.replace('#', '0x')}[a];[1:v]scale=${sideWidth(shown, height)}:${height}[b];[a][b]hstack=inputs=2`,
       '-compression_level', '1', '-frames:v', String(n), '-start_number', String(first + 1), '-y', `${pair.dir}/f%05d.png`,
     ])
-    await $.process.run(['rm', '-rf', tmp])
+    await runTool($, ['rm', '-rf', tmp])
     if (made.exitCode !== 0) return void debug(`merge failed: ${made.stderr.trim().slice(0, 120)}`)
     for (let k = first; k < first + n; k++) disk(pair.dir).add(k)
     wake(pair.dir)
@@ -1278,7 +1286,7 @@ export async function pairReady($: EngineInterface, shown: Shown, i: number, sit
 export async function prepare($: EngineInterface, raw: string, title?: string, key?: string): Promise<Shown> {
   const path = expand(raw, state.cwd, state.home)
   const stat = await $.fs.stat(path, { resolve: true })
-  const real = stat.realPath ?? path
+  const real = slashed(stat.realPath ?? path)
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
   if (isAudio(real)) return prepareAudio($, real, name, key ?? (await identityOf($, real)))
@@ -1290,11 +1298,11 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   } else if (!/\.png$/i.test(real)) {
     state.generation += 1
     png = `${state.TMP}/${real.split('/').pop()!.replace(/\.[^.]+$/, '')}-${state.generation}.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     if (!state.isMac && !(await exists($, state.ffmpeg))) throw new Error(noFfmpeg(false))
     const conv = state.isMac
-      ? await $.process.run(['sips', '-s', 'format', 'png', real, '--out', png])
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', real, '-frames:v', '1', png])
+      ? await runTool($, ['sips', '-s', 'format', 'png', real, '--out', png])
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', real, '-frames:v', '1', png])
     if (conv.exitCode !== 0) throw new Error(`could not convert ${real}: ${conv.stderr.trim()}`)
   }
   // The terminal reads the file itself, so only a picture past what any
@@ -1303,10 +1311,10 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   if (Math.max(dims.width, dims.height) > MAX_STILL) {
     state.generation += 1
     const small = `${state.TMP}/${png.split('/').pop()!.replace(/\.png$/i, '')}-${state.generation}-small.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     const shrunk = state.isMac
-      ? await $.process.run(['sips', '-Z', String(MAX_STILL), png, '--out', small])
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale='if(gt(iw,ih),min(${MAX_STILL},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_STILL},ih))'`, small]).catch(() => ({ exitCode: 1 }))
+      ? await runTool($, ['sips', '-Z', String(MAX_STILL), png, '--out', small])
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale='if(gt(iw,ih),min(${MAX_STILL},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_STILL},ih))'`, small]).catch(() => ({ exitCode: 1 }))
     if (state.isMac || shrunk.exitCode === 0) png = small
   }
   // A picture narrower than the window shows it is drawn that wide, as a
@@ -1317,10 +1325,10 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   if (wide > now.width) {
     state.generation += 1
     const big = `${state.TMP}/${png.split('/').pop()!.replace(/\.png$/i, '')}-${state.generation}-w${wide}.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     const grown = state.isMac
-      ? await $.process.run(['sips', '--resampleWidth', String(wide), png, '--out', big]).catch(() => ({ exitCode: 1 }))
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale=${wide}:-2:flags=lanczos`, big]).catch(() => ({ exitCode: 1 }))
+      ? await runTool($, ['sips', '--resampleWidth', String(wide), png, '--out', big]).catch(() => ({ exitCode: 1 }))
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale=${wide}:-2:flags=lanczos`, big]).catch(() => ({ exitCode: 1 }))
     if (grown.exitCode === 0) png = big
   }
   state.generation += 1

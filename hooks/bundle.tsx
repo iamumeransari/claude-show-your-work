@@ -86,7 +86,9 @@ export function fit(width: number, height: number, maxCols: number, maxRows: num
 // The width a picture or clip is made at when it's prepared: what an inline
 // player in this terminal needs (see layoutOf). 1600 px at most while unmeasured.
 export function frameWidth(width: number, height: number, term: { columns: number; rows: number } | null, px: Cell | null) {
-  if (!term || !px || !width || !height) return Math.min(1600, width)
+  // Windows reports no cell size (no tty ioctl): frames are capped at 640 px
+  // there, not cut at the clip's full width.
+  if (!term || !px || !width || !height) return Math.min(state.isWindows ? 640 : 1600, width)
   const layout = layoutOf({ columns: term.columns, rows: term.rows, isPane: false, hasReport: false })
   return pixelsFor(targetBox(width, height, layout, px), px, width / height)
 }
@@ -117,8 +119,8 @@ export function cellOf(stdout: string, scale = 1): Cell | null {
 const SCALE_SH = `osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSScreen.mainScreen.backingScaleFactor'`
 export async function measureCells($: EngineInterface) {
   const [r, s] = await Promise.all([
-    $.process.run(['sh', '-c', CELL_SH]).catch(() => null),
-    state.isMac ? $.process.run(['sh', '-c', SCALE_SH]).catch(() => null) : null,
+    runTool($, ['sh', '-c', CELL_SH]).catch(() => null),
+    state.isMac ? runTool($, ['sh', '-c', SCALE_SH]).catch(() => null) : null,
   ])
   // A measure Claude Code cancelled (a newer draw replaced the one that asked,
   // as happens many times while a window edge is dragged) says nothing about
@@ -126,7 +128,7 @@ export async function measureCells($: EngineInterface) {
   // cells, a picture of the wrong shape until the next resize.
   if (!r) return void event('measure', { state: 'cancelled', kept: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
   const scale = Number(s?.stdout.trim()) || 1
-  state.cell = r.exitCode === 0 ? cellOf(r.stdout, scale) : null
+  state.cell = (r.exitCode === 0 ? cellOf(r.stdout, scale) : null) ?? state.cellGiven
   const [rows, columns] = (r.exitCode === 0 ? r.stdout : '').trim().split(/\s+/).map(Number)
   state.termSize = rows && columns ? { columns, rows } : null
   event('measure', { state: 'measured', tty: r.stdout.trim(), scale, cell: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
@@ -343,13 +345,22 @@ const MAX_FRAMES = 900
 const MAX_STREAMED = 3600
 const MAX_FPS = 12
 
-// A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
-export function expand(path: string, base: string, homeDir: string): string {
-  let p = path.trim().replace(/^(['"])(.*)\1$/, '$2').replace(/\\(.)/g, '$1')
-  if (p === '~' || p.startsWith('~/')) p = homeDir + p.slice(1)
-  if (p.startsWith('/')) return p
+// A Windows path (C:\x, C:/x or \\server\share): its backslashes are
+// separators, not escapes, and it is whole on its own.
+const WINDOWS_PATH = /^([A-Za-z]:[\\/]|\\\\)/
+export const isAbsolutePath = (p: string) => p.startsWith('/') || WINDOWS_PATH.test(p)
+// Windows hands a resolved path back with backslashes; they become C:/x/y.
+export const slashed = (p: string) => (WINDOWS_PATH.test(p) ? p.replace(/\\/g, '/') : p)
 
-  return `${base.replace(/\/$/, '')}/${p}`
+// A typed or dragged-in path: quotes, backslash-escaped spaces and ~ allowed.
+// On Windows it comes back in the mixed form C:/x/y.
+export function expand(path: string, base: string, homeDir: string): string {
+  const bare = path.trim().replace(/^(['"])(.*)\1$/, '$2')
+  let p = WINDOWS_PATH.test(bare) || state.isWindows ? bare.replace(/\\/g, '/') : bare.replace(/\\(.)/g, '$1')
+  if (p === '~' || p.startsWith('~/')) p = homeDir + p.slice(1)
+  if (isAbsolutePath(p)) return p
+
+  return `${base.replace(/\\/g, '/').replace(/\/$/, '')}/${p}`
 }
 
 // A name with its look-alike spaces made plain: macOS writes a narrow
@@ -413,9 +424,9 @@ export function pngDims(base64: string): { width: number; height: number } | nul
 
 // Finds a pasted image's original file by name with Spotlight (macOS).
 export async function findPasted($: EngineInterface, name: string): Promise<string | null> {
-  if (name.startsWith('/')) return name
+  if (isAbsolutePath(name)) return name
   if (!state.isMac) return null
-  const found = await $.process.run(['mdfind', '-name', name])
+  const found = await runTool($, ['mdfind', '-name', name])
 
   return found.stdout.split('\n').find(line => line.endsWith(`/${name}`)) ?? null
 }
@@ -426,7 +437,7 @@ export async function pngSize($: EngineInterface, png: string) {
     if (!d || !d.width || !d.height) throw new Error(`not an image: ${png}`)
     return d
   }
-  const dims = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', png])
+  const dims = await runTool($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', png])
   const width = Number(/pixelWidth:\s*(\d+)/.exec(dims.stdout)?.[1] ?? 0)
   const height = Number(/pixelHeight:\s*(\d+)/.exec(dims.stdout)?.[1] ?? 0)
   if (!width || !height) throw new Error(`not an image: ${png}`)
@@ -440,7 +451,7 @@ const FRAMES_CAP_KB = 500_000
 // Folders this session is playing are never trimmed.
 export function trimFrames($: EngineInterface) {
   const inUse = [...watching.keys()].map(d => d.split('/').pop()!).join(' ')
-  return $.process.run(['sh', '-c', TRIM_SH, state.TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
+  return runTool($, ['sh', '-c', TRIM_SH, state.TMP, String(FRAMES_CAP_KB), inUse]).catch(() => undefined)
 }
 
 // A screen recording's blank opening (a page loading: one flat tone, maybe a
@@ -485,7 +496,6 @@ export const isPage = (path: string) => /\.html?$/i.test(path)
 // viewer carries none of their logins.
 // Each path segment percent-encoded, so a name with spaces, `#`, `%` or `?`
 // names the right file.
-const fileUrl = (page: string) => `file://${page.split('/').map(encodeURIComponent).join('/')}`
 export const htmlOpenArgv = (chrome: string, page: string) => [
   chrome, '--no-first-run', '--no-default-browser-check', `--app=${fileUrl(page)}`, '--window-size=960,720',
   `--user-data-dir=${state.TMP}/page-viewer.profile`,
@@ -498,17 +508,17 @@ export const htmlArgv = (chrome: string, page: string, png: string) => [
 ]
 export async function renderPage($: EngineInterface, page: string, key: string): Promise<string> {
   if (!state.chrome) throw new Error('pages need Chrome or Chromium')
-  const folder = await $.process.run(['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
+  const folder = await runTool($, ['mktemp', '-d', `${state.TMP}/page-XXXXXX`])
   const dir = folder.stdout.trim()
   if (folder.exitCode !== 0 || !dir.startsWith(`${state.TMP}/page-`)) throw new Error("the page couldn't be rendered: could not create its temporary folder")
   const png = `${dir}/page-${key}.png`
   try {
-    const result = await $.process.run(htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
+    const result = await runTool($, htmlArgv(state.chrome, page, png), { timeoutMs: 20000 })
     if (result.exitCode !== 0 || !(await exists($, png))) throw new Error("the page couldn't be rendered by Chrome or Chromium")
     return png
   } finally {
     // A fresh browser profile, never the person's login, cookies or extensions.
-    await $.process.run(['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
+    await runTool($, ['rm', '-rf', '--', `${png}.profile`]).catch(() => undefined)
   }
 }
 
@@ -590,10 +600,10 @@ export function ensureWave($: EngineInterface, real: string, id: string): Promis
 
 async function cutWave($: EngineInterface, real: string, out: string): Promise<string> {
   if (await isGone($, out)) {
-    const dur = await $.process.run([state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
+    const dur = await runTool($, [state.ffprobe, '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', real])
     const seconds = Number(dur.stdout.trim())
     if (dur.exitCode !== 0 || !Number.isFinite(seconds) || seconds <= 0) throw new Error(`ffmpeg could not read ${real}: ${(dur.stderr || dur.stdout).trim().slice(0, 200)}`)
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     // This attempt's own names: a second run (another session, or one that
     // slipped past the map) never writes where this one writes — the session
     // prefix keeps two Claude processes from ever colliding on one name.
@@ -603,14 +613,14 @@ async function cutWave($: EngineInterface, real: string, out: string): Promise<s
     const part = `${out}.${attempt}.part`
     try {
       for (const [png, color] of [[bright, WAVE_PLAYED], [dim, WAVE_UNPLAYED]] as const) {
-        const strip = await $.process.run(waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
+        const strip = await runTool($, waveStripArgv(state.ffmpeg, real, png, color), { timeoutMs: 120000 })
         if (strip.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${strip.stderr.trim().slice(0, 200)}`)
       }
-      const made = await $.process.run(waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
+      const made = await runTool($, waveArgv(state.ffmpeg, bright, dim, real, part, +seconds.toFixed(3)), { timeoutMs: 120000 })
       if (made.exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: ${made.stderr.trim().slice(0, 200)}`)
-      if ((await $.process.run(['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
+      if ((await runTool($, ['mv', '-f', part, out])).exitCode !== 0) throw new Error(`ffmpeg could not read ${real}: could not finish`)
     } finally {
-      await $.process.run(['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
+      await runTool($, ['rm', '-f', '--', part, bright, dim]).catch(() => undefined)
     }
   }
   return out
@@ -747,12 +757,12 @@ export async function identityOf($: EngineInterface, raw: string): Promise<strin
 // What a folder's meta.json holds, unchecked: the caller says what it expects.
 // (No type argument at the call: the directory review reads only fn($, ...).)
 async function readMeta($: EngineInterface, dir: string): Promise<unknown> {
-  const r = await $.process.run(['cat', `${dir}/meta.json`]).catch(() => null)
+  const r = await runTool($, ['cat', `${dir}/meta.json`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   try { return JSON.parse(r.stdout) as unknown } catch { return null }
 }
 function writeMeta($: EngineInterface, dir: string, meta: unknown) {
-  return $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
+  return runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0/meta.json"', dir, JSON.stringify(meta)]).catch(() => undefined)
 }
 
 export async function prepareVideo($: EngineInterface, real: string, title: string, key?: string, cutAt?: number): Promise<Shown> {
@@ -760,7 +770,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     state.hasVideoTools = (await Promise.all([exists($, state.ffmpeg), exists($, state.ffprobe)])).every(Boolean)
     if (!state.hasVideoTools) throw new Error(noFfmpeg(state.isMac))
   }
-  const facts = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name:format=duration', '-of', 'default=nw=1', real])
+  const facts = await runTool($, [state.ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,codec_name:format=duration', '-of', 'default=nw=1', real])
   const field = (name: string) => Number(new RegExp(`^${name}=([0-9.]+)`, 'm').exec(facts.stdout)?.[1] ?? Number.NaN)
   hwDecode.set(real, state.isMac && /^codec_name=(h264|hevc)$/m.test(facts.stdout))
   // Frames stay within PX_MAX in every Picture size (see sharpen).
@@ -775,7 +785,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
     const meta = (await readMeta($, dir)) as { frames: Omit<Frames, 'dir'>; width: number; height: number } | null
     if (meta) {
       const frames = { ...meta.frames, dir }
-      await $.process.run(['touch', dir]).catch(() => undefined)
+      await runTool($, ['touch', dir]).catch(() => undefined)
       await learn($, dir)
       if (!disk(dir).has(0)) await until($, dir, 0, ensure($, frames, real, 0, false))
       return { kind: 'video', path: frameFile(frames, 0), source: real, width: meta.width, height: meta.height, ...own, title, generation: ++state.generation, frames }
@@ -787,7 +797,7 @@ export async function prepareVideo($: EngineInterface, real: string, title: stri
   const fps = sampleRate(Number.isFinite(probed) && probed > 0 ? probed : 1)
   state.generation += 1
   const dir = folder ? `${state.TMP}/${folder}` : `${state.TMP}/v${state.generation}-${Math.floor(await $.clock.now())}`
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   // The blank-opening skip is off: every clip plays from its start (see
   // leadFrom, and known-issues.md for how it would be turned on).
   const lead = 0
@@ -838,7 +848,7 @@ export async function rescaleVideo($: EngineInterface, m: Shown, width: number, 
   // The new size keeps the frames' aspect (after any rotation), even rows.
   const frames: Frames = { ...f, dir, cut: width, raw: raw && m.width > 0 ? { width, height: Math.max(2, Math.round((width * m.height) / m.width / 2) * 2) } : undefined }
   const i = Math.max(0, Math.min(at, f.count - 1))
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   await learn($, dir)
   if (!disk(dir).has(i)) await until($, dir, i, ensure($, frames, source, i, false))
   const shown = frameFile(frames, i)
@@ -929,18 +939,18 @@ let canPace = true
 // kitty, a frame over BYTES_MAX may not draw, so a clip with one is cut again
 // in 256 colours.
 async function cutFrames($: EngineInterface, cut: (isFew: boolean) => string[], files: () => Promise<string[]>) {
-  let made = await $.process.run(cut(state.sendBytes))
+  let made = await runTool($, cut(state.sendBytes))
   if (made.exitCode !== 0 && cut(state.sendBytes).includes('-hwaccel')) {
     debug(`hw decode failed, cut again without it: ${made.stderr.trim().slice(0, 80)}`)
     const plain = cut
     cut = isFew => withoutHw(plain(isFew))
-    made = await $.process.run(cut(state.sendBytes))
+    made = await runTool($, cut(state.sendBytes))
   }
   if (made.exitCode !== 0 || state.sendBytes || readsAnyFile()) return made
   const sizes = await Promise.all((await files()).map(f => Promise.resolve().then(() => $.fs.stat(f)).then(st => st.size, () => 0)))
   if (!sizes.some(size => size > BYTES_MAX)) return made
   debug('cut again in 256 colours: a frame is over 2 MB')
-  return $.process.run(cut(true))
+  return runTool($, cut(true))
 }
 
 // The frames each folder holds, as far as this session knows: what its
@@ -1193,7 +1203,7 @@ export async function recutFrame($: EngineInterface, media: Shown, i: number): P
   // There after all (a draw that looked while the frame was being written):
   // stopping the decoder for it would only stall playback.
   if (!(await isGone($, frameFile(f, i)))) return true
-  await $.process.run(['mkdir', '-p', f.dir]).catch(() => undefined)
+  await runTool($, ['mkdir', '-p', f.dir]).catch(() => undefined)
   disk(f.dir).delete(i)
   decoders.get(f.dir)?.stop()
   await until($, f.dir, i, ensure($, f, media.source, i, false))
@@ -1240,7 +1250,7 @@ function prune($: EngineInterface, dir: string, fps: number) {
       gone.push(`${dir}/${name}`)
       disk(dir).delete(i)
     }
-    if (gone.length) await $.process.run(['rm', '-f', ...gone]).catch(() => undefined)
+    if (gone.length) await runTool($, ['rm', '-f', ...gone]).catch(() => undefined)
   })()
 }
 
@@ -1345,7 +1355,7 @@ export const compareFrame = (shown: Shown, frame: number) => {
 // runs by eye. Small and sparse on purpose: matching costs frames × frames.
 async function thumbs($: EngineInterface, media: Shown, stride: number): Promise<number[][]> {
   const f = media.frames!
-  const r = await $.process.run([
+  const r = await runTool($, [
     'sh', '-c',
     `"$0" -v error ${f.lead ? `-ss ${f.lead} ` : ''}-i "$1" -vf "fps=${f.fps},select=not(mod(n\\,${stride})),scale=32:18,format=gray" -fps_mode passthrough -frames:v ${Math.ceil(f.count / stride)} -f rawvideo - | od -An -tu1 -v`,
     state.ffmpeg, media.source ?? '',
@@ -1464,7 +1474,7 @@ export async function preparePair($: EngineInterface, original: Shown, updated: 
   const known = (await readMeta($, dir)) as PairMeta | null
   if (known) {
     const pair = { ...known.pair, dir }
-    await $.process.run(['touch', dir]).catch(() => undefined)
+    await runTool($, ['touch', dir]).catch(() => undefined)
     await pairReady($, { ...updated, compare: original, pair, sync: known.sync }, 0)
     return { pair, pairWidth: known.pairWidth, pairHeight: known.pairHeight, sync: known.sync }
   }
@@ -1478,7 +1488,7 @@ export async function preparePair($: EngineInterface, original: Shown, updated: 
   const match = ta.length && tb.length
     ? spreadMatch(matchOf(align(ta, tb, 0.01, Math.max(2, Math.round((0.6 * f.fps) / stride)), 0.02), ta.length), stride, f.count, g.count - 1)
     : byTime()
-  await $.process.run(['mkdir', '-p', dir])
+  await runTool($, ['mkdir', '-p', dir])
   // Each side scaled to the merged height, at an even width. The merged
   // frames are PNGs (two clips, rarely played: simpler than raw for little
   // cost), made from the sides' frames, raw or not.
@@ -1522,25 +1532,25 @@ function merge($: EngineInterface, shown: Shown, i: number, isPlay: boolean): Pr
     while (first + n < want && disk(f.dir).has(first + n) && disk(g.dir).has(jOf(first + n))) n++
     if (!n) return
     const tmp = `${pair.dir}/m${first}`
-    await $.process.run(['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
+    await runTool($, ['mkdir', '-p', `${tmp}/o`, `${tmp}/u`])
     const ext = (side: Frames) => (side.raw ? 'rgb' : 'png')
     const links = Array.from({ length: n }, (_, k) => {
       const name = String(k + 1).padStart(5, '0')
       return `ln -sf "${frameFile(g, jOf(first + k))}" "$0/o/f${name}.${ext(g)}"; ln -sf "${frameFile(f, first + k)}" "$0/u/f${name}.${ext(f)}"`
     }).join('\n')
-    await $.process.run(['sh', '-c', links, tmp])
+    await runTool($, ['sh', '-c', links, tmp])
     // Raw frames have no header: ffmpeg is told their format and size.
     const input = (side: Frames, sub: string) => [
       ...(side.raw ? ['-f', 'image2', '-c:v', 'rawvideo', '-pixel_format', 'rgb24', '-video_size', `${side.raw.width}x${side.raw.height}`] : []),
       '-framerate', String(pair.fps), '-i', `${tmp}/${sub}/f%05d.${ext(side)}`,
     ]
     const height = pairHeightOf(shown, original)
-    const made = await $.process.run([
+    const made = await runTool($, [
       state.ffmpeg, '-v', 'error', '-nostdin', ...ONE_THREAD, ...input(g, 'o'), ...input(f, 'u'),
       '-filter_complex', `[0:v]scale=${sideWidth(original, height)}:${height},pad=iw+${PAIR_GAP}:ih:0:0:color=${SIDEBAR.replace('#', '0x')}[a];[1:v]scale=${sideWidth(shown, height)}:${height}[b];[a][b]hstack=inputs=2`,
       '-compression_level', '1', '-frames:v', String(n), '-start_number', String(first + 1), '-y', `${pair.dir}/f%05d.png`,
     ])
-    await $.process.run(['rm', '-rf', tmp])
+    await runTool($, ['rm', '-rf', tmp])
     if (made.exitCode !== 0) return void debug(`merge failed: ${made.stderr.trim().slice(0, 120)}`)
     for (let k = first; k < first + n; k++) disk(pair.dir).add(k)
     wake(pair.dir)
@@ -1579,7 +1589,7 @@ export async function pairReady($: EngineInterface, shown: Shown, i: number, sit
 export async function prepare($: EngineInterface, raw: string, title?: string, key?: string): Promise<Shown> {
   const path = expand(raw, state.cwd, state.home)
   const stat = await $.fs.stat(path, { resolve: true })
-  const real = stat.realPath ?? path
+  const real = slashed(stat.realPath ?? path)
   const name = title ?? real.split('/').pop()!
   if (VIDEO.test(real)) return prepareVideo($, real, name, key ?? (await identityOf($, real)))
   if (isAudio(real)) return prepareAudio($, real, name, key ?? (await identityOf($, real)))
@@ -1591,11 +1601,11 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   } else if (!/\.png$/i.test(real)) {
     state.generation += 1
     png = `${state.TMP}/${real.split('/').pop()!.replace(/\.[^.]+$/, '')}-${state.generation}.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     if (!state.isMac && !(await exists($, state.ffmpeg))) throw new Error(noFfmpeg(false))
     const conv = state.isMac
-      ? await $.process.run(['sips', '-s', 'format', 'png', real, '--out', png])
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', real, '-frames:v', '1', png])
+      ? await runTool($, ['sips', '-s', 'format', 'png', real, '--out', png])
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', real, '-frames:v', '1', png])
     if (conv.exitCode !== 0) throw new Error(`could not convert ${real}: ${conv.stderr.trim()}`)
   }
   // The terminal reads the file itself, so only a picture past what any
@@ -1604,10 +1614,10 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   if (Math.max(dims.width, dims.height) > MAX_STILL) {
     state.generation += 1
     const small = `${state.TMP}/${png.split('/').pop()!.replace(/\.png$/i, '')}-${state.generation}-small.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     const shrunk = state.isMac
-      ? await $.process.run(['sips', '-Z', String(MAX_STILL), png, '--out', small])
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale='if(gt(iw,ih),min(${MAX_STILL},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_STILL},ih))'`, small]).catch(() => ({ exitCode: 1 }))
+      ? await runTool($, ['sips', '-Z', String(MAX_STILL), png, '--out', small])
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale='if(gt(iw,ih),min(${MAX_STILL},iw),-2)':'if(gt(iw,ih),-2,min(${MAX_STILL},ih))'`, small]).catch(() => ({ exitCode: 1 }))
     if (state.isMac || shrunk.exitCode === 0) png = small
   }
   // A picture narrower than the window shows it is drawn that wide, as a
@@ -1618,10 +1628,10 @@ export async function prepare($: EngineInterface, raw: string, title?: string, k
   if (wide > now.width) {
     state.generation += 1
     const big = `${state.TMP}/${png.split('/').pop()!.replace(/\.png$/i, '')}-${state.generation}-w${wide}.png`
-    await $.process.run(['mkdir', '-p', state.TMP])
+    await runTool($, ['mkdir', '-p', state.TMP])
     const grown = state.isMac
-      ? await $.process.run(['sips', '--resampleWidth', String(wide), png, '--out', big]).catch(() => ({ exitCode: 1 }))
-      : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale=${wide}:-2:flags=lanczos`, big]).catch(() => ({ exitCode: 1 }))
+      ? await runTool($, ['sips', '--resampleWidth', String(wide), png, '--out', big]).catch(() => ({ exitCode: 1 }))
+      : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', png, '-vf', `scale=${wide}:-2:flags=lanczos`, big]).catch(() => ({ exitCode: 1 }))
     if (grown.exitCode === 0) png = big
   }
   state.generation += 1
@@ -1650,10 +1660,6 @@ export const MD_MAX_BYTES = 1_048_576
 export const DOC_MAX_PAGES = 100
 
 // ── Markdown to HTML, escaped first ───────────────────────────────────────
-
-// A path into a file URL, percent-encoded a segment at a time: nothing in the
-// name can close the attribute or inject markup.
-const encodeDir = (path: string) => path.split('/').map(encodeURIComponent).join('/')
 
 const escapeText = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -1758,7 +1764,7 @@ export function documentHtml(text: string, title: string, base: string, mermaidP
   const body = parsed.body
   const graphs = scriptJson(parsed.diagrams)
   const doc = `<!doctype html><meta charset="utf-8"><title>${escapeText(title)}</title>
-<base href="file://${encodeDir(base)}">
+<base href="${fileUrl(base)}">
 <style>@page{margin:18mm 16mm}
 :root{--ink:#1a1d23;--dim:#5b6472;--line:#e3e6ea;--wash:#f5f6f8}
 html{-webkit-text-size-adjust:100%}
@@ -1777,7 +1783,7 @@ a{color:#0b57d0;text-decoration:none}a:hover{text-decoration:underline}
 hr{border:0;border-top:1px solid var(--line);margin:1.8em 0}
 .mmd{margin:1.2em 0}.mmd.wide{margin:0}.mmd svg{max-width:100%}</style>
 ${body}
-<script src="file://${encodeDir(mermaidPath)}"></script>
+<script src="${fileUrl(mermaidPath)}"></script>
 <script>mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:'neutral'});
 const G=${graphs};const all=[...document.querySelectorAll('.mmd')];
 (async()=>{for(const el of all){try{el.innerHTML=(await mermaid.render('m'+el.dataset.i,G[+el.dataset.i])).svg}catch(e){el.innerHTML='<pre class="mmd-error"></pre>';el.dataset.error=String(e)}el.removeAttribute('data-i')}
@@ -1855,7 +1861,7 @@ export async function prepareDocument($: EngineInterface, real: string, title: s
   // the other writes (the attempt map in sound.ts is the same pattern).
   const attempt = docSession + Date.now().toString(36) + (docAttempt += 1).toString(36)
 
-  const facts = await $.process.run(pdfInfoArgv(state.pdfinfo, printed ? `${pdf}` : real))
+  const facts = await runTool($, pdfInfoArgv(state.pdfinfo, printed ? `${pdf}` : real))
   // A printed document has no PDF yet on its first show; the count comes after
   // the print. A PDF file's count is known up front.
   let count = 0
@@ -1873,19 +1879,19 @@ export async function prepareDocument($: EngineInterface, real: string, title: s
       const partHtml = `${dir}.${attempt}.html`
       const partPdf = `${dir}.${attempt}.part.pdf`
       await $.fs.write(partHtml, documentHtml(text, title, base, mermaidAsset($), /\.(mmd|mermaid)$/i.test(real)))
-      const print = await $.process.run(docPrintArgv(state.chrome, partHtml, partPdf), { timeoutMs: DOC_TIMEOUT_MS })
-      await $.process.run(['rm', '-rf', '--', `${partPdf}.profile`]).catch(() => undefined)
+      const print = await runTool($, docPrintArgv(state.chrome, partHtml, partPdf), { timeoutMs: DOC_TIMEOUT_MS })
+      await runTool($, ['rm', '-rf', '--', `${partPdf}.profile`]).catch(() => undefined)
       if (print.exitCode !== 0) throw new Error(docErrorOf(`the browser could not print it (${print.stderr.trim().slice(0, 120)})`, name).message)
       if (domHasError(print.stdout) || !domIsReady(print.stdout)) throw new Error(docErrorOf('mermaid', name).message)
-      if ((await $.process.run(['mv', '-f', partPdf, pdf])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
-      if ((await $.process.run(['mv', '-f', partHtml, html])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
-      const printedFacts = await $.process.run(pdfInfoArgv(state.pdfinfo, pdf))
+      if ((await runTool($, ['mv', '-f', partPdf, pdf])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
+      if ((await runTool($, ['mv', '-f', partHtml, html])).exitCode !== 0) throw new Error(docErrorOf('could not be finished', name).message)
+      const printedFacts = await runTool($, pdfInfoArgv(state.pdfinfo, pdf))
       const printedCount = docPageCount(printedFacts.stdout)
       if (printedFacts.exitCode !== 0 || printedCount < 1) throw new Error(docErrorOf('was printed with no pages', name).message)
       if (printedCount > DOC_MAX_PAGES) throw new Error(docErrorOf('pages', name).message)
       count = printedCount
     }
-    await $.process.run(['mkdir', '-p', dir])
+    await runTool($, ['mkdir', '-p', dir])
     const moved1 = await rasterPage($, pdf, dir, 1)
     if (moved1 !== first) throw new Error(docErrorOf('poppler could not rasterize page 1', name).message)
   }
@@ -1923,12 +1929,12 @@ export async function docPage($: EngineInterface, media: Shown, page: number): P
 // Renders one page to a side name and moves it into place whole: a render
 // that dies midway never leaves a half-written page behind as a cached page.
 async function rasterPage($: EngineInterface, pdf: string, dir: string, page: number): Promise<string | null> {
-  await $.process.run(['mkdir', '-p', dir]).catch(() => undefined)
+  await runTool($, ['mkdir', '-p', dir]).catch(() => undefined)
   const final = `${dir}/f${String(page).padStart(5, '0')}.png`
   const part = `${dir}/p${String(page).padStart(5, '0')}`
-  const made = await $.process.run(pdfPageArgv(state.pdftoppm, pdf, dir, page), { timeoutMs: POPPLER_TIMEOUT_MS })
+  const made = await runTool($, pdfPageArgv(state.pdftoppm, pdf, dir, page), { timeoutMs: POPPLER_TIMEOUT_MS })
   if (made.exitCode !== 0) return null
-  if ((await $.process.run(['mv', '-f', `${part}.png`, final])).exitCode !== 0) return null
+  if ((await runTool($, ['mv', '-f', `${part}.png`, final])).exitCode !== 0) return null
   return (await isGone($, final)) ? null : final
 }
 
@@ -2015,7 +2021,7 @@ export async function storeOf($: EngineInterface): Promise<string> {
   for (const dir of [`${state.cwd || state.home}/.show-your-work`, `${state.TMP}/store`]) {
     // Never through a link (a repo could commit `.show-your-work -> ..`), and
     // only a folder this user owns.
-    const r = await $.process.run(['sh', '-c', '[ -L "$0" ] && exit 1; mkdir -p "$0" && [ ! -L "$0" ] && [ -O "$0" ] && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir]).catch(() => null)
+    const r = await runTool($, ['sh', '-c', '[ -L "$0" ] && exit 1; mkdir -p "$0" && [ ! -L "$0" ] && [ -O "$0" ] && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir]).catch(() => null)
     if (r && r.exitCode === 0) {
       const dirs = ((await $.store.get(HISTORY_DIRS)) as string[] | undefined) ?? []
       if (!dirs.includes(dir)) await $.store.set(HISTORY_DIRS, [dir, ...dirs].slice(0, 200))
@@ -2026,7 +2032,7 @@ export async function storeOf($: EngineInterface): Promise<string> {
 }
 async function readVersion($: EngineInterface, dir: string, id: string): Promise<Version | null> {
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
-  const r = await $.process.run(['cat', `${dir}/${id}.json`]).catch(() => null)
+  const r = await runTool($, ['cat', `${dir}/${id}.json`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   // A record's id and extension become paths that are later deleted: only
   // the plugin's own shapes pass.
@@ -2037,13 +2043,13 @@ async function readVersion($: EngineInterface, dir: string, id: string): Promise
 }
 export async function storeVersion($: EngineInterface, raw: string, note: string, title: string | undefined, parent: string | undefined):
   Promise<{ real: string; copy: string; id: string; chain: { path: string; note?: string; id: string }[]; missing?: string }> {
-  const real = (await $.fs.stat(expand(raw, state.cwd, state.home), { resolve: true })).realPath ?? expand(raw, state.cwd, state.home)
+  const real = slashed((await $.fs.stat(expand(raw, state.cwd, state.home), { resolve: true })).realPath ?? expand(raw, state.cwd, state.home))
   const dir = await storeOf($)
   const ext = real.match(/\.[^./]+$/)?.[0] ?? ''
   state.generation += 1
   const id = keyOf(`${real}|${await $.clock.now()}|${state.generation}`).slice(0, 6)
   const meta: Version = { id, ...(parent ? { parent } : {}), note, ext, title, origin: real }
-  const r = await $.process.run(['sh', '-c',
+  const r = await runTool($, ['sh', '-c',
     '[ ! -L "$0" ] && [ -O "$0" ] || exit 1\n' +
     'cp -c "$1" "$0/$2$3" 2>/dev/null || cp --reflink=auto "$1" "$0/$2$3" 2>/dev/null || cp "$1" "$0/$2$3" || exit 1\n' +
     'printf "%s" "$4" > "$0/$2.json"\n' +
@@ -2058,7 +2064,7 @@ export async function storeVersion($: EngineInterface, raw: string, note: string
   if (r.exitCode !== 0) return { real, copy: real, id, chain: [] }
   // Then the cap across every project's history.
   const dirs = ((await $.store.get(HISTORY_DIRS)) as string[] | undefined) ?? [dir]
-  void $.process.run(['sh', '-c', HISTORY_TRIM_SH, 'trim', String(HISTORY_CAP_KB), `${dir}/${id}.json`, ...dirs]).catch(() => undefined)
+  void runTool($, ['sh', '-c', HISTORY_TRIM_SH, 'trim', String(HISTORY_CAP_KB), `${dir}/${id}.json`, ...dirs]).catch(() => undefined)
   // Follow the links back, oldest first.
   const chain: { path: string; note?: string; id: string }[] = []
   let at = parent, missing: string | undefined
@@ -2072,7 +2078,7 @@ export async function storeVersion($: EngineInterface, raw: string, note: string
   // Updated, no deeper history, so re-recordings don't pile up.
   if (VIDEO.test(real) && chain.length > 1) {
     const older = chain.slice(0, -1)
-    void $.process.run(['rm', '-f', ...older.map(v => v.path)]).catch(() => undefined)
+    void runTool($, ['rm', '-f', ...older.map(v => v.path)]).catch(() => undefined)
     chain.splice(0, chain.length - 1)
   }
   return { real, copy: `${dir}/${id}${ext}`, id, chain, missing }
@@ -2100,7 +2106,7 @@ export async function shownOf($: EngineInterface, output: unknown): Promise<Show
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
   const known = shownById.get(id)
   if (known) return known
-  const r = await $.process.run(['cat', `${await storeOf($)}/${id}.shown`]).catch(() => null)
+  const r = await runTool($, ['cat', `${await storeOf($)}/${id}.shown`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   try {
     const shown = JSON.parse(r.stdout) as Shown
@@ -2226,7 +2232,7 @@ export const outerOf = (termtype: string) => (/^(warp|wezterm|konsole)\b/i.exec(
 export async function forwardPictures($: EngineInterface): Promise<boolean> {
   const pane = (await $.env.get('TMUX_PANE')) ?? ''
   if (!pane) return false
-  const tmux = (args: string[]) => Promise.resolve().then(() => $.process.run(['tmux', ...args])).catch(() => null)
+  const tmux = (args: string[]) => Promise.resolve().then(() => runTool($, ['tmux', ...args])).catch(() => null)
   const facts = await tmux(['display', '-p', '-t', pane, '#{pane_tty}\t#{pane_pipe}\t#{client_termtype}'])
   const [tty, piped, outer] = (facts?.exitCode === 0 ? facts.stdout.trim() : '').split('\t')
   event('tmux', { tty, piped, outer })
@@ -2257,7 +2263,7 @@ export async function stopForwarding($: EngineInterface) {
   if (!forwarding) return
   const pane = forwarding
   forwarding = ''
-  await Promise.resolve().then(() => $.process.run(['tmux', 'pipe-pane', '-t', pane])).catch(() => undefined)
+  await Promise.resolve().then(() => runTool($, ['tmux', 'pipe-pane', '-t', pane])).catch(() => undefined)
 }
 
 // ── sound.ts ──────────────────────────────────────────────────────────────
@@ -2311,7 +2317,7 @@ const LATENCY_JS = "ObjC.import('AVFoundation');$.AVAudioEngine.alloc.init.outpu
 export function measureLatency($: EngineInterface) {
   if (!state.isMac || Date.now() - latencyAskedAt < 5000) return
   latencyAskedAt = Date.now()
-  void $.process.run(['osascript', '-l', 'JavaScript', '-e', LATENCY_JS], { timeoutMs: 8000 }).then(r => {
+  void runTool($, ['osascript', '-l', 'JavaScript', '-e', LATENCY_JS], { timeoutMs: 8000 }).then(r => {
     const s = Number(r.stdout.trim())
     if (r.exitCode !== 0 || !Number.isFinite(s) || s < 0 || s > 1) return
     if (Math.abs(s - outputLatency) > 0.001) event('sound', { action: 'latency', ms: Math.round(s * 1000) })
@@ -2366,7 +2372,7 @@ export function probeSound($: EngineInterface, source: string | undefined, f: Fr
   if (!job) {
     job = (async () => {
       try {
-        const probed = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', source], { timeoutMs: 15000 })
+        const probed = await runTool($, [state.ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', source], { timeoutMs: 15000 })
         if (probed.exitCode !== 0) return undefined
         const found: Track = probed.stdout.split('\n').some(l => l.trim() === 'audio') ? { status: 'has' } : { status: 'none' }
         if (!tracks.has(key)) tracks.set(key, found)
@@ -2411,13 +2417,13 @@ async function cutSound($: EngineInterface, source: string, f: Frames): Promise<
   const name = `${state.TMP}/sound-${keyOf(`${id}|${f.lead ?? 0}|${f.duration}`)}`
   // Cut to a side name, then moved: a cut that dies midway never leaves a
   // short file that plays as if it were whole.
-  const cut = await $.process.run(soundExtractArgv(state.ffmpeg, source, `${name}.part`, f.lead ?? 0, f.duration), { timeoutMs: 120000 })
+  const cut = await runTool($, soundExtractArgv(state.ffmpeg, source, `${name}.part`, f.lead ?? 0, f.duration), { timeoutMs: 120000 })
   if (cut.exitCode !== 0) {
     // Not tried again this session: the clip plays silent, as before.
     problem('sound_cut_failed', { error: cut.stderr.trim().slice(0, 120) })
     return { status: 'none' }
   }
-  const moved = await $.process.run(['mv', '-f', `${name}.part`, `${name}.wav`])
+  const moved = await runTool($, ['mv', '-f', `${name}.part`, `${name}.wav`])
   if (moved.exitCode !== 0) return { status: 'none' }
   const st = await $.fs.stat(`${name}.wav`).catch(() => null)
   const seconds = st ? wavSeconds(st.size) : 0
@@ -2601,7 +2607,9 @@ export const OPEN_SH = [
   'done',
   'exit 0',
 ].join('\n')
-const openArgv = (target: string) => (state.isMac ? ['open', target] : ['sh', '-c', OPEN_SH, 'sh', 'xdg-open', target])
+// Windows: cmd's start opens it with the default app ('' is start's window title).
+const openArgv = (target: string) =>
+  state.isMac ? ['open', target] : state.isWindows ? ['cmd', '/c', 'start', '', target.replace(/\//g, '\\')] : ['sh', '-c', OPEN_SH, 'sh', 'xdg-open', target]
 
 // What went wrong opening something, in words: from xdg-open's exit codes
 // (2 no such file, 3 no app or tool for it, 4 the app failed) and from macOS
@@ -2720,8 +2728,8 @@ const SOUND_CLEAN_MS = 8000
 async function widenStill($: EngineInterface, source: string, width: number): Promise<Shown | null> {
   const out = `${state.TMP}/w-${keyOf(source)}-${width}.png`
   const made = state.isMac
-    ? await $.process.run(['sips', '-s', 'format', 'png', '--resampleWidth', String(width), source, '--out', out]).catch(() => null)
-    : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', source, '-frames:v', '1', '-vf', `scale=${width}:-2:flags=lanczos`, out]).catch(() => null)
+    ? await runTool($, ['sips', '-s', 'format', 'png', '--resampleWidth', String(width), source, '--out', out]).catch(() => null)
+    : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', source, '-frames:v', '1', '-vf', `scale=${width}:-2:flags=lanczos`, out]).catch(() => null)
   if (!made || made.exitCode !== 0) return null
   state.generation += 1
   return { kind: 'image', path: out, source, ...(await pngSize($, out)), title: '', generation: state.generation }
@@ -2809,7 +2817,7 @@ async function readBytes($: EngineInterface, file: string, version: string): Pro
   }
   let small = fitted.get(version)
   if (!small) {
-    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(version)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(version)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     small = r?.exitCode === 0 ? r.stdout.trim() : ''
     if (!small) return null
     fitted.set(version, small)
@@ -2843,12 +2851,12 @@ async function readableFile($: EngineInterface, file: string): Promise<string> {
 }
 async function readableCopy($: EngineInterface, file: string, size: number, id: string): Promise<string> {
   if (size > BYTES_MAX) {
-    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     return (r?.exitCode === 0 && r.stdout.trim()) || file
   }
   const copy = `${state.TMP}/o-${id}.png`
   // `cp -c` keeps the original's time; the temp folder's cleanup goes by it.
-  const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', '{ cp -c "$0" "$1" 2>/dev/null || cp --reflink=auto "$0" "$1" 2>/dev/null || cp "$0" "$1"; } && touch "$1"', file, copy])).catch(() => null)
+  const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', '{ cp -c "$0" "$1" 2>/dev/null || cp --reflink=auto "$0" "$1" 2>/dev/null || cp "$0" "$1"; } && touch "$1"', file, copy])).catch(() => null)
   return r?.exitCode === 0 ? copy : file
 }
 export async function pngSource($: EngineInterface, file: string): Promise<Source> {
@@ -3728,11 +3736,11 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
     const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, '']
     let out = `${state.home}/Downloads/${name}`
     for (let n = 2; await $.fs.stat(out).then(() => true, () => false); n++) out = `${state.home}/Downloads/${stem} ${n}${ext}`
-    if (!state.isMac) await $.process.run(['mkdir', '-p', `${state.home}/Downloads`])
-    const r = await $.process.run(['cp', source, out])
+    if (!state.isMac) await runTool($, ['mkdir', '-p', `${state.home}/Downloads`])
+    const r = await runTool($, ['cp', source, out])
     if (r.exitCode !== 0) return $.ui.toast(`Couldn't save it to Downloads: ${r.stderr.trim().split('\n')[0]?.slice(0, 100) || `error ${r.exitCode}`}`)
     // Saved either way; the folder opening is a convenience on top.
-    await $.process.run(state.isMac ? ['open', '-R', out] : openArgv(`${state.home}/Downloads`)).catch(() => undefined)
+    await runTool($, state.isMac ? ['open', '-R', out] : openArgv(`${state.home}/Downloads`)).catch(() => undefined)
     $.ui.toast(`Saved to Downloads/${out.split('/').pop()}`)
   }
 
@@ -3741,7 +3749,7 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
       {!source.startsWith(`${state.home}/Downloads/`) ? (
         <Button key="keep" plain dimColor label="Save to Downloads" onPress={() => { act('save'); void keep() }} />
       ) : (
-        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void $.process.run(state.isMac ? ['open', '-R', source] : openArgv(source.slice(0, source.lastIndexOf('/')) || '/')).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder', 'folders', source))} />
+        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void runTool($, state.isMac ? ['open', '-R', source] : openArgv(source.slice(0, source.lastIndexOf('/')) || '/')).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder', 'folders', source))} />
       )}
       {!isNarrow && (
         <Button
@@ -3965,7 +3973,7 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
   const n = cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId)
   const file = shown.origin ?? shown.source ?? shown.path
   const onPress = state.drawCause === 'desktop'
-    ? () => act(n.action) || void $.process.run(openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
+    ? () => act(n.action) || void runTool($, openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
     : state.drawCause === 'unrecognised'
       ? (press: { surface: 'terminal' }) => act(n.action) || void (async () => {
         const profile = await turnOnPictures($)
@@ -4116,7 +4124,7 @@ export async function Viewer(
       : <Text color="suggestion">{prLabel}</Text>
     : null
   const run = (argv: string[], note: string) => () => {
-    void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
+    void runTool($, argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
   // The single view with the QA sidebar is the default; side by side is a click away.
   if (!state.canImage) {
@@ -4195,7 +4203,7 @@ export async function Viewer(
         const argv = artifact
           ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, target!)]
           : openArgv(target ?? source)
-        void $.process.run(argv).then(r =>
+        void runTool($, argv).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(target ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, target ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', target ?? source)),
         )
       }}
@@ -4349,6 +4357,7 @@ export function toolLine(tool: string, input: unknown, isRunning: boolean): stri
 // What more than one module reads or changes: the session's facts, the
 // player's and tour's progress, and the settings.
 
+
 // An imported `let` is read-only to the module that imports it, so anything
 // set in one module and read in another is a field of this object.
 export const state = {
@@ -4375,6 +4384,12 @@ export const state = {
   // macOS unless the session says Linux: every Linux path below is a branch
   // beside the macOS one, which stays as it was.
   isMac: true,
+  // Windows through Git for Windows' sh (MSYS2): paths are kept in the mixed
+  // form C:/Users/... that Node, the sh tools and Windows programs all read.
+  isWindows: false,
+  // Git for Windows' usr/bin (C:/Program Files/Git/usr/bin): Claude Code spawns
+  // programs with the Windows PATH, which has no sh, mkdir or rm.
+  gitBin: '',
   // Found once, then trusted for the session; while missing it is looked for
   // again on each video, so installing it mid-session works.
   hasVideoTools: false,
@@ -4382,6 +4397,9 @@ export const state = {
   cell: null as Cell | null,
   // The terminal's size in cells, from the same measure.
   termSize: null as { columns: number; rows: number } | null,
+  // SHOW_YOUR_WORK_CELL=8x17: the cell in pixels where the terminal reports
+  // none (Windows has no tty to ask), so the box matches the picture.
+  cellGiven: null as Cell | null,
   // The terminal reads the file itself: a path crosses, not the picture. Sending
   // bytes (b6b8b14) moved ~400 KB a frame and froze playback.
   // Over ssh the terminal is on another machine and can't read the file, so the
@@ -4444,6 +4462,74 @@ export const SETTINGS = [
 export type Field = (typeof SETTINGS)[number]['field']
 // Each switch is true on its first option, the default.
 export const settings: Record<Field, boolean> = { stable_updates: true, usage_stats: true, standard_size: true }
+
+// Windows: the Unix tools this plugin runs live in Git for Windows' usr/bin,
+// which is not on the Windows PATH. run() names them in full there.
+// A path as a file URL, percent-encoded a segment at a time so nothing in the
+// name can close an attribute. A Windows drive path C:/x needs file:///C:/x.
+export const fileUrl = (raw: string) => {
+  // Claude Code may hand over C:\x\y (the plugin's own folder does): a drive
+  // path's backslashes become slashes first.
+  const path = /^[A-Za-z]:\\/.test(raw) ? raw.replace(/\\/g, '/') : raw
+  const drive = /^[A-Za-z]:(?=\/)/.exec(path)?.[0] ?? ''
+  return `file://${drive ? '/' + drive : ''}${path.slice(drive.length).split('/').map(encodeURIComponent).join('/')}`
+}
+
+export const UNIX_TOOLS = new Set(['sh', 'mkdir', 'rm', 'mv', 'cp', 'touch', 'cat', 'mktemp', 'cygpath', 'uname', 'id', 'pwd'])
+
+export function winArgv(argv: string[], gitBin: string): string[] {
+  if (!gitBin || argv.length === 0 || !UNIX_TOOLS.has(argv[0]!)) {
+    return argv
+  }
+  const result = [`${gitBin}/${argv[0]}.exe`, ...argv.slice(1)]
+  if (argv[0] === 'sh' && (argv[1] === '-c' || argv[1] === '-lc') && typeof argv[2] === 'string') {
+    result[2] = 'PATH="/usr/bin:$PATH"; ' + argv[2]
+  }
+  return result
+}
+
+export async function findGitBin($: EngineInterface): Promise<string> {
+  const os = await Promise.resolve().then(() => $.env.get('OS')).catch(() => undefined)
+  if (os !== 'Windows_NT') {
+    return ''
+  }
+
+  const candidates: string[] = []
+
+  const gitBashPath = await Promise.resolve().then(() => $.env.get('CLAUDE_CODE_GIT_BASH_PATH')).catch(() => undefined)
+  if (gitBashPath) {
+    const normalized = gitBashPath.replace(/\\/g, '/')
+    const stripped = normalized.replace(/\/(usr\/)?bin\/(ba)?sh\.exe$/i, '')
+    candidates.push(stripped + '/usr/bin')
+  }
+
+  const whereResult = await Promise.resolve().then(() => $.process.run(['where', 'git'])).catch(() => ({ stdout: '' }))
+  const stdout = whereResult.stdout || ''
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const normalized = trimmed.replace(/\\/g, '/')
+    if (/\/(cmd|bin|mingw64\/bin)\/git\.exe$/i.test(normalized)) {
+      const stripped = normalized.replace(/\/(cmd|bin|mingw64\/bin)\/git\.exe$/i, '')
+      candidates.push(stripped + '/usr/bin')
+    }
+  }
+
+  candidates.push('C:/Program Files/Git/usr/bin')
+
+  for (const c of candidates) {
+    const exists = await Promise.resolve().then(() => $.fs.stat(`${c}/sh.exe`)).then(() => true, () => false)
+    if (exists) {
+      return c
+    }
+  }
+
+  return ''
+}
+
+export function runTool($: EngineInterface, argv: string[], options?: { timeoutMs: number }) {
+  return $.process.run(winArgv(argv, state.gitBin), options)
+}
 
 // ── diagnostics.ts ────────────────────────────────────────────────────────
 // The local diagnostics log: what the plugin did and every problem it noticed,
@@ -4556,7 +4642,7 @@ async function claude($: EngineInterface, args: string[]) {
   const known = CLAUDE_BINARIES.map(b => (b.startsWith('.') ? `${state.home}/${b}` : b))
   const candidates = [...new Set([claudeBinary, state.claudePath, ...known].filter(Boolean))]
   for (const bin of candidates) {
-    const r = await $.process.run([bin, ...args], { timeoutMs: 120_000 }).catch(() => undefined)
+    const r = await runTool($, [bin, ...args], { timeoutMs: 120_000 }).catch(() => undefined)
     if (r) {
       claudeBinary = bin
       return r
@@ -4680,7 +4766,7 @@ async function moveTo($: EngineInterface, branch: Branch, market: { url?: string
   const url = market.url ?? SOURCE
   const old = market.ref ? `${url}#${market.ref}` : url
   track('channel_move', { from: market.ref ?? 'main', to: branch })
-  const r = await $.process.run([...DETACH, 'sh', '-c', MOVE_SH, 'move', claudeBinary, url, branch, old, installed.scope ?? 'user', MARKETPLACE, `${PLUGIN}@${MARKETPLACE}`]).catch(() => undefined)
+  const r = await runTool($, [...DETACH, 'sh', '-c', MOVE_SH, 'move', claudeBinary, url, branch, old, installed.scope ?? 'user', MARKETPLACE, `${PLUGIN}@${MARKETPLACE}`]).catch(() => undefined)
   return r?.exitCode === 0
 }
 
@@ -5209,27 +5295,44 @@ export const isAtLeast = (version: string, least: string) => {
 // mid-session can bring the module back without a session start.
 export function setUp($: EngineInterface): Promise<void> {
   // Each step on its own: one that fails leaves the defaults, never a throw.
-  const tryRun = (argv: string[], options?: { timeoutMs: number }) => Promise.resolve().then(() => $.process.run(argv, options)).catch(() => null)
+  const tryRun = (argv: string[], options?: { timeoutMs: number }) => Promise.resolve().then(() => runTool($, argv, options)).catch(() => null)
   return (state.setup ??= (async () => {
     // After a reload the session start doesn't run again: ask the session
     // where it runs, so history is read from the right folder.
+    state.gitBin = await findGitBin($)
     if (!state.cwd) state.cwd = (await Promise.resolve().then(() => $.session.cwd()).catch(() => '')) || ((await tryRun(['pwd']))?.stdout ?? '').trim()
     const picked = await tryRun(['sh', '-c', PICK_TMP])
     if (picked && picked.exitCode === 0 && picked.stdout.trim().startsWith('/')) state.TMP = picked.stdout.trim()
     // A login shell finds ffmpeg where the person's profile puts it; one that
     // hangs gets five seconds, then a plain shell and the usual places.
-    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || { p=; for a in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/* "/Applications/Chromium.app/Contents/MacOS/Chromium" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell; do [ -f "$a" ] && [ -x "$a" ] && p=$a; done; echo "$p"; })"; echo "pp=$(command -v pdftoppm)"; echo "pi=$(command -v pdfinfo)"'
+    const where = 'echo "home=$HOME"; echo "ff=$(command -v ffmpeg)"; echo "fp=$(command -v ffprobe)"; echo "fy=$(command -v ffplay)"; echo "cl=$(command -v claude)"; echo "os=$(uname -s)"; echo "ch=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || { p=; for a in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/* "/Applications/Chromium.app/Contents/MacOS/Chromium" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$HOME"/AppData/Local/ms-playwright/chromium-*/chrome-win*/chrome.exe "/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" "/c/Program Files/Google/Chrome/Application/chrome.exe" "$HOME"/AppData/Local/Google/Chrome/Application/chrome.exe "/c/Program Files/Microsoft/Edge/Application/msedge.exe" "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell "$HOME"/AppData/Local/ms-playwright/chromium_headless_shell-*/chrome-*/*headless*shell.exe; do [ -f "$a" ] && [ -x "$a" ] && p=$a; done; echo "$p"; })"; echo "pp=$(command -v pdftoppm)"; echo "pi=$(command -v pdfinfo)"'
     const run = (flag: string) => tryRun(['sh', flag, where], { timeoutMs: 5000 })
     const login = await run('-lc')
     const env = (login?.stdout.includes('os=') ? login : await run('-c')) ?? { stdout: '', stderr: '', exitCode: 1 }
-    const got = (key: string) => env.stdout.split('\n').find(l => l.startsWith(`${key}=`))?.slice(key.length + 1).trim() ?? ''
+    const found = (key: string) => env.stdout.split('\n').find(l => l.startsWith(`${key}=`))?.slice(key.length + 1).trim() ?? ''
+    // Git for Windows' sh names things /c/Users/.../ffmpeg: one cygpath call
+    // turns every path into C:/Users/.../ffmpeg.exe, which Node can stat and run.
+    state.isWindows = !!state.gitBin || /^(MINGW|MSYS|CYGWIN)/i.test(found('os'))
+    const mixed = new Map<string, string>()
+    if (state.isWindows) {
+      const keys = ['home', 'ff', 'fp', 'fy', 'cl', 'ch', 'pp', 'pi']
+      const toMixed = 'for a; do if [ -n "$a" ]; then [ -f "$a.exe" ] && a="$a.exe"; cygpath -m "$a"; else echo; fi; done'
+      const r = await tryRun(['sh', '-c', toMixed, 'sh', state.TMP, ...keys.map(found)])
+      const lines = r && r.exitCode === 0 ? r.stdout.split('\n').map(l => l.trim()) : []
+      if (lines[0]) state.TMP = lines[0]
+      keys.forEach((k, i) => lines[i + 1] && mixed.set(k, lines[i + 1]!))
+      state.cwd = state.cwd.replace(/\\/g, '/')
+    }
+    // Without cygpath's answer, /c/x is still read as C:/x.
+    const got = (key: string) => mixed.get(key) ?? (state.isWindows ? found(key).replace(/^\/([A-Za-z])(?=\/|$)/, (_, d: string) => `${d.toUpperCase()}:`) : found(key))
     state.home = got('home') || ((await Promise.resolve().then(() => $.env.get('HOME')).catch(() => '')) ?? '')
-    state.isMac = got('os') !== 'Linux'
+    state.isMac = !state.isWindows && got('os') !== 'Linux'
     state.ffmpeg = got('ff') || (state.isMac ? '/opt/homebrew/bin/ffmpeg' : '/usr/bin/ffmpeg')
     state.ffprobe = got('fp') || (state.isMac ? '/opt/homebrew/bin/ffprobe' : '/usr/bin/ffprobe')
     state.claudePath = got('cl')
     // Else the last one there of: Playwright's Chromium builds, Chromium and
-    // Chrome in /Applications, then Playwright's headless shells (newest
+    // Chrome in /Applications; on Windows Chrome, then Edge, which every
+    // Windows 11 has; then Playwright's headless shells (newest
     // last). A headless shell is made for screenshots: Playwright's Chrome
     // for Testing 1234 never wrote one on macOS and hung. It opens no window,
     // so Open page uses the default browser. With none, the install notice
@@ -5249,6 +5352,8 @@ export function setUp($: EngineInterface): Promise<void> {
     state.isFarFromSpeakers = !!(sshConnection || sshTty) || kind === 'bg'
     const engine = await Promise.resolve().then(() => $.session.version()).catch(() => null)
     state.canColourButtons = !!engine && isAtLeast(engine.base ?? engine.version, '2.1.295')
+    const given = /^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)$/.exec(((await Promise.resolve().then(() => $.env.get('SHOW_YOUR_WORK_CELL')).catch(() => '')) ?? '').trim())
+    if (given) state.cellGiven = { width: Number(given[1]), height: Number(given[2]) }
     await Promise.resolve().then(() => measureCells($)).catch(() => undefined)
   })())
 }
@@ -5347,6 +5452,8 @@ export const register: Register = on => {
       state.isForced = /^(1|true|on|yes)$/i.test((await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) ?? '')
       // iTerm2 and the Herdr app draw pictures from bytes only, never from a file they're named.
       if (terminal === 'iterm2' || terminal === 'herdr_app') state.sendBytes = true
+      // A terminal not known here that draws from bytes only: SHOW_YOUR_WORK_SEND_BYTES=1.
+      if (/^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_SEND_BYTES')) ?? '')) state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
       state.isDebug = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_DEBUG')) ?? '')
       if (state.isDebug) $.clock.every(1000, () => void flushDebug($))
@@ -5369,7 +5476,7 @@ export const register: Register = on => {
         claude_code_version: (await $.session.version().catch(() => ({ base: '' }))).base ?? '',
         terminal,
         has_ffmpeg: await exists($, state.ffmpeg),
-        os: state.isMac ? 'macos' : 'linux',
+        os: state.isMac ? 'macos' : state.isWindows ? 'windows' : 'linux',
       }
       // Every install sees the welcome and tour once, an update included:
       // installs from before 0.6.2 never had one. 0.6.0 stored 'welcomed' both
@@ -5392,7 +5499,7 @@ export const register: Register = on => {
     })().catch(() => undefined)
     // Frames and converted pictures a week old go; a window that scrolls back
     // into view cuts its frames again from the source.
-    void $.process.run(['sh', '-c', CLEAN_SH, state.TMP]).then(() => trimFrames($))
+    void runTool($, ['sh', '-c', CLEAN_SH, state.TMP]).then(() => trimFrames($))
     await $.command.register({
       name: 'show-your-work',
       description: 'Settings for show-your-work; /show-your-work tour for the tour, /show-your-work update to check for updates, /show-your-work diagnose for recent problems',
@@ -5511,7 +5618,7 @@ export const register: Register = on => {
       shownById.set(id, shown)
       // Saved beside the history too, so the row still draws after a reload
       // wipes the module's memory.
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('img_command', { kind: shown.frames ? 'video' : 'image' })
       return { text: `Showing ${shown.title}.\n${MARK}#${id}` }
@@ -5531,7 +5638,7 @@ export const register: Register = on => {
       const shown = await prepare($, arg, `Page · ${arg.split('/').pop()}`)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('page_command', { kind: 'image' })
       return { text: `Previewing ${shown.title}. Open page opens it in your browser.\n${MARK}#${id}` }
@@ -5551,7 +5658,7 @@ export const register: Register = on => {
       const shown = await prepare($, arg)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('audio_command', { kind: shown.frames ? 'audio' : 'image' })
       return { text: `Showing ${shown.title}.${soundUsable() ? ' Press Play to hear it.' : ''}\n${MARK}#${id}` }
@@ -5571,7 +5678,7 @@ export const register: Register = on => {
       const shown = await prepareDocument($, arg, arg.split('/').pop()!)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('doc_command', { kind: 'document' })
       return { text: `Showing ${shown.title} (${shown.pages?.count ?? 1} page${(shown.pages?.count ?? 1) === 1 ? '' : 's'}).\n${MARK}#${id}` }
@@ -5686,7 +5793,7 @@ export const register: Register = on => {
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
-        const saved = await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${kept.id}.shown`, mark]).catch(() => null)
+        const saved = await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${kept.id}.shown`, mark]).catch(() => null)
         if (saved && saved.exitCode === 0) {
           shownById.set(kept.id, shown)
           mark = `#${kept.id}`
@@ -5694,7 +5801,7 @@ export const register: Register = on => {
       }
       return { result: `${opening}${hint}\n${MARK}${mark}` }
     } catch (err) {
-      if (copied) void $.process.run(['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
+      if (copied) void runTool($, ['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
       const n = noticeOf(err, expand(input.path ?? '', state.cwd, state.home), state.home)
       notices.set(e.tool_use_id, n)
       track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : String((e as { tool?: string }).tool ?? '').endsWith('document') ? 'show_document' : 'show_image', reason: REASONS[n.kind] })

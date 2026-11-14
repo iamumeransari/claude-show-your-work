@@ -8,7 +8,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { event } from './diagnostics'
-import { state } from './state'
+import { runTool, state } from './state'
 
 export const FORCE = 'CLAUDE_CODE_FORCE_TERMINAL_IMAGES'
 
@@ -56,7 +56,7 @@ export const outerOf = (termtype: string) => (/^(warp|wezterm|konsole)\b/i.exec(
 export async function forwardPictures($: EngineInterface): Promise<boolean> {
   const pane = (await $.env.get('TMUX_PANE')) ?? ''
   if (!pane) return false
-  const tmux = (args: string[]) => Promise.resolve().then(() => $.process.run(['tmux', ...args])).catch(() => null)
+  const tmux = (args: string[]) => Promise.resolve().then(() => runTool($, ['tmux', ...args])).catch(() => null)
   const facts = await tmux(['display', '-p', '-t', pane, '#{pane_tty}\t#{pane_pipe}\t#{client_termtype}'])
   const [tty, piped, outer] = (facts?.exitCode === 0 ? facts.stdout.trim() : '').split('\t')
   event('tmux', { tty, piped, outer })
@@ -87,5 +87,5 @@ export async function stopForwarding($: EngineInterface) {
   if (!forwarding) return
   const pane = forwarding
   forwarding = ''
-  await Promise.resolve().then(() => $.process.run(['tmux', 'pipe-pane', '-t', pane])).catch(() => undefined)
+  await Promise.resolve().then(() => runTool($, ['tmux', 'pipe-pane', '-t', pane])).catch(() => undefined)
 }

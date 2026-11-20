@@ -72,6 +72,10 @@ export const state = {
   terminalName: '',
   // CLAUDE_CODE_FORCE_TERMINAL_IMAGES was set when Claude Code started.
   isForced: false,
+  // SHOW_YOUR_WORK_PLACEHOLDERS=1 with pictures forced on: the person says
+  // their Warp, WezTerm or Konsole build paints placeholders (#29), so it
+  // isn't ruled out by name.
+  trustsPlaceholders: false,
   // Inside tmux, the terminal around it (`ghostty`, `kitty`, `rex`, or '').
   outerTerminal: '',
   // Usage stats: whether they're on, and the events waiting to go out.

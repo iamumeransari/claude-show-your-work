@@ -110,6 +110,7 @@ export const register: Register = on => {
       const terminal = terminalOf({ program, term, kitty: !!(await $.env.get('KITTY_WINDOW_ID')), konsole: !!(await $.env.get('KONSOLE_VERSION')), lcTerminal: (await $.env.get('LC_TERMINAL')) ?? '', herdrApp })
       state.terminalName = terminal
       state.isForced = /^(1|true|on|yes)$/i.test((await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES')) ?? '')
+      state.trustsPlaceholders = state.isForced && /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_PLACEHOLDERS')) ?? '')
       // iTerm2 and the Herdr app draw pictures from bytes only, never from a file they're named.
       if (terminal === 'iterm2' || terminal === 'herdr_app') state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
@@ -124,10 +125,11 @@ export const register: Register = on => {
       const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
       // Rex and the Herdr app draw nothing until Claude Code starts with FORCE.
       const isOff = !state.inTmux && !!UNRECOGNISED[state.terminalName] && !state.isForced
-      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff) {
+      const isRuledOut = !!NO_PLACEHOLDERS[state.terminalName] && !state.trustsPlaceholders
+      if (isDesktop || (state.inTmux && !isForwarded) || isRuledOut || isOff) {
         state.canImage = false
         state.probed = true
-        state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)
+        state.drawCause = isDesktop ? 'desktop' : isRuledOut ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)
       }
       state.statsContext = {
         plugin_version: state.pluginVersion,

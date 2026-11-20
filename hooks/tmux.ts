@@ -61,7 +61,7 @@ export async function forwardPictures($: EngineInterface): Promise<boolean> {
   const [tty, piped, outer] = (facts?.exitCode === 0 ? facts.stdout.trim() : '').split('\t')
   event('tmux', { tty, piped, outer })
   state.outerTerminal = (/^(ghostty|kitty|rex)\b/i.exec(outer ?? '')?.[1] ?? '').toLowerCase()
-  if (outerOf(outer ?? '')) {
+  if (outerOf(outer ?? '') && !state.trustsPlaceholders) {
     state.terminalName = outerOf(outer ?? '')
     return false
   }

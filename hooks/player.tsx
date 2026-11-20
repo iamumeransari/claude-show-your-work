@@ -517,19 +517,19 @@ export function draw($: EngineInterface, site: string, media: Shown, shown?: Sho
   if (one.isSplit && shown?.pair) {
     const at = Math.min(one.frame, shown.pair.count - 1), pair = shown.pair
     const ticket = ++tickets
-    void pairReady($, shown, at, site, !!one.timer).then(() => { if (still()) blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket) }).catch(() => undefined)
+    void pairReady($, shown, at, site, !!one.timer).then(() => (still() ? blit($, site, 'view-pair', shown, frameFile(pair, at), at, ticket) : undefined)).catch(() => undefined)
     return
   }
   if (one.isSplit && shown?.compare) {
     const at = compareFrame(shown, one.frame), compare = shown.compare, frame = one.frame
     const ticket = ++tickets
-    void frameReady($, compare, at, site, true, !!one.timer).then(() => { if (still()) blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket) }).catch(() => undefined)
-    void frameReady($, shown, frame, site, true, !!one.timer).then(() => { if (still()) blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket) }).catch(() => undefined)
+    void frameReady($, compare, at, site, true, !!one.timer).then(() => (still() ? blit($, site, 'view-a', compare, plainAt(compare, at), at, ticket) : undefined)).catch(() => undefined)
+    void frameReady($, shown, frame, site, true, !!one.timer).then(() => (still() ? blit($, site, 'view-b', shown, plainAt(shown, frame), frame, ticket) : undefined)).catch(() => undefined)
     return
   }
   const frame = one.frame
   const ticket = ++tickets
-  void frameReady($, media, frame, site, true, !!one.timer).then(() => { if (still()) blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket) }).catch(() => undefined)
+  void frameReady($, media, frame, site, true, !!one.timer).then(() => (still() ? blit($, site, viewKey(site), media, plainAt(media, frame), frame, ticket) : undefined)).catch(() => undefined)
 }
 
 // A side's checks in words: "4 checks fail" or "all 11 checks pass".

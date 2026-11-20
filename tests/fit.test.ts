@@ -38,6 +38,13 @@ test('typed and dragged-in paths resolve', () => {
   expect(expand('img/a.png', '/w/', '/Users/u')).toBe('/w/img/a.png')
 })
 
+test('Windows paths stay whole, in the mixed form C:/x', () => {
+  expect(expand('C:\\Users\\u\\My Clips\\a.wav', 'C:\\w', 'C:/Users/u')).toBe('C:/Users/u/My Clips/a.wav')
+  expect(expand('"D:/output/a b.mp4"', 'C:/w', 'C:/Users/u')).toBe('D:/output/a b.mp4')
+  expect(expand('\\\\nas\\share\\a.png', 'C:/w', 'C:/Users/u')).toBe('//nas/share/a.png')
+  expect(expand('img/a.png', 'C:\\w\\', 'C:/Users/u')).toBe('C:/w/img/a.png')
+})
+
 test('long clips are sampled slower so they stay under 3600 frames', () => {
   expect(sampleRate(10)).toBe(12)
   // Five minutes still plays at the full rate.

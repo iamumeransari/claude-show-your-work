@@ -4,7 +4,7 @@ import type { EngineInterface, Timer } from 'claude-code'
 
 import type { Check, KeyChange, Shown, Summary } from '../types'
 
-import { settings, state } from './state'
+import { runTool, settings, state } from './state'
 import { clock, drawBox, layoutOf, oneLine, pagesOf, pixelsFor, PX_MAX, remeasure, SIDE, SIDEBAR, sizeFor, sizeStep, tabLabel, targetBox, wrapWords } from './layout'
 import { debug, event, isWiderThanBox, problem } from './diagnostics'
 import { act, track } from './telemetry'
@@ -94,7 +94,10 @@ export const OPEN_SH = [
   'done',
   'exit 0',
 ].join('\n')
-const openArgv = (target: string) => (state.isMac ? ['open', target] : ['sh', '-c', OPEN_SH, 'sh', 'xdg-open', target])
+// Windows: the shell's file handler opens it with the default app. Not cmd's
+// start: cmd parses the line again, so a name with & in it would run a command.
+const openArgv = (target: string) =>
+  state.isMac ? ['open', target] : state.isWindows ? ['rundll32', 'url.dll,FileProtocolHandler', target.replace(/\//g, '\\')] : ['sh', '-c', OPEN_SH, 'sh', 'xdg-open', target]
 
 // What went wrong opening something, in words: from xdg-open's exit codes
 // (2 no such file, 3 no app or tool for it, 4 the app failed) and from macOS
@@ -213,8 +216,8 @@ const SOUND_CLEAN_MS = 8000
 async function widenStill($: EngineInterface, source: string, width: number): Promise<Shown | null> {
   const out = `${state.TMP}/w-${keyOf(source)}-${width}.png`
   const made = state.isMac
-    ? await $.process.run(['sips', '-s', 'format', 'png', '--resampleWidth', String(width), source, '--out', out]).catch(() => null)
-    : await $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', source, '-frames:v', '1', '-vf', `scale=${width}:-2:flags=lanczos`, out]).catch(() => null)
+    ? await runTool($, ['sips', '-s', 'format', 'png', '--resampleWidth', String(width), source, '--out', out]).catch(() => null)
+    : await runTool($, [state.ffmpeg, '-v', 'error', '-y', '-i', source, '-frames:v', '1', '-vf', `scale=${width}:-2:flags=lanczos`, out]).catch(() => null)
   if (!made || made.exitCode !== 0) return null
   state.generation += 1
   return { kind: 'image', path: out, source, ...(await pngSize($, out)), title: '', generation: state.generation }
@@ -314,7 +317,7 @@ async function readBytes($: EngineInterface, file: string, version: string): Pro
   }
   let small = fitted.get(version)
   if (!small) {
-    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(version)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${keyOf(version)}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     small = r?.exitCode === 0 ? r.stdout.trim() : ''
     if (!small) return null
     fitted.set(version, small)
@@ -348,12 +351,12 @@ async function readableFile($: EngineInterface, file: string): Promise<string> {
 }
 async function readableCopy($: EngineInterface, file: string, size: number, id: string): Promise<string> {
   if (size > BYTES_MAX) {
-    const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
+    const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', SHRINK_SH, file, `${state.TMP}/b-${id}.png`, state.ffmpeg, String(BYTES_MAX)])).catch(() => null)
     return (r?.exitCode === 0 && r.stdout.trim()) || file
   }
   const copy = `${state.TMP}/o-${id}.png`
   // `cp -c` keeps the original's time; the temp folder's cleanup goes by it.
-  const r = await Promise.resolve().then(() => $.process.run(['sh', '-c', '{ cp -c "$0" "$1" 2>/dev/null || cp --reflink=auto "$0" "$1" 2>/dev/null || cp "$0" "$1"; } && touch "$1"', file, copy])).catch(() => null)
+  const r = await Promise.resolve().then(() => runTool($, ['sh', '-c', '{ cp -c "$0" "$1" 2>/dev/null || cp --reflink=auto "$0" "$1" 2>/dev/null || cp "$0" "$1"; } && touch "$1"', file, copy])).catch(() => null)
   return r?.exitCode === 0 ? copy : file
 }
 export async function pngSource($: EngineInterface, file: string): Promise<Source> {
@@ -1248,11 +1251,11 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
     const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, '']
     let out = `${state.home}/Downloads/${name}`
     for (let n = 2; await $.fs.stat(out).then(() => true, () => false); n++) out = `${state.home}/Downloads/${stem} ${n}${ext}`
-    if (!state.isMac) await $.process.run(['mkdir', '-p', `${state.home}/Downloads`])
-    const r = await $.process.run(['cp', source, out])
+    if (!state.isMac) await runTool($, ['mkdir', '-p', `${state.home}/Downloads`])
+    const r = await runTool($, ['cp', source, out])
     if (r.exitCode !== 0) return $.ui.toast(`Couldn't save it to Downloads: ${r.stderr.trim().split('\n')[0]?.slice(0, 100) || `error ${r.exitCode}`}`)
     // Saved either way; the folder opening is a convenience on top.
-    await $.process.run(state.isMac ? ['open', '-R', out] : openArgv(`${state.home}/Downloads`)).catch(() => undefined)
+    await runTool($, state.isMac ? ['open', '-R', out] : openArgv(`${state.home}/Downloads`)).catch(() => undefined)
     $.ui.toast(`Saved to Downloads/${out.split('/').pop()}`)
   }
 
@@ -1261,7 +1264,7 @@ function Actions(ui: Ui, $: EngineInterface, media: Shown, source: string, isNar
       {!source.startsWith(`${state.home}/Downloads/`) ? (
         <Button key="keep" plain dimColor label="Save to Downloads" onPress={() => { act('save'); void keep() }} />
       ) : (
-        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void $.process.run(state.isMac ? ['open', '-R', source] : openArgv(source.slice(0, source.lastIndexOf('/')) || '/')).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder', 'folders', source))} />
+        <Button key="reveal" plain dimColor label={state.isMac ? 'Show in Finder' : 'Show in folder'} onPress={() => act('reveal') || void runTool($, state.isMac ? ['open', '-R', source] : openArgv(source.slice(0, source.lastIndexOf('/')) || '/')).then(r => done(r, state.isMac ? 'Shown in Finder' : 'Opened the folder', 'folders', source))} />
       )}
       {!isNarrow && (
         <Button
@@ -1485,7 +1488,7 @@ function Warning(ui: Ui, $: EngineInterface, site: string, shown: Shown, width: 
   const n = cantDraw(state.drawCause, shown.title, shown.frames ? 'video' : 'picture', state.sessionId)
   const file = shown.origin ?? shown.source ?? shown.path
   const onPress = state.drawCause === 'desktop'
-    ? () => act(n.action) || void $.process.run(openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
+    ? () => act(n.action) || void runTool($, openArgv(file)).then(r => { if (r.exitCode !== 0) $.ui.toast(openFailure(r, shown.frames ? 'videos' : 'pictures', file)) })
     : state.drawCause === 'unrecognised'
       ? (press: { surface: 'terminal' }) => act(n.action) || void (async () => {
         const profile = await turnOnPictures($)
@@ -1636,7 +1639,7 @@ export async function Viewer(
       : <Text color="suggestion">{prLabel}</Text>
     : null
   const run = (argv: string[], note: string) => () => {
-    void $.process.run(argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
+    void runTool($, argv).then(r => $.ui.toast(r.exitCode === 0 ? note : `Could not: ${r.stderr.trim()}`))
   }
   // The single view with the QA sidebar is the default; side by side is a click away.
   if (!state.canImage) {
@@ -1715,7 +1718,7 @@ export async function Viewer(
         const argv = artifact
           ? ['sh', '-c', OPEN_SH, 'sh', ...htmlOpenArgv(state.chrome, target!)]
           : openArgv(target ?? source)
-        void $.process.run(argv).then(r =>
+        void runTool($, argv).then(r =>
           $.ui.toast(r.exitCode === 0 ? `Opened ${(target ?? source.split('/').pop()!).slice(0, 60)}` : openFailure(r, target ? 'web pages' : media.kind === 'video' ? 'videos' : media.kind === 'audio' ? 'audio files' : 'pictures', target ?? source)),
         )
       }}

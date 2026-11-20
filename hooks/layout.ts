@@ -3,7 +3,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { event } from './diagnostics'
-import { settings, state } from './state'
+import { runTool, settings, state } from './state'
 
 // The window's fill: a step lighter than a dark terminal, so it reads as one panel.
 const PANEL = '#2c2e35'
@@ -57,6 +57,9 @@ export const sizeStep = () => (settings.standard_size ? 1 : SIZE_STEP)
 // frame is cut at. 1600 px takes about a second to land there and the clip
 // blinks black between frames. 960 is still sharp in the box and arrives in time.
 export const unmeasuredWidth = () => (state.terminalName === 'herdr_app' ? 960 : 1600)
+// Windows has no tty to measure a cell from either: video frames are cut at
+// 640 px there (stills keep 1600), unless SHOW_YOUR_WORK_CELL gives a cell.
+const unmeasuredFrame = () => (state.isWindows && state.terminalName !== 'herdr_app' ? 640 : unmeasuredWidth())
 export const pixelsFor = (box: { columns: number; rows?: number }, px: Cell | null, aspect = 0) =>
   px ? Math.max(PX_MIN, Math.min(Math.round(PX_MAX * sizeStep()), Math.ceil(Math.max(box.columns * px.width, (box.rows ?? 0) * px.height * aspect) / 2) * 2)) : unmeasuredWidth()
 
@@ -84,9 +87,9 @@ export function fit(width: number, height: number, maxCols: number, maxRows: num
 
 // The width a picture or clip is made at when it's prepared: what an inline
 // player in this terminal needs (see layoutOf). 1600 px at most while
-// unmeasured, 960 in the Herdr app (see unmeasuredWidth).
+// unmeasured, 960 in the Herdr app, 640 on Windows (see unmeasuredFrame).
 export function frameWidth(width: number, height: number, term: { columns: number; rows: number } | null, px: Cell | null) {
-  if (!term || !px || !width || !height) return Math.min(unmeasuredWidth(), width)
+  if (!term || !px || !width || !height) return Math.min(unmeasuredFrame(), width)
   const layout = layoutOf({ columns: term.columns, rows: term.rows, isPane: false, hasReport: false })
   return pixelsFor(targetBox(width, height, layout, px), px, width / height)
 }
@@ -117,8 +120,8 @@ export function cellOf(stdout: string, scale = 1): Cell | null {
 const SCALE_SH = `osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSScreen.mainScreen.backingScaleFactor'`
 export async function measureCells($: EngineInterface) {
   const [r, s] = await Promise.all([
-    $.process.run(['sh', '-c', CELL_SH]).catch(() => null),
-    state.isMac ? $.process.run(['sh', '-c', SCALE_SH]).catch(() => null) : null,
+    runTool($, ['sh', '-c', CELL_SH]).catch(() => null),
+    state.isMac ? runTool($, ['sh', '-c', SCALE_SH]).catch(() => null) : null,
   ])
   // A measure Claude Code cancelled (a newer draw replaced the one that asked,
   // as happens many times while a window edge is dragged) says nothing about
@@ -126,7 +129,7 @@ export async function measureCells($: EngineInterface) {
   // cells, a picture of the wrong shape until the next resize.
   if (!r) return void event('measure', { state: 'cancelled', kept: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })
   const scale = Number(s?.stdout.trim()) || 1
-  state.cell = r.exitCode === 0 ? cellOf(r.stdout, scale) : null
+  state.cell = (r.exitCode === 0 ? cellOf(r.stdout, scale) : null) ?? state.cellGiven
   const [rows, columns] = (r.exitCode === 0 ? r.stdout : '').trim().split(/\s+/).map(Number)
   state.termSize = rows && columns ? { columns, rows } : null
   event('measure', { state: 'measured', tty: r.stdout.trim(), scale, cell: state.cell && `${state.cell.width.toFixed(2)}x${state.cell.height.toFixed(2)}` })

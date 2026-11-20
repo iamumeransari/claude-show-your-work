@@ -30,6 +30,12 @@ test('the render command asks Chrome for a fixed-window picture of the page', ()
   expect(tricky).toBe('file:///tmp/50%25%20off%20%231%3F.html')
 })
 
+test('a Windows drive path becomes a file URL with three slashes, the drive letter kept', () => {
+  expect(htmlArgv('C:/Program Files/Microsoft/Edge/Application/msedge.exe', 'C:/Users/a b/report.html', 'C:/tmp/out.png').at(-1)).toBe('file:///C:/Users/a%20b/report.html')
+  expect(htmlOpenArgv('msedge', 'D:/pages/x.html')).toContain('--app=file:///D:/pages/x.html')
+  expect(htmlArgv('msedge', 'C:\\Users\\a b\\x.html', 'C:/tmp/out.png').at(-1)).toBe('file:///C:/Users/a%20b/x.html')
+})
+
 test('a page renders to a PNG, and a Chrome that fails says so', async () => {
   state.chrome = '/usr/bin/google-chrome'
   const runs: string[][] = []

@@ -14,7 +14,7 @@ import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult
 
 import type { Frames } from '../types'
 
-import { state } from './state'
+import { runTool, state } from './state'
 import { event, problem } from './diagnostics'
 import { identityOf, isGone, keyOf } from './media'
 
@@ -53,7 +53,7 @@ const LATENCY_JS = "ObjC.import('AVFoundation');$.AVAudioEngine.alloc.init.outpu
 export function measureLatency($: EngineInterface) {
   if (!state.isMac || Date.now() - latencyAskedAt < 5000) return
   latencyAskedAt = Date.now()
-  void $.process.run(['osascript', '-l', 'JavaScript', '-e', LATENCY_JS], { timeoutMs: 8000 }).then(r => {
+  void runTool($, ['osascript', '-l', 'JavaScript', '-e', LATENCY_JS], { timeoutMs: 8000 }).then(r => {
     const s = Number(r.stdout.trim())
     if (r.exitCode !== 0 || !Number.isFinite(s) || s < 0 || s > 1) return
     if (Math.abs(s - outputLatency) > 0.001) event('sound', { action: 'latency', ms: Math.round(s * 1000) })
@@ -108,7 +108,7 @@ export function probeSound($: EngineInterface, source: string | undefined, f: Fr
   if (!job) {
     job = (async () => {
       try {
-        const probed = await $.process.run([state.ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', source], { timeoutMs: 15000 })
+        const probed = await runTool($, [state.ffprobe, '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', source], { timeoutMs: 15000 })
         if (probed.exitCode !== 0) return undefined
         const found: Track = probed.stdout.split('\n').some(l => l.trim() === 'audio') ? { status: 'has' } : { status: 'none' }
         if (!tracks.has(key)) tracks.set(key, found)
@@ -153,13 +153,13 @@ async function cutSound($: EngineInterface, source: string, f: Frames): Promise<
   const name = `${state.TMP}/sound-${keyOf(`${id}|${f.lead ?? 0}|${f.duration}`)}`
   // Cut to a side name, then moved: a cut that dies midway never leaves a
   // short file that plays as if it were whole.
-  const cut = await $.process.run(soundExtractArgv(state.ffmpeg, source, `${name}.part`, f.lead ?? 0, f.duration), { timeoutMs: 120000 })
+  const cut = await runTool($, soundExtractArgv(state.ffmpeg, source, `${name}.part`, f.lead ?? 0, f.duration), { timeoutMs: 120000 })
   if (cut.exitCode !== 0) {
     // Not tried again this session: the clip plays silent, as before.
     problem('sound_cut_failed', { error: cut.stderr.trim().slice(0, 120) })
     return { status: 'none' }
   }
-  const moved = await $.process.run(['mv', '-f', `${name}.part`, `${name}.wav`])
+  const moved = await runTool($, ['mv', '-f', `${name}.part`, `${name}.wav`])
   if (moved.exitCode !== 0) return { status: 'none' }
   const st = await $.fs.stat(`${name}.wav`).catch(() => null)
   const seconds = st ? wavSeconds(st.size) : 0

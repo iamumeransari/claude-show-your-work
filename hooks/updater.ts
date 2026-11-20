@@ -3,7 +3,7 @@
 // Claude Code plugin directory, which keeps it up to date instead.
 import type { EngineInterface } from 'claude-code'
 
-import { state } from './state'
+import { runTool, state } from './state'
 import { isInstalledCopy, track } from './telemetry'
 
 // Keeps the plugin current without the user turning on marketplace
@@ -52,7 +52,7 @@ async function claude($: EngineInterface, args: string[]) {
   const known = CLAUDE_BINARIES.map(b => (b.startsWith('.') ? `${state.home}/${b}` : b))
   const candidates = [...new Set([claudeBinary, state.claudePath, ...known].filter(Boolean))]
   for (const bin of candidates) {
-    const r = await $.process.run([bin, ...args], { timeoutMs: 120_000 }).catch(() => undefined)
+    const r = await runTool($, [bin, ...args], { timeoutMs: 120_000 }).catch(() => undefined)
     if (r) {
       claudeBinary = bin
       return r
@@ -176,6 +176,6 @@ async function moveTo($: EngineInterface, branch: Branch, market: { url?: string
   const url = market.url ?? SOURCE
   const old = market.ref ? `${url}#${market.ref}` : url
   track('channel_move', { from: market.ref ?? 'main', to: branch })
-  const r = await $.process.run([...DETACH, 'sh', '-c', MOVE_SH, 'move', claudeBinary, url, branch, old, installed.scope ?? 'user', MARKETPLACE, `${PLUGIN}@${MARKETPLACE}`]).catch(() => undefined)
+  const r = await runTool($, [...DETACH, 'sh', '-c', MOVE_SH, 'move', claudeBinary, url, branch, old, installed.scope ?? 'user', MARKETPLACE, `${PLUGIN}@${MARKETPLACE}`]).catch(() => undefined)
   return r?.exitCode === 0
 }

@@ -5,7 +5,7 @@ import type { Register } from 'claude-code'
 
 import type { Check, KeyChange, Overlay, Shown, Summary } from '../types'
 
-import { state } from './state'
+import { runTool, state } from './state'
 import { clock, paneSize } from './layout'
 import type { PaneProps } from './layout'
 import { debug, diagnosis, flushDebug } from './diagnostics'
@@ -113,6 +113,8 @@ export const register: Register = on => {
       state.trustsPlaceholders = state.isForced && /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_PLACEHOLDERS')) ?? '')
       // iTerm2 and the Herdr app draw pictures from bytes only, never from a file they're named.
       if (terminal === 'iterm2' || terminal === 'herdr_app') state.sendBytes = true
+      // A terminal not known here that draws from bytes only: SHOW_YOUR_WORK_SEND_BYTES=1.
+      if (/^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_SEND_BYTES')) ?? '')) state.sendBytes = true
       state.inTmux = !!(await $.env.get('TMUX')) || /^tmux/i.test(term)
       state.isDebug = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_DEBUG')) ?? '')
       if (state.isDebug) $.clock.every(1000, () => void flushDebug($))
@@ -136,7 +138,7 @@ export const register: Register = on => {
         claude_code_version: (await $.session.version().catch(() => ({ base: '' }))).base ?? '',
         terminal,
         has_ffmpeg: await exists($, state.ffmpeg),
-        os: state.isMac ? 'macos' : 'linux',
+        os: state.isMac ? 'macos' : state.isWindows ? 'windows' : 'linux',
       }
       // Every install sees the welcome and tour once, an update included:
       // installs from before 0.6.2 never had one. 0.6.0 stored 'welcomed' both
@@ -159,7 +161,7 @@ export const register: Register = on => {
     })().catch(() => undefined)
     // Frames and converted pictures a week old go; a window that scrolls back
     // into view cuts its frames again from the source.
-    void $.process.run(['sh', '-c', CLEAN_SH, state.TMP]).then(() => trimFrames($))
+    void runTool($, ['sh', '-c', CLEAN_SH, state.TMP]).then(() => trimFrames($))
     await $.command.register({
       name: 'show-your-work',
       description: 'Settings for show-your-work; /show-your-work tour for the tour, /show-your-work update to check for updates, /show-your-work diagnose for recent problems',
@@ -278,7 +280,7 @@ export const register: Register = on => {
       shownById.set(id, shown)
       // Saved beside the history too, so the row still draws after a reload
       // wipes the module's memory.
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('img_command', { kind: shown.frames ? 'video' : 'image' })
       return { text: `Showing ${shown.title}.\n${MARK}#${id}` }
@@ -298,7 +300,7 @@ export const register: Register = on => {
       const shown = await prepare($, arg, `Page · ${arg.split('/').pop()}`)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('page_command', { kind: 'image' })
       return { text: `Previewing ${shown.title}. Open page opens it in your browser.\n${MARK}#${id}` }
@@ -318,7 +320,7 @@ export const register: Register = on => {
       const shown = await prepare($, arg)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('audio_command', { kind: shown.frames ? 'audio' : 'image' })
       return { text: `Showing ${shown.title}.${soundUsable() ? ' Press Play to hear it.' : ''}\n${MARK}#${id}` }
@@ -338,7 +340,7 @@ export const register: Register = on => {
       const shown = await prepareDocument($, arg, arg.split('/').pop()!)
       const id = keyOf(`${arg}|${await $.clock.now()}`).slice(0, 10)
       shownById.set(id, shown)
-      await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
+      await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${id}.shown`, JSON.stringify(shown)]).catch(() => undefined)
 
       track('doc_command', { kind: 'document' })
       return { text: `Showing ${shown.title} (${shown.pages?.count ?? 1} page${(shown.pages?.count ?? 1) === 1 ? '' : 's'}).\n${MARK}#${id}` }
@@ -453,7 +455,7 @@ export const register: Register = on => {
       // Claude gets one short line; the drawing data stays out of its context.
       let mark = JSON.stringify(shown)
       if (kept.id) {
-        const saved = await $.process.run(['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${kept.id}.shown`, mark]).catch(() => null)
+        const saved = await runTool($, ['sh', '-c', 'printf "%s" "$1" > "$0"', `${await storeOf($)}/${kept.id}.shown`, mark]).catch(() => null)
         if (saved && saved.exitCode === 0) {
           shownById.set(kept.id, shown)
           mark = `#${kept.id}`
@@ -461,7 +463,7 @@ export const register: Register = on => {
       }
       return { result: `${opening}${hint}\n${MARK}${mark}` }
     } catch (err) {
-      if (copied) void $.process.run(['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
+      if (copied) void runTool($, ['rm', '-f', '--', copied, copied.replace(/\.[^./]+$/, '.json')]).catch(() => undefined)
       const n = noticeOf(err, expand(input.path ?? '', state.cwd, state.home), state.home)
       notices.set(e.tool_use_id, n)
       track('show_failed', { from: String((e as { tool?: string }).tool ?? '').endsWith('video') ? 'show_video' : String((e as { tool?: string }).tool ?? '').endsWith('audio') ? 'show_audio' : String((e as { tool?: string }).tool ?? '').endsWith('document') ? 'show_document' : 'show_image', reason: REASONS[n.kind] })

@@ -4,8 +4,8 @@ import type { EngineInterface } from 'claude-code'
 
 import type { KeyChange, Shown } from '../types'
 
-import { state } from './state'
-import { expand, keyOf, prepare, VIDEO } from './media'
+import { runTool, state } from './state'
+import { expand, keyOf, prepare, slashed, VIDEO } from './media'
 import { isDocument, prepareDocument } from './document'
 
 export const MARK = 'show-your-work:'
@@ -85,7 +85,7 @@ export async function storeOf($: EngineInterface): Promise<string> {
   for (const dir of [`${state.cwd || state.home}/.show-your-work`, `${state.TMP}/store`]) {
     // Never through a link (a repo could commit `.show-your-work -> ..`), and
     // only a folder this user owns.
-    const r = await $.process.run(['sh', '-c', '[ -L "$0" ] && exit 1; mkdir -p "$0" && [ ! -L "$0" ] && [ -O "$0" ] && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir]).catch(() => null)
+    const r = await runTool($, ['sh', '-c', '[ -L "$0" ] && exit 1; mkdir -p "$0" && [ ! -L "$0" ] && [ -O "$0" ] && { [ -f "$0/.gitignore" ] || printf "*\\n" > "$0/.gitignore"; }', dir]).catch(() => null)
     if (r && r.exitCode === 0) {
       const dirs = ((await $.store.get(HISTORY_DIRS)) as string[] | undefined) ?? []
       if (!dirs.includes(dir)) await $.store.set(HISTORY_DIRS, [dir, ...dirs].slice(0, 200))
@@ -96,7 +96,7 @@ export async function storeOf($: EngineInterface): Promise<string> {
 }
 async function readVersion($: EngineInterface, dir: string, id: string): Promise<Version | null> {
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
-  const r = await $.process.run(['cat', `${dir}/${id}.json`]).catch(() => null)
+  const r = await runTool($, ['cat', `${dir}/${id}.json`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   // A record's id and extension become paths that are later deleted: only
   // the plugin's own shapes pass.
@@ -107,13 +107,13 @@ async function readVersion($: EngineInterface, dir: string, id: string): Promise
 }
 export async function storeVersion($: EngineInterface, raw: string, note: string, title: string | undefined, parent: string | undefined):
   Promise<{ real: string; copy: string; id: string; chain: { path: string; note?: string; id: string }[]; missing?: string }> {
-  const real = (await $.fs.stat(expand(raw, state.cwd, state.home), { resolve: true })).realPath ?? expand(raw, state.cwd, state.home)
+  const real = slashed((await $.fs.stat(expand(raw, state.cwd, state.home), { resolve: true })).realPath ?? expand(raw, state.cwd, state.home))
   const dir = await storeOf($)
   const ext = real.match(/\.[^./]+$/)?.[0] ?? ''
   state.generation += 1
   const id = keyOf(`${real}|${await $.clock.now()}|${state.generation}`).slice(0, 6)
   const meta: Version = { id, ...(parent ? { parent } : {}), note, ext, title, origin: real }
-  const r = await $.process.run(['sh', '-c',
+  const r = await runTool($, ['sh', '-c',
     '[ ! -L "$0" ] && [ -O "$0" ] || exit 1\n' +
     'cp -c "$1" "$0/$2$3" 2>/dev/null || cp --reflink=auto "$1" "$0/$2$3" 2>/dev/null || cp "$1" "$0/$2$3" || exit 1\n' +
     'printf "%s" "$4" > "$0/$2.json"\n' +
@@ -128,7 +128,7 @@ export async function storeVersion($: EngineInterface, raw: string, note: string
   if (r.exitCode !== 0) return { real, copy: real, id, chain: [] }
   // Then the cap across every project's history.
   const dirs = ((await $.store.get(HISTORY_DIRS)) as string[] | undefined) ?? [dir]
-  void $.process.run(['sh', '-c', HISTORY_TRIM_SH, 'trim', String(HISTORY_CAP_KB), `${dir}/${id}.json`, ...dirs]).catch(() => undefined)
+  void runTool($, ['sh', '-c', HISTORY_TRIM_SH, 'trim', String(HISTORY_CAP_KB), `${dir}/${id}.json`, ...dirs]).catch(() => undefined)
   // Follow the links back, oldest first.
   const chain: { path: string; note?: string; id: string }[] = []
   let at = parent, missing: string | undefined
@@ -142,7 +142,7 @@ export async function storeVersion($: EngineInterface, raw: string, note: string
   // Updated, no deeper history, so re-recordings don't pile up.
   if (VIDEO.test(real) && chain.length > 1) {
     const older = chain.slice(0, -1)
-    void $.process.run(['rm', '-f', ...older.map(v => v.path)]).catch(() => undefined)
+    void runTool($, ['rm', '-f', ...older.map(v => v.path)]).catch(() => undefined)
     chain.splice(0, chain.length - 1)
   }
   return { real, copy: `${dir}/${id}${ext}`, id, chain, missing }
@@ -170,7 +170,7 @@ export async function shownOf($: EngineInterface, output: unknown): Promise<Show
   if (!/^[0-9a-f]{4,12}$/.test(id)) return null
   const known = shownById.get(id)
   if (known) return known
-  const r = await $.process.run(['cat', `${await storeOf($)}/${id}.shown`]).catch(() => null)
+  const r = await runTool($, ['cat', `${await storeOf($)}/${id}.shown`]).catch(() => null)
   if (!r || r.exitCode !== 0) return null
   try {
     const shown = JSON.parse(r.stdout) as Shown

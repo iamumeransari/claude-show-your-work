@@ -107,10 +107,23 @@ test('the page is readable on screen and unchanged in print', () => {
   const page = documentHtml('# Test', 'Title', '/tmp/dir/', '/plugin/assets/vendor/mermaid.min.js')
   // Screen (the app window): a centered column with room at the edges, and
   // headings that read as headings.
-  expect(page).toContain('margin:0 auto;padding:28px 36px 40px;max-width:820px')
-  expect(page).toContain('h1{font-size:1.9em')
+  expect(page).toContain('margin:0 auto;padding:56px 72px 64px;max-width:860px')
+  expect(page).toContain('h1{font-size:3em')
+  // Set in Nunito, shipped with the plugin so pages render offline.
+  expect(page).toContain('src:url("file:///plugin/assets/vendor/nunito-latin.woff2")')
+  expect(page).toContain('font:16px/1.7 Nunito,')
   // Print (the card): the screen box steps aside for the page margins.
   expect(page).toContain('@media print{body{padding:0;max-width:none;margin:0}}')
+})
+
+test('images show: inline, by reference and embedded, and no other scheme', () => {
+  const png = 'data:image/png;base64,iVBORw0KGgo='
+  const html = markdownBody(`![Home](shots/home.jpg)\n\n![](<https://x.dev/a.png> "t")\n\n![][image5]\n\n![bad](javascript:alert)\n\n[image5]: <${png}>`)
+  expect(html).toContain('<img src="shots/home.jpg" alt="Home">')
+  expect(html).toContain('<img src="https://x.dev/a.png" alt="">')
+  expect(html).toContain(`<img src="${png}" alt="">`)
+  expect(html).not.toContain('javascript')
+  expect(html).not.toContain('[image5]')
 })
 
 test('pdfinfo reports pages, and the print run returns the page it printed', () => {

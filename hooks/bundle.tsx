@@ -1665,7 +1665,7 @@ export const isPrinted = (path: string) => /\.(md|markdown|mmd|mermaid)$/i.test(
 export const PAGE_WIDTH = 1100
 export const DOC_TIMEOUT_MS = 30000
 export const POPPLER_TIMEOUT_MS = 60000
-export const MD_MAX_BYTES = 1_048_576
+export const MD_MAX_BYTES = 33_554_432
 export const DOC_MAX_PAGES = 100
 
 // ── Markdown to HTML, escaped first ───────────────────────────────────────
@@ -1673,9 +1673,20 @@ export const DOC_MAX_PAGES = 100
 const escapeText = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
-const inline = (raw: string) => {
+// An image's source is an embedded picture, a web address or a file beside the
+// document (the page's base is the document's folder); any other scheme is refused.
+const imageSrc = (src: string) =>
+  /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=\s]+$/i.test(src) || /^https?:\/\//i.test(src) || !/^[a-z][a-z0-9+.-]*:/i.test(src) || /^[A-Za-z]:[\\/]/.test(src)
+
+const inline = (raw: string, refs: Map<string, string> = new Map()) => {
   let t = escapeText(raw)
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>')
+  // Images go first, so a link never takes the brackets of one. ![alt](src),
+  // ![alt][ref] and ![alt] with [ref]: src defined anywhere in the document.
+  const img = (alt: string, src: string | undefined) =>
+    src && imageSrc(src) ? `<img src="${src.replace(/\s/g, '')}" alt="${alt}">` : alt
+  t = t.replace(/!\[([^\]]*)\]\(\s*(?:&lt;)?([^)\s]+?)(?:&gt;)?(?:\s+&quot;[^)]*&quot;)?\s*\)/g, (_m, alt: string, src: string) => img(alt, src))
+  t = t.replace(/!\[([^\]]*)\]\[([^\]]*)\]/g, (_m, alt: string, ref: string) => img(alt, refs.get((ref || alt).toLowerCase())))
   t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
   t = t.replace(/\*([^*]+)\*/g, '<i>$1</i>')
   // A link's target is a page or a file only: anything with a scheme another
@@ -1691,7 +1702,12 @@ export function markdownBody(text: string): string {
 
 function parseMarkdown(text: string): { body: string; diagrams: string[] } {
   const diagrams: string[] = []
-  const body = text.replace(/\r\n/g, '\n')
+  // Reference definitions ([ref]: <src>, as Google Docs exports images) are
+  // gathered first and left out of the page.
+  const refs = new Map<string, string>()
+  const body = text.replace(/\r\n/g, '\n').replace(/^ {0,3}\[([^\]]+)\]:[ \t]*<?([^>\s]+)>?(?:[ \t]+"[^"\n]*")?[ \t]*$/gm, (_m, ref: string, src: string) => {
+    refs.set(ref.toLowerCase(), escapeText(src)); return ''
+  })
 
   const out: string[] = []
   let codeLines: string[] | null = null
@@ -1716,7 +1732,7 @@ function parseMarkdown(text: string): { body: string; diagrams: string[] } {
     }
     if (codeLines !== null) { codeLines.push(lines[i]!); continue }
     const head = /^(#{1,6})\s+(.*)$/.exec(s)
-    if (head) { closeList(); if (inQuote) { out.push('</blockquote>'); inQuote = false } out.push(`<h${head[1]!.length}>${inline(head[2]!)}</h${head[1]!.length}>`); continue }
+    if (head) { closeList(); if (inQuote) { out.push('</blockquote>'); inQuote = false } out.push(`<h${head[1]!.length}>${inline(head[2]!, refs)}</h${head[1]!.length}>`); continue }
     // A table: a header row, a --- row, at least one body row.
     const isRow = (l: string) => /^\|.*\|$/.test(l)
     if (isRow(s) && /^\|[\s:|-]+\|$/.test(lines[i + 1]?.trim() ?? '') && lines[i + 2] !== undefined && isRow(lines[i + 2]!.trim())) {
@@ -1725,8 +1741,8 @@ function parseMarkdown(text: string): { body: string; diagrams: string[] } {
       const rows: string[][] = []
       let k = i + 2
       while (k < lines.length && isRow(lines[k]!.trim())) { rows.push(cells(lines[k]!.trim())); k++ }
-      out.push(`<table><thead><tr>${head.map(c => `<th>${inline(c)}</th>`).join('')}</tr></thead><tbody>`)
-      for (const r of rows) out.push(`<tr>${r.map(c => `<td>${inline(c)}</td>`).join('')}</tr>`)
+      out.push(`<table><thead><tr>${head.map(c => `<th>${inline(c, refs)}</th>`).join('')}</tr></thead><tbody>`)
+      for (const r of rows) out.push(`<tr>${r.map(c => `<td>${inline(c, refs)}</td>`).join('')}</tr>`)
       out.push('</tbody></table>')
       i = k - 1
       continue
@@ -1735,27 +1751,27 @@ function parseMarkdown(text: string): { body: string; diagrams: string[] } {
     if (li) {
       if (inQuote) { out.push('</blockquote>'); inQuote = false }
       if (list !== 'ul') { closeList(); list = 'ul' }
-      listItems.push(`<li>${inline(li[1]!)}</li>`)
+      listItems.push(`<li>${inline(li[1]!, refs)}</li>`)
       continue
     }
     const oi = /^\d+\.\s+(.*)$/.exec(s)
     if (oi) {
       if (inQuote) { out.push('</blockquote>'); inQuote = false }
       if (list !== 'ol') { closeList(); list = 'ol' }
-      listItems.push(`<li>${inline(oi[1]!)}</li>`)
+      listItems.push(`<li>${inline(oi[1]!, refs)}</li>`)
       continue
     }
     if (s.startsWith('>')) {
       closeList()
       if (!inQuote) { out.push('<blockquote>'); inQuote = true }
-      out.push(`${inline(s.replace(/^>\s?/, ''))}<br>`)
+      out.push(`${inline(s.replace(/^>\s?/, ''), refs)}<br>`)
       continue
     }
     if (inQuote) { out.push('</blockquote>'); inQuote = false }
     if (s === '---') { closeList(); out.push('<hr>'); continue }
     if (!s) { closeList(); continue }
     closeList()
-    out.push(`<p>${inline(s)}</p>`)
+    out.push(`<p>${inline(s, refs)}</p>`)
   }
   closeList()
   if (inQuote) out.push('</blockquote>')
@@ -1772,25 +1788,33 @@ export function documentHtml(text: string, title: string, base: string, mermaidP
   const parsed = bare ? { body: '<div class="mmd wide" data-i="0"></div>', diagrams: [text] } : parseMarkdown(text)
   const body = parsed.body
   const graphs = scriptJson(parsed.diagrams)
+  const fontDir = mermaidPath.replace(/[^/\\]*$/, '')
   const doc = `<!doctype html><meta charset="utf-8"><title>${escapeText(title)}</title>
 <base href="${fileUrl(base)}">
-<style>@page{margin:18mm 16mm}
-:root{--ink:#1a1d23;--dim:#5b6472;--line:#e3e6ea;--wash:#f5f6f8}
+<style>@page{margin:22mm 24mm}
+@font-face{font-family:Nunito;font-weight:200 1000;font-display:block;src:url("${fileUrl(fontDir)}nunito-latin.woff2") format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:Nunito;font-weight:200 1000;font-display:block;src:url("${fileUrl(fontDir)}nunito-latin-ext.woff2") format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+:root{--ink:#14161a;--dim:#5d6573;--line:#e4e7eb;--wash:#f4f5f7}
 html{-webkit-text-size-adjust:100%}
-body{font:15px/1.6 -apple-system,'Segoe UI',Helvetica,sans-serif;margin:0 auto;padding:28px 36px 40px;max-width:820px;box-sizing:border-box;color:var(--ink);${bare ? 'text-align:center' : ''}}
+body{font:16px/1.7 Nunito,-apple-system,'Segoe UI',Helvetica,sans-serif;margin:0 auto;padding:56px 72px 64px;max-width:860px;box-sizing:border-box;color:var(--ink);-webkit-font-smoothing:antialiased;${bare ? 'text-align:center' : ''}}
 @media print{body{padding:0;max-width:none;margin:0}}
-h1,h2,h3,h4{line-height:1.25;margin:1.6em 0 .55em;letter-spacing:-.01em}
-h1{font-size:1.9em;margin-top:.2em}h2{font-size:1.35em;border-bottom:1px solid var(--line);padding-bottom:.25em}h3{font-size:1.12em}h4{font-size:1em}
-p{margin:.7em 0}
-ul,ol{margin:.7em 0;padding-left:1.5em}li{margin:.25em 0}
-pre{background:var(--wash);border:1px solid var(--line);padding:12px 14px;border-radius:8px;font:12.5px/1.55 ui-monospace,'Cascadia Mono',monospace;white-space:pre-wrap;overflow-x:auto}
-code{font:0.92em ui-monospace,'Cascadia Mono',monospace;background:var(--wash);border:1px solid var(--line);border-radius:4px;padding:.08em .35em}
-pre code{border:0;background:none;padding:0;font-size:1em}
-blockquote{border-left:3px solid #b9bfc9;margin:1em 0;padding:.35em 1em;color:var(--dim)}
-table{border-collapse:collapse;margin:1em 0;font-size:.95em}th,td{border:1px solid var(--line);padding:6px 12px;text-align:left}th{background:var(--wash)}tr:nth-child(even) td{background:#fafbfc}
+h1,h2,h3,h4{font-weight:800;line-height:1.18;letter-spacing:-.015em;margin:2em 0 .55em;break-after:avoid}
+h1{font-size:3em;line-height:1.05;letter-spacing:-.03em;margin:0 0 .45em}
+h1+p{font-size:1.2em;line-height:1.55;color:var(--dim);margin-bottom:1.6em}
+h2{font-size:1.7em}h3{font-size:1.25em}h4{font-size:1.05em}
+p{margin:.85em 0}
+ul,ol{margin:.9em 0;padding-left:1.4em}li{margin:.4em 0}
+img{display:block;max-width:100%;height:auto;border-radius:4px;border:1px solid var(--line);margin:1.6em 0;break-inside:avoid}
+pre{background:var(--wash);padding:16px 18px;border-radius:4px;font:13px/1.6 ui-monospace,'Cascadia Mono',Menlo,monospace;white-space:pre-wrap;overflow-x:auto;margin:1.4em 0}
+code{font:.88em ui-monospace,'Cascadia Mono',Menlo,monospace;background:var(--wash);border-radius:4px;padding:.12em .38em}
+pre code{background:none;padding:0;font-size:1em}
+blockquote{margin:1.6em 0;padding:.1em 0 .1em 1.1em;border-left:3px solid var(--ink);font-size:1.2em;line-height:1.5;font-weight:600}
+table{border-collapse:collapse;width:100%;margin:1.4em 0;font-variant-numeric:tabular-nums}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line)}th{font-weight:800;border-bottom:1.5px solid var(--ink)}
+td:not(:first-child),th:not(:first-child){text-align:right}
 a{color:#0b57d0;text-decoration:none}a:hover{text-decoration:underline}
-hr{border:0;border-top:1px solid var(--line);margin:1.8em 0}
-.mmd{margin:1.2em 0}.mmd.wide{margin:0}.mmd svg{max-width:100%}</style>
+hr{border:0;border-top:1px solid var(--line);margin:2.2em 0}
+.mmd{margin:1.4em 0}.mmd.wide{margin:0}.mmd svg{max-width:100%}</style>
 ${body}
 <script src="${fileUrl(mermaidPath)}"></script>
 <script>mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:'neutral'});
@@ -1883,7 +1907,7 @@ export async function prepareDocument($: EngineInterface, real: string, title: s
       const text = String(await $.fs.read(real).catch(() => {
         throw new Error(docErrorOf('could not be read', name).message)
       }))
-      if (text.length > MD_MAX_BYTES) throw new Error(docErrorOf(`is larger than the ${MD_MAX_BYTES >> 10} KiB the player prints`, name).message)
+      if (text.length > MD_MAX_BYTES) throw new Error(docErrorOf(`is larger than the ${MD_MAX_BYTES >> 20} MiB the player prints`, name).message)
       const base = real.slice(0, real.lastIndexOf('/'))
       const partHtml = `${dir}.${attempt}.html`
       const partPdf = `${dir}.${attempt}.part.pdf`
